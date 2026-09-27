@@ -109,11 +109,11 @@ def normalize(frame: np.ndarray, size: tuple[int, int] = (FRAME_W, FRAME_H)) -> 
 
 
 def download(url: str, out: str | Path, start: Optional[str] = None, end: Optional[str] = None) -> Path:
-    """Download a Twitch VOD (or a section of it) at the best 1080p quality with yt-dlp."""
+    """Download a video URL (or a section of it) at the best 1080p quality with yt-dlp."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["uvx", "yt-dlp", "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]", "--merge-output-format", "mp4",
-           "-o", str(out), url]
+           "-o", str(out), "--", url]
     if start or end:
         sec = f"*{start or '0'}-{end or 'inf'}"
         cmd[2:2] = ["--download-sections", sec]

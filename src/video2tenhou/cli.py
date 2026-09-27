@@ -1,7 +1,7 @@
 """Browser launcher and scriptable pipeline commands.
 
     video2tenhou web                                 # complete browser workflow
-    video2tenhou download <twitch-url> <out.mp4> [--start HH:MM:SS --end HH:MM:SS]
+    video2tenhou download <video-url> <out.mp4> [--start HH:MM:SS --end HH:MM:SS]
     video2tenhou calib fit <video> [--calib pml] [--keep overhead hand ...] [--force]
     video2tenhou calib check <video> [--t <seconds> ...] [--calib pml] [--out work/calib]
     video2tenhou convert <video> --game <id> [--game <id>] [--out out] [--calib pml]

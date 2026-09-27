@@ -1,6 +1,6 @@
 # PML quick start
 
-Download **video2tenhou-0.1.1-starter.zip** from the
+Download **video2tenhou-0.1.2-starter.zip** from the
 [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
 The starter includes the application, PML layout and trained models.
 
@@ -59,7 +59,7 @@ builds, so keep a compatible NVIDIA driver installed.
 
 ## Convert a recording
 
-1. Choose **Saved video**, **Upload** or **Twitch URL**. Saved video lists
+1. Choose **Saved video**, **Upload** or **Video URL**. Saved video lists
    recordings in `samples/` and `videos/`; **Enter a video path → Video path**
    accepts a local path without copying it. Upload copies a recording into
    `samples/`. Enter scoremj game IDs in broadcast order; a URL ending in
@@ -135,7 +135,7 @@ uv run --no-sync video2tenhou web
 ```
 
 The server is for your own machine, not a multi-user hosted service. Videos
-stay local; Twitch downloads, scoremj records and external Tenhou replays
+stay local; video downloads, scoremj records and external Tenhou replays
 require network access.
 
 ## Troubleshooting
@@ -171,7 +171,7 @@ Torch/CUDA stack, follow the [separate environment setup](MAINTENANCE.md#depende
 
 The starter already contains the required models. Source users can download
 **video2tenhou-pml-models.zip** and **video2tenhou-pml-models.sha256** from the
-[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.1.1),
+[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.1.2),
 or [train their own models](MAINTENANCE.md#training).
 
 With both downloaded files in the application folder, verify and extract them:

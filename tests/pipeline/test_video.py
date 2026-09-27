@@ -47,3 +47,24 @@ def test_sample_can_be_closed_early_without_waiting_for_the_entire_clip(clip):
 def test_empty_window_does_not_start_a_decoder(monkeypatch):
     monkeypatch.setattr(video.subprocess, "Popen", lambda *a, **k: pytest.fail("unexpected decode"))
     assert list(video.sample("unused.mp4", start=1., end=1.)) == []
+
+
+@pytest.mark.parametrize("source", ["https://www.youtube.com/watch?v=example&feature=share", "--version"])
+def test_download_cli_passes_source_as_literal_to_ytdlp(tmp_path, monkeypatch, source):
+    from video2tenhou.cli import main
+
+    commands = []
+    monkeypatch.setattr(video.subprocess, "run", lambda cmd, **kwargs: commands.append((cmd, kwargs)))
+    output = tmp_path / "video.mp4"
+    main(["download", "--", source, str(output)])
+    command, kwargs = commands[0]
+    assert command[-4:] == ["-o", str(output), "--", source]
+    assert kwargs["check"] is True
+
+
+def test_download_propagates_ytdlp_failure(tmp_path, monkeypatch):
+    def fail(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd)
+    monkeypatch.setattr(video.subprocess, "run", fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        video.download("https://unsupported.test/video", tmp_path / "video.mp4")

@@ -20,7 +20,6 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
 
 from .processes import ProcessOwner
 
@@ -139,22 +138,20 @@ class Workspace:
     def create(self, body: dict) -> dict:
         """Validate source/game order and persist a project without starting work.
 
-        Local sources must exist and be video files. Network sources are
-        canonical public Twitch VOD URLs; arbitrary URLs, shares and command
-        options are rejected. A basename is a pipeline identity, so two
+        Local sources must exist and be video files. URL support is decided
+        by yt-dlp when downloading. A basename is a pipeline identity, so two
         recordings cannot accidentally share labels or cached observations.
         """
         games, layout = self._settings(body)
         source = str(body.get("source", "")).strip()
         kind = body.get("kind", "local")
-        if kind not in ("local", "twitch"):
-            raise ValueError("Choose a local recording or a Twitch VOD.")
-        if kind == "twitch":
-            url = urlparse(source)
-            if (url.scheme != "https" or url.netloc not in ("www.twitch.tv", "twitch.tv")
-                    or not re.fullmatch(r"/videos/\d+/?", url.path) or url.query or url.fragment):
-                raise ValueError("Use a Twitch VOD URL such as https://www.twitch.tv/videos/2874520836.")
-            stem = "twitch_" + url.path.strip("/").split("/")[-1]
+        if kind not in ("local", "url"):
+            raise ValueError("Choose a local recording or a video URL.")
+        if kind == "url":
+            if not source:
+                raise ValueError("Enter a video URL.")
+            # Hash the full URL so query-based video IDs stay distinct and filenames stay safe.
+            stem = "video_" + hashlib.sha256(source.encode()).hexdigest()[:16]
             video = self.root / "samples" / f"{stem}.mp4"
         else:
             if source.startswith(("\\\\", "//")) or "://" in source:
@@ -426,7 +423,7 @@ class Workspace:
                 raise ValueError("The app is closing. Restart it before starting a job.")
             project = self.project(key)
             self._sync_source(project)
-            if self._source(project) is None and project["kind"] != "twitch":
+            if self._source(project) is None and project["kind"] != "url":
                 raise ValueError("Recording not found. Restore the local video before continuing.")
             if any(p.get("job", {}).get("running") for p in self.projects.values()):
                 raise ValueError("Another job is running. Wait for it to finish before starting this recording.")
@@ -461,9 +458,9 @@ class Workspace:
                 source_before = self._source(project)
                 args = [sys.executable, "-u", "-m", "video2tenhou.cli"]
                 if action == "prepare":
-                    if project["kind"] == "twitch" and not Path(project["video"]).exists():
+                    if project["kind"] == "url" and not Path(project["video"]).exists():
                         job["stage"] = "Downloading recording"
-                        self.runner(args + ["download", project["source"], project["video"]], project)
+                        self.runner(args + ["download", "--", project["source"], project["video"]], project)
                     fit_source = self._source(project)
                     job["stage"] = "Measuring table layout"
                     self.runner(args + ["calib", "fit", project["video"], "--calib", project["layout"],

@@ -7,7 +7,7 @@ Analysis runs locally. The included layout supports Pacific Mahjong League
 
 ## Start
 
-1. Download **video2tenhou-0.1.1-starter.zip** from the
+1. Download **video2tenhou-0.1.2-starter.zip** from the
    [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
    It includes the application, PML layout and trained models.
 2. Follow the [one-time setup](docs/QUICKSTART.md#one-time-setup) to install
@@ -21,7 +21,7 @@ needed. Leave the launcher running while processing recordings. An NVIDIA
 CUDA GPU is recommended for practical analysis times.
 
 The browser studio covers Video, Calibrate, Analyze, Review and Results.
-Upload a recording, enter a local video path, or paste a Twitch VOD URL.
+Upload a recording, enter a local video path, or paste a video URL supported by yt-dlp.
 Supply the scoremj game IDs in broadcast order. Calibration, progress,
 review questions, replay links and file downloads stay in the browser.
 

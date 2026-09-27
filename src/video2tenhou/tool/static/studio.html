@@ -15,10 +15,10 @@
 <main>
 <div id="setup" class="notice hidden"></div><div id="global-error" class="notice error" role="alert"></div>
 <section class="panel intake" id="intake"><h1>Add recording</h1><form id="create-form">
-<div class="source-tabs" role="tablist" aria-label="Video source"><button type="button" role="tab" data-source="existing" aria-selected="true">Saved video</button><button type="button" role="tab" data-source="upload" aria-selected="false">Upload</button><button type="button" role="tab" data-source="twitch" aria-selected="false">Twitch URL</button></div>
+<div class="source-tabs" role="tablist" aria-label="Video source"><button type="button" role="tab" data-source="existing" aria-selected="true">Saved video</button><button type="button" role="tab" data-source="upload" aria-selected="false">Upload</button><button type="button" role="tab" data-source="url" aria-selected="false">Video URL</button></div>
 <div id="source-existing" class="field"><div id="saved-videos"><label for="local-source">Video</label><select id="local-source"></select></div><details id="path-entry"><summary>Enter a video path</summary><div class="field"><label for="local-path">Video path</label><input id="local-path" placeholder="D:\Recordings\broadcast.mp4"></div></details></div>
 <div id="source-upload" class="field hidden"><label for="upload-source">Video file</label><input id="upload-source" type="file" accept="video/*,.mkv"></div>
-<div id="source-twitch" class="field hidden"><label for="twitch-source">Twitch video URL</label><input id="twitch-source" type="url" placeholder="https://www.twitch.tv/videos/2874520836"></div>
+<div id="source-url" class="field hidden"><label for="url-source">Video URL</label><input id="url-source" type="url" placeholder="https://www.twitch.tv/videos/2874520836"></div>
 <div class="field"><label for="games">Scoremj games</label><input id="games" required placeholder="21938, 21939"><p class="hint">Game IDs or links, in broadcast order.</p></div>
 <div class="actions" style="margin-top:24px"><button class="primary" id="create-button">Prepare recording</button><span id="intake-status" class="hint" role="status" aria-live="polite"></span></div><progress id="upload-progress" class="progress hidden" value="0" max="100" aria-label="Uploading recording"></progress>
 <details><summary>Layout</summary><div class="field"><label for="layout">Layout file</label><input id="layout" placeholder="PML (default)"></div></details>
@@ -48,7 +48,7 @@ function calibrationBlocked() {
 }
 function source(kind) {
   sourceKind = kind;
-  for (const name of ['existing','upload','twitch']) $('source-' + name).classList.toggle('hidden', kind !== name);
+  for (const name of ['existing','upload','url']) $('source-' + name).classList.toggle('hidden', kind !== name);
   document.querySelectorAll('[data-source]').forEach(button => button.setAttribute('aria-selected', button.dataset.source === kind));
 }
 document.querySelectorAll('[data-source]').forEach(button => button.onclick = () => source(button.dataset.source));
@@ -187,10 +187,10 @@ $('create-form').onsubmit = async event => {
   event.preventDefault(); error(''); const button = $('create-button'); button.disabled = true;
   try {
     const games = gameIds($('games').value);
-    let video = sourceKind === 'twitch' ? $('twitch-source').value.trim() : ($('local-path').value.trim() || $('local-source').value);
+    let video = sourceKind === 'url' ? $('url-source').value.trim() : ($('local-path').value.trim() || $('local-source').value);
     if (sourceKind === 'upload') { const file = $('upload-source').files[0]; if (!file) throw new Error('Choose a video file.'); $('upload-progress').classList.remove('hidden'); video = await upload(file); }
-    if (!video) throw new Error('Choose a recording or paste a Twitch VOD URL.');
-    const project = await api('/api/projects', {source:video,kind:sourceKind === 'twitch' ? 'twitch' : 'local',games,layout:$('layout').value.trim()});
+    if (!video) throw new Error('Choose a recording or paste a video URL.');
+    const project = await api('/api/projects', {source:video,kind:sourceKind === 'url' ? 'url' : 'local',games,layout:$('layout').value.trim()});
     projects.push(project); openProject(project.id); if (!project.has_fit) await action('prepare');
   } catch(e) { error(e.message); } finally { button.disabled = false; $('upload-progress').classList.add('hidden'); $('intake-status').textContent = ''; }
 };

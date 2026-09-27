@@ -274,19 +274,37 @@ def test_import_prepare_analyze_review_and_export(web):
     assert reopened.snapshot(key)["status"] == "complete"
 
 
-def test_twitch_preparation_and_source_validation(web):
+@pytest.mark.parametrize("source", [
+    "https://www.twitch.tv/videos/123",
+    "https://www.twitch.tv/videos/123?foo=bar#fragment",
+    "https://www.youtube.com/watch?v=example",
+    "https://vimeo.com/123",
+    "http://example.test/video.mp4?token=abc",
+])
+def test_url_preparation_delegates_to_downloader(web, source):
     client, workspace, commands = web
-    for source in ("http://127.0.0.1/private", "https://evil.test/videos/123", "https://twitch.tv@evil.test/videos/123",
-                   "https://www.twitch.tv/videos/123?redirect=evil", "https://www.twitch.tv/channel"):
-        assert client.request("/api/projects", {"source": source, "kind": "twitch", "games": [1]})[0] == 400
-    status, p, _ = client.request("/api/projects", {"source": "https://www.twitch.tv/videos/123", "kind": "twitch", "games": [1]})
+    status, p, _ = client.request("/api/projects", {"source": source, "kind": "url", "games": [1]})
     assert status == 201
     assert client.request(f"/api/projects/{p['id']}/prepare", {})[0] == 202
     assert wait_for_job(client, p["id"])["status"] == "ready"
-    assert commands[0][-3:] == ["download", "https://www.twitch.tv/videos/123", str(workspace.root / "samples/twitch_123.mp4")]
+    assert commands[0][-4:] == ["download", "--", source, p["video"]]
+    assert Path(p["video"]).parent == workspace.root / "samples"
     assert client.request(f"/api/projects/{p['id']}/prepare", {})[0] == 202
     wait_for_job(client, p["id"])
     assert sum("download" in command for command in commands) == 1
+
+
+def test_url_recording_identity_includes_query(web):
+    client, _, _ = web
+    def create(source):
+        return client.request("/api/projects", {"source": source, "kind": "url", "games": [1]})
+    first = "https://www.youtube.com/watch?v=first"
+    status, p, _ = create(first)
+    assert status == 201
+    status, other, _ = create("https://www.youtube.com/watch?v=second")
+    assert status == 201 and p["video"] != other["video"]
+    assert create(first)[0] == 400
+    assert create(" ")[0] == 400
 
 
 def test_native_results_use_current_json_and_shared_replay_links(web):

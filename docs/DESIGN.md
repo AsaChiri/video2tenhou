@@ -11,7 +11,7 @@ points, cache contracts and validation commands.
 
 | input | form | required |
 |---|---|---|
-| video | local mp4 of the broadcast (1080p preferred; any size is rescaled), or a Twitch VOD URL to download | yes |
+| video | local mp4 of the broadcast (1080p preferred; any size is rescaled), or a video URL supported by yt-dlp to download | yes |
 | site record | scoremj.com game ids, one per hanchan in the video, in video order | yes |
 | calibration | two parts: the **layout** of the broadcast composite (one per layout; the PML layout ships with the repo) and the **fit** of this video (where the table and the camera panels landed), measured by stage 0 and confirmed in the tool | yes, the layout ships, the fit is measured |
 | facts | human answers to review items from earlier runs on the same video | optional |
@@ -199,7 +199,7 @@ riichi-stick counter timing.
 `video2tenhou web` opens a loopback-only workspace for the complete recording
 lifecycle. A project records its source, ordered scoremj game IDs and layout
 in `work/projects/`; videos, caches, facts and outputs retain their stage
-contracts below. Local file uploads stream to disk and Twitch VOD downloads
+contracts below. Local file uploads stream to disk and video downloads
 run in a child process. Only one analysis job runs at a time so competing
 videos cannot exhaust GPU memory. Progress comes from real pipeline output;
 failed and interrupted jobs remain visible and can be retried using caches.
