@@ -77,7 +77,10 @@ inputs, including the calibration plate used for pond ownership checks. Neither
 workload guarantees a cold operating-system file cache.
 
 The profile records input hashes, geometry, library versions, effective thread
-counts, stage/hand events and five-second resource samples. `summary.json`
+counts, stage/hand events and five-second resource samples. It also records
+resolved executable paths and versions for FFmpeg, ffprobe, Tesseract and uv;
+unavailable or failed version probes are reported without stopping conversion.
+`summary.json`
 contains conversion wall time, process CPU time and inclusive timing totals.
 Hashing and instrumentation imports are reported separately. Existing profile
 output is never overwritten; failed calls remain visible.

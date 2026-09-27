@@ -19,8 +19,10 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -295,6 +297,49 @@ def file_identity(path):
     return dict(path=str(path), exists=True, bytes=stat.st_size, mtime_ns=stat.st_mtime_ns, sha256=digest.hexdigest())
 
 
+def tool_versions():
+    """Record PATH-resolved tools without importing models or failing conversion.
+
+    Each probe has a three-second deadline. Output goes to a temporary file,
+    avoiding an unbounded in-memory capture; only its first 4096 bytes are read
+    and one 300-character line is retained. Both output streams are inspected
+    because Tesseract can print its version on stderr.
+    """
+    tools = {}
+    tess = sys.modules.get("pytesseract.pytesseract")
+    tesseract = getattr(tess, "tesseract_cmd", "tesseract")
+    for name, command, flag in (("ffmpeg", "ffmpeg", "-version"),
+                               ("ffprobe", "ffprobe", "-version"),
+                               ("tesseract", tesseract, "--version"),
+                               ("uv", "uv", "--version")):
+        row = tools[name] = dict(path=None, version=None, status="missing")
+        try:
+            executable = shutil.which(command)
+            if executable is None:
+                continue
+            row["path"] = str(Path(executable).resolve())
+            with tempfile.TemporaryFile() as output:
+                result = subprocess.run(
+                    [row["path"], flag], stdout=output, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, timeout=3, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                output.seek(0)
+                lines = output.read(4096).decode("utf-8", errors="replace").splitlines()
+            row["returncode"] = result.returncode
+            line = next((line.strip() for line in lines if line.strip()), "")[:300]
+            if result.returncode:
+                row.update(status="error", error=line or "Nonzero exit status")
+            elif not line:
+                row.update(status="error", error="Empty version output")
+            else:
+                row.update(status="ok", version=line)
+        except subprocess.TimeoutExpired:
+            row.update(status="timeout", error="Version probe exceeded 3 seconds")
+        except OSError as error:
+            row.update(status="error", error=str(error)[:300])
+    return tools
+
+
 def run_metadata(args):
     """Capture inputs, effective geometry, versions and initial cache state before timing."""
     from video2tenhou import video
@@ -322,7 +367,7 @@ def run_metadata(args):
         result = subprocess.run(["git", "-c", "safe.directory=" + str(Path.cwd()).replace("\\", "/"), *command], capture_output=True, timeout=10)
         git[label] = hashlib.sha256(result.stdout).hexdigest() if label == "diff" else result.stdout.decode(errors="replace").strip()
     return dict(arguments=vars(args), data_directory=str(DATA_DIR), platform=platform.platform(),
-                python=sys.version, logical_cpus=os.cpu_count(), versions=versions, git=git, cache=cache,
+                python=sys.version, logical_cpus=os.cpu_count(), versions=versions, tools=tool_versions(), git=git, cache=cache,
                 input_files=[file_identity(p) for p in inputs], video=vars(video.probe(args.video)),
                 calibration=cal.data, calibration_sha256=hashlib.sha256(json.dumps(cal.data, sort_keys=True).encode()).hexdigest())
 

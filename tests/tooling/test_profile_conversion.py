@@ -103,3 +103,41 @@ def test_imported_overlay_alias_is_timed_once_and_restored(tmp_path, monkeypatch
     assert len(rows) == 1 and rows[0]["calls"] == 1
     assert calls == [("frame", {"names": False})]
     recorder.close()
+
+
+def test_tool_versions_keep_failures_bounded_and_report_resolved_paths(tmp_path, monkeypatch):
+    """One broken optional probe must not prevent metadata for the other tools."""
+    commands = []
+    monkeypatch.setattr(profile.shutil, "which", lambda name: None if name == "ffmpeg" else str(tmp_path / name))
+
+    def run(command, **kwargs):
+        commands.append(command)
+        assert kwargs["timeout"] == 3 and kwargs["check"] is False
+        assert kwargs["stderr"] == profile.subprocess.STDOUT
+        assert kwargs["stdin"] == profile.subprocess.DEVNULL
+        name = Path(command[0]).name
+        if name == "uv":
+            raise profile.subprocess.TimeoutExpired(command, kwargs["timeout"])
+        if name == "ffprobe":
+            kwargs["stdout"].write(b"broken executable\n" + b"x" * 10000)
+            return profile.subprocess.CompletedProcess(command, 7)
+        kwargs["stdout"].write(b"\ntesseract 5.5.3\nleptonica details\n")
+        return profile.subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(profile.subprocess, "run", run)
+    rows = profile.tool_versions()
+    assert rows["ffmpeg"] == {"path": None, "version": None, "status": "missing"}
+    assert rows["ffprobe"]["status"] == "error"
+    assert rows["ffprobe"]["error"] == "broken executable"
+    assert rows["ffprobe"]["returncode"] == 7
+    assert rows["tesseract"]["version"] == "tesseract 5.5.3"
+    assert rows["tesseract"]["path"] == str((tmp_path / "tesseract").resolve())
+    assert rows["tesseract"]["status"] == "ok"
+    assert rows["uv"]["status"] == "timeout" and rows["uv"]["version"] is None
+    assert [command[1] for command in commands] == ["-version", "--version", "--version"]
+
+    monkeypatch.setattr(profile.shutil, "which", lambda name: str(tmp_path / name))
+    def denied(*args, **kwargs):
+        raise PermissionError("not executable")
+    monkeypatch.setattr(profile.subprocess, "run", denied)
+    assert all(row["status"] == "error" and row["version"] is None for row in profile.tool_versions().values())
