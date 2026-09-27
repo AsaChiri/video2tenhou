@@ -55,3 +55,7 @@ VODs or model weights. See the [test guide](tests/README.md) for focused runs.
 The CLI remains available for scripts (`uv run video2tenhou --help`).
 Generated recordings, labels, work caches and outputs stay local and ignored.
 Set `VIDEO2TENHOU_HOME` before launch to use another data directory.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

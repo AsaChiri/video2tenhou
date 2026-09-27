@@ -3,6 +3,8 @@ name = "video2tenhou"
 version = "0.1.0"
 description = "Review and convert riichi mahjong broadcast recordings into Tenhou game logs locally"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy==2.5.3",
@@ -18,6 +20,10 @@ dependencies = [
 
 [project.scripts]
 video2tenhou = "video2tenhou.cli:main"
+
+[project.urls]
+Repository = "https://github.com/AsaChiri/video2tenhou"
+Issues = "https://github.com/AsaChiri/video2tenhou/issues"
 
 [dependency-groups]
 dev = [
