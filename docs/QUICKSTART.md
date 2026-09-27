@@ -1,6 +1,6 @@
 # PML quick start
 
-Download **video2tenhou-0.1.0-starter.zip** from the
+Download **video2tenhou-0.1.1-starter.zip** from the
 [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
 The starter includes the application, PML layout and trained models.
 
@@ -171,7 +171,7 @@ Torch/CUDA stack, follow the [separate environment setup](MAINTENANCE.md#depende
 
 The starter already contains the required models. Source users can download
 **video2tenhou-pml-models.zip** and **video2tenhou-pml-models.sha256** from the
-[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.1.0),
+[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.1.1),
 or [train their own models](MAINTENANCE.md#training).
 
 With both downloaded files in the application folder, verify and extract them:

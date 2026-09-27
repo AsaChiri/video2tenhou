@@ -24,7 +24,7 @@ Use the same source revision for all validation and published artifacts.
    Build the starter download from that model bundle and the source distribution:
 
    ```console
-   uv run python tools/package_starter.py --source dist/video2tenhou-0.1.0.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.1.0-starter.zip
+   uv run python tools/package_starter.py --source dist/video2tenhou-0.1.1.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.1.1-starter.zip
    ```
 
    Use the matching version in the filenames. The starter contains the application,

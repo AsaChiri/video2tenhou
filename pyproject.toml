@@ -1,6 +1,6 @@
 [project]
 name = "video2tenhou"
-version = "0.1.0"
+version = "0.1.1"
 description = "Review and convert riichi mahjong broadcast recordings into Tenhou game logs locally"
 readme = "README.md"
 license = "Apache-2.0"
