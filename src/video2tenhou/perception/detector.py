@@ -19,6 +19,7 @@ from ..paths import MODEL_DIR
 from .graphs import GRAPH_POLICY, enable_owned_graphs
 from .runtime import runtime_signature
 from .evidence_policy import resolve_policy
+from .detector_flow import prepare_input, infer_prepared, one_ahead
 
 DEFAULT_WEIGHTS = MODEL_DIR / "detector" / "weights.pt"
 
@@ -53,6 +54,10 @@ class Detector:
         ``cuda_graph`` opts into bounded, grid-owning CUDA graphs for LibreYOLO
         1.5.0 YOLO9. Unsupported runtimes use eager inference; default is false
         unless qualified checkpoint metadata requests it.
+        Supported graph models prepare uint8 BGR inputs directly from arrays;
+        batches overlap one next CPU preparation with serial inference. This
+        input path has its own cache identity. Other runtimes retain the public
+        prediction API and its existing identity.
         """
         import torch
         weights = Path(weights)
@@ -110,11 +115,19 @@ class Detector:
         self._prediction_lock = Lock()
         version = metadata.version(backend)
         self.cuda_graph = cuda_graph and enable_owned_graphs(self.model, version=version, device=device)
+        # The direct path is deliberately restricted to the audited graph
+        # runtime; unsupported/eager models keep the public prediction API.
+        self._direct_preprocessing = (version == "1.5.0" and self.cuda_graph
+            and callable(getattr(self.model, "_forward_graphed", None))
+            and callable(getattr(self.model, "_postprocess", None))
+            and callable(getattr(self.model, "cuda_graph_scope", None)))
         identity = dict(weights_sha256=digest.hexdigest(), backend=backend, version=version,
                         imgsz=imgsz, conf=conf, iou=iou, color="BGR", classes=self.model.names,
                         cuda_graph=self.cuda_graph, graph_policy=GRAPH_POLICY if self.cuda_graph else None,
                         runtime=runtime_signature(device),
                         preprocessing="libreyolo9-top-left-rect-stride32-v1")
+        if self._direct_preprocessing:
+            identity["input_path"] = "ndarray-one-ahead-v1"
         self.id = "detector:" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
     def predict(self, img: np.ndarray) -> list[Det]:
@@ -127,6 +140,24 @@ class Detector:
             return self._predict(img)
 
     def _predict(self, img: np.ndarray) -> list[Det]:
+        if self._direct_preprocessing and self._supported_input(img):
+            return self._consume_prepared(prepare_input(img, self.imgsz))
+        return self._public_predict(img)
+
+    @staticmethod
+    def _supported_input(img):
+        return (isinstance(img, np.ndarray) and img.dtype == np.uint8
+                and img.ndim == 3 and img.shape[2] == 3
+                and min(img.shape[:2]) > 4)
+
+    def _consume_prepared(self, prepared):
+        data = infer_prepared(self.model, prepared, self.conf, self.iou, self.cuda_graph)
+        if any(int(value) != 0 for value in data["classes"]):
+            raise ValueError("Face-only checkpoint returned an unexpected class ID")
+        return [Det(tuple(float(v) for v in box), float(conf), False)
+                for box, conf in zip(data["boxes"], data["scores"])]
+
+    def _public_predict(self, img: np.ndarray) -> list[Det]:
         height, width = img.shape[:2]
         ratio = self.imgsz / max(height, width)
         shape = (math.ceil(height * ratio / 32) * 32, math.ceil(width * ratio / 32) * 32)
@@ -146,5 +177,15 @@ class Detector:
         padding. Even matching shapes can use different CUDA kernels when
         batched, changing box coordinates and therefore classifier crop pixels.
         Classifier inference is batched separately by the region reader.
+        On supported graph models, one CPU input is prepared ahead of the
+        current inference. The instance lock spans the whole batch and worker
+        cleanup, including when preparation or inference raises an exception.
         """
-        return [self.predict(img) for img in imgs]
+        if not imgs:
+            return []
+        with self._prediction_lock:
+            if not self._direct_preprocessing or not all(self._supported_input(img) for img in imgs):
+                return [self._public_predict(img) for img in imgs]
+            # CPU-only preparation owns one next item; all GPU work and output
+            # materialization remain serial under this instance's lock.
+            return one_ahead(imgs, lambda img: prepare_input(img, self.imgsz), self._consume_prepared)

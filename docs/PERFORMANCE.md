@@ -11,6 +11,13 @@ The [benchmark workloads](BENCHMARKS.md) define representative inputs and checks
   transfers contain up to 512 tile crops, including sideways orientations. Detector
   calls process images individually. Sampling windows, pixels, ordering and batch
   boundaries stay stable; cancellation joins the producer and closes its decoder.
+- The supported LibreYOLO9 CUDA-graph path prepares one detector input ahead on
+  the CPU. It converts upright BGR arrays directly to the backend's RGB recipe,
+  avoiding image copies used for visualization. Resize, padding, normalization,
+  tensor layout, single-image inference and postprocessing remain unchanged.
+  A shared model lock covers inference and result materialization; preparation
+  workers are joined on failure. Other backend versions and eager execution use
+  the public prediction path. The selected path is part of recognition identity.
 - Count-change checks and votes reuse filtered, structured readings. Classifier
   inference loads the complete local checkpoint without downloading initialization
   weights.
