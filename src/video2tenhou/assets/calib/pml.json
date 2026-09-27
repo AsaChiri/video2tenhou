@@ -1,0 +1,304 @@
+{
+ "name": "pml",
+ "frame": [
+  1920,
+  1080
+ ],
+ "overlay": {
+  "score": {
+   "TL": [
+    10,
+    20,
+    250,
+    60
+   ],
+   "TR": [
+    1525,
+    20,
+    250,
+    60
+   ],
+   "BL": [
+    10,
+    560,
+    250,
+    60
+   ],
+   "BR": [
+    1655,
+    560,
+    250,
+    60
+   ]
+  },
+  "name": {
+   "TL": [
+    10,
+    75,
+    270,
+    45
+   ],
+   "TR": [
+    1525,
+    75,
+    385,
+    45
+   ],
+   "BL": [
+    10,
+    615,
+    330,
+    45
+   ],
+   "BR": [
+    1655,
+    615,
+    260,
+    45
+   ]
+  },
+  "wind": {
+   "TL": [
+    280,
+    35,
+    80,
+    85
+   ],
+   "TR": [
+    1435,
+    35,
+    80,
+    85
+   ],
+   "BL": [
+    335,
+    575,
+    80,
+    85
+   ],
+   "BR": [
+    1565,
+    575,
+    80,
+    85
+   ]
+  },
+  "strip": {
+   "TL": [
+    0,
+    10,
+    760,
+    130
+   ],
+   "TR": [
+    1160,
+    10,
+    760,
+    130
+   ],
+   "BL": [
+    0,
+    550,
+    760,
+    130
+   ],
+   "BR": [
+    1160,
+    550,
+    760,
+    130
+   ]
+  },
+  "round_wind": [
+   768,
+   938,
+   82,
+   108
+  ],
+  "round_num": [
+   845,
+   945,
+   60,
+   95
+  ],
+  "honba": [
+   1000,
+   945,
+   55,
+   95
+  ],
+  "sticks": [
+   1110,
+   945,
+   55,
+   95
+  ]
+ },
+ "cam": {
+  "TL": [
+   0,
+   0,
+   700,
+   540
+  ],
+  "TR": [
+   1220,
+   0,
+   700,
+   540
+  ],
+  "BL": [
+   0,
+   540,
+   700,
+   540
+  ],
+  "BR": [
+   1220,
+   540,
+   700,
+   540
+  ]
+ },
+ "hand": {
+  "TL": {
+   "rect": [
+    0,
+    140,
+    720,
+    340
+   ],
+   "scale": 1.0,
+   "roll": 21.1
+  },
+  "TR": {
+   "rect": [
+    1200,
+    50,
+    720,
+    380
+   ],
+   "scale": 1.0,
+   "roll": -24.0
+  },
+  "BL": {
+   "rect": [
+    0,
+    580,
+    700,
+    420
+   ],
+   "scale": 1.0,
+   "roll": -22.4
+  },
+  "BR": {
+   "rect": [
+    1300,
+    580,
+    620,
+    380
+   ],
+   "scale": 1.0,
+   "roll": 18.6
+  }
+ },
+ "meld": {
+  "TL": {
+   "rect": [
+    520,
+    405,
+    150,
+    190
+   ],
+   "scale": 3.0
+  },
+  "TR": {
+   "rect": [
+    1740,
+    310,
+    180,
+    220
+   ],
+   "scale": 3.0
+  },
+  "BL": {
+   "rect": [
+    580,
+    850,
+    180,
+    230
+   ],
+   "scale": 3.0
+  },
+  "BR": {
+   "rect": [
+    1815,
+    890,
+    105,
+    190
+   ],
+   "scale": 3.0
+  }
+ },
+ "overhead": {
+  "center": [
+   960,
+   540
+  ],
+  "angle": 45.0,
+  "side": 680,
+  "unit": [
+   225,
+   250,
+   220,
+   220
+  ]
+ },
+ "pond": {
+  "TL": {
+   "rect": [
+    0,
+    160,
+    225,
+    360
+   ],
+   "rot": 3,
+   "scale": 3.0
+  },
+  "TR": {
+   "rect": [
+    170,
+    40,
+    360,
+    210
+   ],
+   "rot": 2,
+   "scale": 3.0
+  },
+  "BL": {
+   "rect": [
+    170,
+    470,
+    360,
+    210
+   ],
+   "rot": 0,
+   "scale": 3.0
+  },
+  "BR": {
+   "rect": [
+    445,
+    160,
+    235,
+    360
+   ],
+   "rot": 1,
+   "scale": 3.0
+  }
+ },
+ "pond_rows": "first row nearest the centre unit; later rows toward the player; tiles ordered from the player's left",
+ "notes": [
+  "1080p coordinates. pond rects are in the de-rotated overhead square (side px, origin at its top-left); rot = clockwise quarter turns that make the owner's tiles upright with the owner at the bottom; the dora indicators lie inside the pond rect on the wall side. hand.roll = angle in degrees of the hand row in the image (positive = descending to the right), measured from the human quads; rotating a crop by -roll makes the tile upright.",
+  "pond rects reach the edge of the overhead image (20 overhead px beyond the wall row's usual near edge): the dead wall (dora indicators) lies in the wall row in front of the player, which the overhead view itself may cut"
+ ]
+}

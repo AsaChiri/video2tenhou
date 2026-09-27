@@ -1,0 +1,104 @@
+"""The rules of section 1 of docs/DESIGN.md as checkable functions and constants."""
+from __future__ import annotations
+
+from collections import Counter
+from typing import Iterable, Optional
+
+SEATS = "ESWN"
+KINDS = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + [f"{n}z" for n in range(1, 8)]   # 34
+REDS = {"0m": "5m", "0p": "5p", "0s": "5s"}
+SUITS = "mpsz"
+
+
+def plain(tile: str) -> str:
+    """Red five -> plain five; everything else unchanged."""
+    return REDS.get(tile, tile)
+
+
+def suit(tile: str) -> str:
+    """Return m/p/s/z for a validated two-character tile token."""
+    return tile[1]
+
+
+def number(tile: str) -> int:
+    """Return rank 1–9 (honors 1–7), treating a red zero as rank five."""
+    n = int(tile[0])
+    return 5 if n == 0 else n
+
+
+def max_count(tile: str) -> int:
+    """How many copies of exactly this token exist: red fives once, plain fives three, others four."""
+    if tile in REDS:
+        return 1
+    if tile in ("5m", "5p", "5s"):
+        return 3
+    return 4
+
+
+def count_ok(tiles: Iterable[str]) -> bool:
+    """Check physical copy limits while keeping red and plain fives distinct."""
+    c = Counter(tiles)
+    return all(c[t] <= max_count(t) for t in c)
+
+
+def next_seat(seat: str) -> str:
+    """Advance one draw turn in E/S/W/N order, wrapping from North to East."""
+    return SEATS[(SEATS.index(seat) + 1) % 4]
+
+
+def relative(me: str, other: str) -> str:
+    """kamicha (the player before me), toimen, shimocha (after me)."""
+    d = (SEATS.index(other) - SEATS.index(me)) % 4
+    return {0: "self", 1: "shimocha", 2: "toimen", 3: "kamicha"}[d]
+
+
+def is_chi(tiles: list[str]) -> bool:
+    """Check a three-tile sequence, accepting red fives and excluding honors."""
+    if len(tiles) != 3:
+        return False
+    s = {suit(t) for t in tiles}
+    if len(s) != 1 or "z" in s:
+        return False
+    ns = sorted(number(t) for t in tiles)
+    return ns[1] == ns[0] + 1 and ns[2] == ns[1] + 1
+
+
+def is_pon(tiles: list[str]) -> bool:
+    """Check three matching ranks; physical copy limits are checked separately."""
+    return len(tiles) == 3 and len({plain(t) for t in tiles}) == 1
+
+
+def is_kan(tiles: list[str]) -> bool:
+    """Check four tiles of one visible kind, allowing X for concealed tile backs."""
+    return len(tiles) == 4 and len({plain(t) for t in tiles if t != "X"}) == 1
+
+
+def kan_tiles(kind: str) -> list[str]:
+    """The four tiles of any kan of `kind`: a kan of fives is all four fives, three plain and the red one."""
+    k = plain(kind)
+    red = next((r for r, p in REDS.items() if p == k), None)
+    return [k] * 3 + [red] if red else [k] * 4
+
+
+def meld_type(tiles: list[str], face_down: int = 0) -> Optional[str]:
+    """chi | pon | kan (four shown) | ankan (two face-down) | None."""
+    if face_down >= 2 and len(tiles) == 4:
+        return "ankan"
+    if is_kan(tiles):
+        return "kan"
+    if is_pon(tiles):
+        return "pon"
+    if is_chi(tiles):
+        return "chi"
+    return None
+
+
+def hand_size(melds: int, after_draw: bool = False, kans: int = 0) -> int:
+    """Concealed tiles a player holds: 13 - 3 per meld (a kan counts as a meld of three here), +1 after a draw."""
+    return 13 - 3 * melds + (1 if after_draw else 0)
+
+
+DEALER = "E"        # seats are the winds of the hand being decoded, so the dealer is always East
+
+
+LIVE_WALL = 136 - 13 * 4 - 14   # 70 draws in a hand without kans

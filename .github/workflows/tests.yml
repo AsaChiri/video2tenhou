@@ -1,0 +1,34 @@
+name: Tests and package
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg tesseract-ocr
+      - if: runner.os == 'Windows'
+        run: |
+          choco install ffmpeg tesseract -y --no-progress
+          "$env:ProgramFiles\Tesseract-OCR" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - run: uv sync --frozen
+      - run: uv run pytest -q --cov --cov-report=term-missing --cov-report=xml
+      - run: uv build
+      - run: uv run python tools/check_dist.py
+      - run: uv run python tools/check_source_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions-and-coverage-${{ runner.os }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            coverage.xml
