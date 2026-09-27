@@ -21,14 +21,24 @@ Use the same source revision for all validation and published artifacts.
    adjacent model provenance and license files; LibreYOLO bundles require
    both `detector/provenance.json` and the upstream `detector/LICENSE` notice.
    Identical model files produce the same ZIP checksum.
+   Build the starter download from that model bundle and the source distribution:
+
+   ```console
+   uv run python tools/package_starter.py --source dist/video2tenhou-0.1.0.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.1.0-starter.zip
+   ```
+
+   Use the matching version in the filenames. The starter contains the application,
+   launchers, locked dependency configuration and trained models in one folder.
+   Its checksum accompanies the ZIP. Extract it into a new directory and verify
+   that the launcher installs dependencies and opens the browser studio.
 5. Install from the artifacts in a fresh environment. Convert a representative
    full recording, inspect review questions, replay every exported hand and
    compare scores and independent human annotations.
 6. Record the hardware, model hashes, cache state, workload and quality checks
    for performance claims using the [benchmark protocol](BENCHMARKS.md).
-7. Put the actual model download location and checksum instructions in the
-   quick start. Tag the tested revision and publish its code, model bundle
-   and checksums together.
+7. Put the starter download first in the release notes, with prerequisite and
+   launcher instructions from the quick start. Tag the tested revision and
+   publish the starter, source, wheel, model bundle and checksums together.
 
 ## Repository history
 

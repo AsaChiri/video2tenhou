@@ -40,7 +40,7 @@ build-backend = "hatchling.build"
 packages = ["src/video2tenhou"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/", "tests/", "docs/", "tools/", "README.md", "LICENSE*", "THIRD_PARTY_NOTICES.md", "pyproject.toml", "uv.lock", ".python-version"]
+include = ["src/", "tests/", "docs/", "tools/", "README.md", "LICENSE*", "THIRD_PARTY_NOTICES.md", "pyproject.toml", "uv.lock", ".python-version", "Start.cmd", "start.sh"]
 
 [tool.coverage.run]
 source = ["video2tenhou"]

@@ -9,6 +9,8 @@ out/
 models/
 /video2tenhou-pml-models.zip
 /video2tenhou-pml-models.sha256
+/video2tenhou-*-starter.zip
+/video2tenhou-*-starter.sha256
 *.pt
 *.mp4
 videos/

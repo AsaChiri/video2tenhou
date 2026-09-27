@@ -25,7 +25,7 @@ from video2tenhou.tool import server
 assert Path(layout.__file__).is_relative_to(Path(sys.argv[1]))
 assert layout.Calibration.load("pml").name == "pml"
 assert overlay._DIGITS.ready and overlay._WIND.ready
-assert paths.LABEL_DIR == Path.cwd() / "local-data" / "labels"
+assert paths.LABEL_DIR == (Path.cwd() / "local-data" / "labels").resolve()
 static = Path(server.__file__).parent / "static"
 assert (static / "index.html").is_file()
 assert (static / "studio.html").is_file()

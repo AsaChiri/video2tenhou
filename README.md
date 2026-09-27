@@ -7,28 +7,25 @@ Analysis runs locally. The included layout supports Pacific Mahjong League
 
 ## Start
 
-On Windows or Linux, install [uv](https://docs.astral.sh/uv/), FFmpeg (including
-`ffprobe`) and Tesseract with English data. Python 3.12 is managed by uv. An NVIDIA CUDA GPU
-is recommended for practical analysis times; the locked environment uses
-PyTorch's CUDA 12.4 builds on Windows/Linux.
+1. Download **video2tenhou-0.1.0-starter.zip** from the
+   [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
+   It includes the application, PML layout and trained models.
+2. Follow the [one-time setup](docs/QUICKSTART.md#one-time-setup) to install
+   uv, FFmpeg and Tesseract on Windows or Linux.
+3. Extract the ZIP into a folder you can write to. On Windows, double-click
+   **Start.cmd**. On Linux, open a terminal in that folder and run **`bash start.sh`**.
 
-From this checkout:
-
-```console
-uv sync --frozen
-uv run video2tenhou web
-```
+The launcher installs Python and the locked dependencies on first use, then
+opens the browser studio. No Git checkout or separate Python installation is
+needed. Leave the launcher running while processing recordings. An NVIDIA
+CUDA GPU is recommended for practical analysis times.
 
 The browser studio covers Video, Calibrate, Analyze, Review and Results.
 Upload a recording, enter a local video path, or paste a Twitch VOD URL.
 Supply the scoremj game IDs in broadcast order. Calibration, progress,
 review questions, replay links and file downloads stay in the browser.
 
-**Trained models are required.** Put the project's detector and classifier
-bundle in `models/` before analyzing. Keep its detector metadata and classifier
-metadata with the matching weights; a generic YOLO checkpoint cannot replace
-this trained pair. See [model setup](docs/QUICKSTART.md#models).
-The source archive intentionally excludes trained weights and personal video.
+Using a source checkout instead? Follow [source setup and models](docs/QUICKSTART.md#source-setup).
 
 ## Guides
 
