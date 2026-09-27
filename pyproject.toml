@@ -7,15 +7,15 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "numpy==2.5.3",
-    "opencv-python==5.0.0.93",
+    "numpy>=2.5.3,<3",
+    "opencv-python>=5.0.0.93,<6",
     "pytesseract>=0.3.13",
     "yt-dlp>=2026.8.19",
-    "torch==2.6.0",
-    "torchvision==0.21.0",
+    "torch>=2.6,<3",
+    "torchvision>=0.21,<0.30",
     "mahjong>=2.0.0",
     "ortools>=9.15.6755",
-    "libreyolo==1.5.0",
+    "libreyolo>=1.5,<1.6",
 ]
 
 [project.scripts]

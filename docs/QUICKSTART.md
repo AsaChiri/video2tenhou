@@ -164,7 +164,8 @@ uv sync --frozen --no-dev
 
 Install the matching models below, then launch with
 `uv run --no-sync video2tenhou web`. For development and tests, use
-`uv sync --frozen` to include the development dependencies.
+`uv sync --frozen` to include the development dependencies. To choose another
+Torch/CUDA stack, follow the [separate environment setup](MAINTENANCE.md#dependency-environments).
 
 ## Models
 

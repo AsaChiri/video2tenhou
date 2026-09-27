@@ -30,6 +30,49 @@ the explicit seat-mapping helpers. Times are seconds in the source recording.
 Tile strings distinguish red fives (`0m/0p/0s`) from ordinary fives; never collapse
 them for tile-inventory accounting. A missing observation is not proof of absence.
 
+## Dependency environments
+
+The starter and `uv sync --frozen` use the tested versions in `uv.lock`, including
+Torch 2.6 / torchvision 0.21 from the CUDA 12.4 index. Package metadata permits
+compatible upgrades without changing that default. A wheel installer reads the
+package ranges; uv's project-specific CUDA index configuration is not embedded
+in the wheel.
+
+| Package | Allowed range | Boundary |
+|---|---|---|
+| Torch | `>=2.6,<3` | Supports the checkpoint-loading and inference APIs in use; excludes a new major API. |
+| torchvision | `>=0.21,<0.30` | Covers the matching Torch 2.6–2.14 pairs; its own dependency selects the exact Torch version. |
+| NumPy | `>=2.5.3,<3` | Starts at the tested numerical baseline; excludes a new major ABI. |
+| OpenCV | `>=5.0.0.93,<6` | Starts at the tested image-processing baseline; excludes a new major API. |
+| LibreYOLO | `>=1.5,<1.6` | Allows patch updates; the adapter accesses YOLO9 internals, so a new minor series needs validation. |
+
+These ranges express installation compatibility, not a claim that every version
+has identical output or speed. Keep Torch and torchvision paired according to
+[PyTorch's installation matrix](https://pytorch.org/get-started/previous-versions/).
+Torch 2.14 / torchvision 0.29 is an available alternative, not the default.
+Select its CUDA build for the installed driver and measure the full workload;
+a newer runtime does not necessarily run faster.
+
+To try that pair without modifying the starter environment or lock, use a
+separate environment. From the source folder, with a current uv:
+
+```powershell
+uv venv --python 3.12 work/runtime-cu130
+uv pip install --python work/runtime-cu130/Scripts/python.exe --no-sources --torch-backend cu130 "torch==2.14.0" "torchvision==0.29.0" .
+& ./work/runtime-cu130/Scripts/video2tenhou.exe web
+```
+
+On Linux, use `work/runtime-cu130/bin/python` for `--python` and launch
+`work/runtime-cu130/bin/video2tenhou web`. A released application wheel can replace
+`.` in the installation command. `--no-sources` bypasses the checkout's CUDA
+12.4 source rule for this explicit experiment. Launch this environment directly;
+the starter launchers intentionally restore the frozen default environment.
+
+Keep a separate `VIDEO2TENHOU_HOME` with the same model bundle and copies of the
+review inputs for comparisons. Numerical runtime changes invalidate recognition
+caches; run analysis before rebuilding answers. Record package/tool versions,
+compare evidence and exports, and follow the [benchmark procedure](PERFORMANCE.md).
+
 ## Data and caches
 
 Public source includes code, built-in layouts/templates, UI art, small curated
