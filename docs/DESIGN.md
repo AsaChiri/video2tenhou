@@ -1075,11 +1075,14 @@ question per uncertain draw. The kinds, in that order of priority:
    read found, or a hidden call): its type, tiles and source.
 
 Item kinds: `ura`, `conflict`, `result`, `call`, `discard`, `dora`, `kan`,
-`riichi`, `order`, `draw`, `haipai`, `lost`, `uncertain_tiles`, `solver_incomplete`. Each item: hand, seat, time(s),
+`riichi`, `order`, `draw`, `uncertain_tiles`, `solver_incomplete`. Each item: hand, seat, time(s),
 question, candidates with costs, evidence crops (region, t), the best guess,
-and the control it is answered with. Facts file entries mirror the kinds and
-are applied as hard constraints on the next decode, after everything the
-program inferred (a fact always wins). The confidence rows of section 5 hold
+and the control it is answered with. Starting-hand choices appear inside
+`uncertain_tiles`; unseen draws use `draw` items. Review answers are stored as
+facts, including `haipai` confirmations and `lost` acknowledgements. Confirmed
+tiles constrain the next decode. Imported hand annotations must explicitly
+declare `soft: true` for uncertain evidence or `soft: false` for confirmed tiles;
+their source names do not determine trust. The confidence rows of section 5 hold
 every decision: one per draw, discard, haipai, call and indicator, with its
 margin, the evidence it rests on, `human` when a fact fixed it and `lost`
 when nothing did.

@@ -9,7 +9,8 @@ import pytest
 from tests.paths import ROOT
 
 
-@pytest.mark.parametrize("case,expected", [("success", 0), ("sync_failure", 7),
+@pytest.mark.parametrize("case,expected", [("success", 0), ("setup_failure", 7), ("venv_failure", 6),
+                                            ("cpu", 0), ("custom_backend", 0),
                                             ("runtime_failure", 9), ("missing_tool", 1),
                                             ("missing_english", 1)])
 def test_launcher_paths_arguments_and_failure_boundaries(tmp_path, case, expected):
@@ -23,14 +24,26 @@ def test_launcher_paths_arguments_and_failure_boundaries(tmp_path, case, expecte
     launcher = "Start.cmd" if windows else "start.sh"
     shutil.copyfile(ROOT / launcher, checkout / launcher)
     env = {**os.environ, "LAUNCH_LOG": str(log), "VIDEO2TENHOU_HOME": str(data_home),
-           "SYNC_EXIT": "7" if case == "sync_failure" else "0",
+           "SETUP_EXIT": "7" if case == "setup_failure" else "0",
+           "VENV_EXIT": "6" if case == "venv_failure" else "0",
            "RUN_EXIT": "9" if case == "runtime_failure" else "0"}
+    env.pop("UV_TORCH_BACKEND", None)
+    env.pop("VIDEO2TENHOU_DEVICE", None)
+    if case == "cpu":
+        env["VIDEO2TENHOU_DEVICE"] = "cpu"
+    if case == "custom_backend":
+        env["UV_TORCH_BACKEND"] = "chosen-backend"
     if windows:
         env["PATH"] = str(tools) + os.pathsep + str(Path(os.environ["SystemRoot"]) / "System32")
         env["ProgramFiles"] = str(tmp_path / "no installed fallback")
+        env["USERPROFILE"] = str(tmp_path / "no user fallback")
+        env["LOCALAPPDATA"] = str(tmp_path / "no winget fallback")
         uv = tools / "uv.cmd"
         uv.write_text('@echo off\n>>"%LAUNCH_LOG%" echo %CD%^|%VIDEO2TENHOU_HOME%^|%*\n'
-                      'if "%1"=="sync" exit /b %SYNC_EXIT%\nexit /b %RUN_EXIT%\n')
+                      'if not "%UV_PROJECT_ENVIRONMENT%"==".venv-runtime" exit /b 81\n'
+                      'if "%1"=="venv" exit /b %VENV_EXIT%\n'
+                      'if "%1"=="pip" exit /b %SETUP_EXIT%\n'
+                      'exit /b %RUN_EXIT%\n')
         for tool in ("ffmpeg", "ffprobe", "tesseract"):
             if tool == "ffprobe" and case == "missing_tool":
                 continue
@@ -46,7 +59,10 @@ def test_launcher_paths_arguments_and_failure_boundaries(tmp_path, case, expecte
             (tools / tool).symlink_to(executable)
         uv = tools / "uv"
         uv.write_text('#!/bin/sh\nprintf "%s|%s|%s\\n" "$PWD" "$VIDEO2TENHOU_HOME" "$*" >> "$LAUNCH_LOG"\n'
-                      'if [ "$1" = sync ]; then exit "$SYNC_EXIT"; fi\nexit "$RUN_EXIT"\n')
+                      'if [ "$UV_PROJECT_ENVIRONMENT" != .venv-runtime ]; then exit 81; fi\n'
+                      'if [ "$1" = venv ]; then exit "$VENV_EXIT"; fi\n'
+                      'if [ "$1" = pip ]; then exit "$SETUP_EXIT"; fi\n'
+                      'exit "$RUN_EXIT"\n')
         uv.chmod(0o755)
         for tool in ("ffmpeg", "ffprobe", "tesseract"):
             if tool == "ffprobe" and case == "missing_tool":
@@ -67,7 +83,10 @@ def test_launcher_paths_arguments_and_failure_boundaries(tmp_path, case, expecte
     calls = [line.split("|", 2) for line in log.read_text().splitlines()]
     assert all(Path(cwd).resolve() == checkout.resolve() and home == str(data_home)
                for cwd, home, _ in calls)
-    assert calls[0][2] == "sync --frozen --no-dev"
-    assert len(calls) == (1 if case == "sync_failure" else 2)
-    if len(calls) == 2:
-        assert calls[1][2] == "run --no-sync video2tenhou web --port 8898 --no-browser"
+    assert len(calls) == (1 if case == "venv_failure" else 2 if case == "setup_failure" else 3)
+    assert calls[0][2] == "venv --allow-existing --python 3.12 .venv-runtime"
+    if len(calls) > 1:
+        backend = "cpu" if case == "cpu" else "chosen-backend" if case == "custom_backend" else "auto"
+        assert calls[1][2].replace('"', '') == f"pip install --python .venv-runtime --torch-backend {backend} --upgrade-package torch --upgrade-package torchvision --editable ."
+    if len(calls) > 2:
+        assert calls[2][2] == "run --no-sync video2tenhou web --port 8898 --no-browser"

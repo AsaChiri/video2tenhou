@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 
-from .face_data import file_hash
+from ..files import sha256_file as file_hash
 from ..perception.evidence_policy import resolve_policy
+from ..perception.detector_metadata import inference_settings
 
 
 def export_inference_checkpoint(source: Path, target: Path) -> dict:
@@ -82,12 +82,7 @@ def write_runtime_metadata(weights: Path, *, confidence: float, imgsz: int = 102
     target = weights.with_name("meta.json")
     if target.exists():
         raise FileExistsError(target)
-    if not isinstance(imgsz, int) or isinstance(imgsz, bool) or imgsz <= 0:
-        raise ValueError("Image size must be a positive integer")
-    if not isinstance(cuda_graph, bool):
-        raise ValueError("CUDA graph setting must be boolean")
-    if any(isinstance(value, bool) or not math.isfinite(value) or not 0 < value <= 1 for value in (confidence, iou)):
-        raise ValueError("Confidence and IoU must be finite values in (0, 1]")
+    inference = inference_settings(dict(imgsz=imgsz, confidence=confidence, iou=iou, cuda_graph=cuda_graph))
     policy = resolve_policy(evidence_policy)
     checkpoint = torch.load(weights, map_location="cpu", weights_only=True)
     if (not isinstance(checkpoint, dict) or checkpoint.get("model_family") != "yolo9" or
@@ -97,10 +92,10 @@ def write_runtime_metadata(weights: Path, *, confidence: float, imgsz: int = 102
         raise ValueError("Metadata requires a standard YOLO9 face checkpoint with a known size")
     metadata = dict(schema_version=1, backend="libreyolo", architecture=f"yolo9-{checkpoint['size']}",
                     classes={"0": "face"}, weights_sha256=file_hash(weights),
-                    inference=dict(imgsz=imgsz, confidence=confidence, iou=iou),
+                    inference=inference,
                     evidence_policy=policy.to_dict())
-    if cuda_graph:
-        metadata["inference"]["cuda_graph"] = True
+    if not cuda_graph:
+        del inference["cuda_graph"]
     with target.open("x", encoding="utf-8") as stream:
         json.dump(metadata, stream, indent=2)
     return target

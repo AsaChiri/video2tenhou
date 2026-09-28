@@ -159,9 +159,7 @@ def kakan(added: int, a: int, b: int, c: int, rel: Rel) -> str:
     pon's original feeder position; tenhou marks the added tile with 'k' at
     that slot.
     """
-    parts = [str(a), str(b), str(c)]
-    parts.insert(rel, f"k{added}")
-    return "".join(parts)
+    return _place("k", added, (a, b, c), rel)
 
 
 def discard(t: int, *, tsumogiri: bool = False, riichi: bool = False) -> Union[int, str]:
@@ -557,12 +555,10 @@ class _Replay:
         if self.ura and len(self.ura) != len(self.dora):
             self.bad(f"{len(self.ura)} ura indicator(s) under {len(self.dora)} dora indicator(s)")
         res = self.result if isinstance(self.result, list) and self.result else [None]
-        winners = []
         if res[0] == AGARI:
             for w in range(1, len(res), 2):
                 delta, info = res[w], res[w + 1]
                 winner, frm = info[0], info[1]
-                winners.append(winner)
                 hand = Counter(self.hands[winner])
                 if winner != frm:
                     if self.last is None or self.last[0] != frm:

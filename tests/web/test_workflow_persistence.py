@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from video2tenhou.tool import workflow
+from video2tenhou import files
 
 
 @pytest.fixture
@@ -47,7 +48,7 @@ def test_failed_admission_keeps_manifest_and_allows_retry(project, monkeypatch, 
 
     with monkeypatch.context() as patch:
         if boundary == "temporary_file":
-            patch.setattr(workflow.tempfile, "NamedTemporaryFile", denied)
+            patch.setattr(files.tempfile, "NamedTemporaryFile", denied)
         else:
             patch.setattr(Path, "replace", replace)
         with pytest.raises(ValueError, match="Could not save the project"):
@@ -183,7 +184,7 @@ def test_create_failure_does_not_leave_an_unopenable_project(tmp_path, monkeypat
         raise PermissionError("cannot create manifest")
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(workflow.tempfile, "NamedTemporaryFile", denied)
+            patch.setattr(files.tempfile, "NamedTemporaryFile", denied)
             with pytest.raises(PermissionError):
                 workspace.create({"source": str(video), "games": [1]})
         assert workspace.projects == {}

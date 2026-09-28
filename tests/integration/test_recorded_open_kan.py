@@ -1,18 +1,16 @@
 """Real omitted kan-window evidence corrects a draw without a human constraint."""
 
 from tests.paths import DATA
+from tests.integration.helpers import restore_model
 import copy
 import gzip
 import json
-from pathlib import Path
 from types import SimpleNamespace
-
-import numpy as np
 
 from video2tenhou.engine import dense
 from video2tenhou.engine.assemble import kyoku_from_decode
 from video2tenhou.engine.review import draws_to_reread
-from video2tenhou.engine.solver import DrawEvidence, Facts, HandEvidence, HandModel, SeatTurn, Solution, WinSpec
+from video2tenhou.engine.solver import Solution
 from video2tenhou.record import HandResult
 from video2tenhou.tenhou6 import replay_kyoku
 
@@ -20,17 +18,7 @@ from video2tenhou.tenhou6 import replay_kyoku
 def test_recorded_open_kan_window_corrects_confident_inference(monkeypatch, tmp_path):
     with gzip.open(DATA / "week11_open_kan.json.gz", 'rt', encoding='utf-8') as stream:
         case = json.load(stream)
-    data = case['model']
-    turns = {seat: [SeatTurn(**{**t, 'discard_p': np.array(t['discard_p']) if t['discard_p'] is not None else None})
-                    for t in rows] for seat, rows in data['turns'].items()}
-    model = HandModel(data['dealer'], turns, data['indicators'], tsumo_winner=data['tsumo_winner'], ura=data['ura'])
-    model.hand_ev = [HandEvidence(**{**row, 'e': np.array(row['e'])}) for row in data['hand_ev']]
-    model.draw_ev = [DrawEvidence(**{**row, 'p': np.array(row['p'])}) for row in data['draw_ev']]
-    model.facts = Facts(**{**data['facts'], 'draws': {(row['seat'], row['j']): row['tile'] for row in data['facts']['draws']}})
-    for name in ('end_prior', 'repair', 'forbidden_hands', 'bound_hands', 'tenpai', 'result_constraints'):
-        setattr(model, name, data[name])
-    win = data['win']
-    model.win = WinSpec(**{**win, 'ron_from': tuple(win['ron_from']) if win['ron_from'] is not None else None})
+    model = restore_model(case['model'])
     reference = case['reference']
     prior = Solution('optimal', reference['solver']['objective'], reference['haipai'],
                      {(key.split(':')[0], int(key.split(':')[1])): value for key, value in reference['draws'].items()}, {})

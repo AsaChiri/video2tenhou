@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from ..layout import Calibration, fit_path, quad_to_box
 from .data import CLASSES, HELD_OUT_HANDS, hand_of, hand_table, load_labels, region_upright, to_crop
-from .face_data import file_hash
+from ..files import sha256_file as file_hash
 from .train_classifier import Crops, make_model, predict_logits, to_tensor
 
 

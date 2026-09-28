@@ -7,9 +7,21 @@ describe coordinates, seat conventions, effects and failure behavior. Read them
 alongside the detailed [design](DESIGN.md), rather than treating cached JSON as
 an undocumented source of truth.
 
+Before adding an implementation, check the standard library, installed tools and
+existing project functions. Share code when its inputs, behavior and failure
+guarantees match; do not combine algorithms merely because their loops look alike.
+Remove obsolete callers and wrappers when consolidating, and check CLI entry
+points, browser callbacks, saved formats and tests before declaring code dead.
+Historical behavior and backward compatibility are not reasons to retain an
+implementation. Require a concrete current use; update owned callers and fixtures
+to the current contract, and regenerate derived data instead of maintaining
+obsolete formats. Keep human evidence intact and reject ambiguous inputs rather
+than silently changing their meaning.
+
 | Modules | Responsibility / boundary |
 |---|---|
 | `paths` | Immutable package assets vs writable `VIDEO2TENHOU_HOME`. |
+| `files` | Streaming file digests and atomic UTF-8/JSON publication using standard-library primitives. |
 | `video` | Download, probe, normalized BGR frames; external decoder errors propagate. |
 | `layout`, `calibfit` | Frame/region transforms and per-video fitting; failing borders block analysis. |
 | `overlay`, `record`, `timeline` | Read header pixels, normalize authoritative results, align hand windows. |
@@ -32,46 +44,54 @@ them for tile-inventory accounting. A missing observation is not proof of absenc
 
 ## Dependency environments
 
-The starter and `uv sync --frozen` use the tested versions in `uv.lock`, including
-Torch 2.6 / torchvision 0.21 from the CUDA 12.4 index. Package metadata permits
-compatible upgrades without changing that default. A wheel installer reads the
-package ranges; uv's project-specific CUDA index configuration is not embedded
-in the wheel.
+The launchers use uv directly: `uv venv --allow-existing` provides Python 3.12,
+then `uv pip install --torch-backend auto --upgrade-package torch
+--upgrade-package torchvision --editable .` resolves a matched runtime for the
+machine. There is no fixed CUDA index or exact PyTorch version in the starter
+setup. uv owns hardware/driver detection, package resolution, downloads and
+caching. Keep uv current as new GPU generations are released.
+
+The starter uses `.venv-runtime`, separate from the development `.venv`.
+`UV_PROJECT_ENVIRONMENT` and `uv run --no-sync` launch that selected environment
+without applying the development lockfile. Every launch checks for a compatible
+current Torch/torchvision pair; installed packages and cached downloads are reused
+where possible. `UV_OFFLINE=1` uses uv's cache without network access (a successful
+initial setup is required). Interrupted installations can be retried by relaunching.
+
+Before opening the studio, the application checks convolution, matrix multiplication
+and torchvision NMS. The detector and classifier share the same checked device.
+An automatic GPU check failure falls back to CPU with a warning; explicit device
+choices fail visibly. This catches unsupported GPU architectures even when CUDA
+reports that a GPU is available.
 
 | Package | Allowed range | Boundary |
 |---|---|---|
 | Torch | `>=2.6,<3` | Supports the checkpoint-loading and inference APIs in use; excludes a new major API. |
-| torchvision | `>=0.21,<0.30` | Covers the matching Torch 2.6–2.14 pairs; its own dependency selects the exact Torch version. |
+| torchvision | `>=0.21,<0.30` | Its dependency selects the matching Torch version. |
 | NumPy | `>=2.5.3,<3` | Starts at the tested numerical baseline; excludes a new major ABI. |
 | OpenCV | `>=5.0.0.93,<6` | Starts at the tested image-processing baseline; excludes a new major API. |
 | LibreYOLO | `>=1.5,<1.6` | Allows patch updates; the adapter accesses YOLO9 internals, so a new minor series needs validation. |
 
 These ranges express installation compatibility, not a claim that every version
-has identical output or speed. Keep Torch and torchvision paired according to
-[PyTorch's installation matrix](https://pytorch.org/get-started/previous-versions/).
-Torch 2.14 / torchvision 0.29 is an available alternative, not the default.
-Select its CUDA build for the installed driver and measure the full workload;
-a newer runtime does not necessarily run faster.
+has identical output or speed. Numerical runtime changes invalidate recognition
+caches. Validate evidence, exports and workload performance when changing stacks.
+The lockfile remains a development/CI snapshot, not the starter's runtime policy.
 
-To try that pair without modifying the starter environment or lock, use a
-separate environment. From the source folder, with a current uv:
+Set `VIDEO2TENHOU_DEVICE=cpu` before launching to install and use a CPU build.
+Advanced users can set `UV_TORCH_BACKEND` to a backend supported by their installed
+uv; normal launches default to `auto`. Neither option edits the project or lockfile.
+A manual environment can use the same adaptive resolver:
 
 ```powershell
-uv venv --python 3.12 work/runtime-cu130
-uv pip install --python work/runtime-cu130/Scripts/python.exe --no-sources --torch-backend cu130 "torch==2.14.0" "torchvision==0.29.0" .
-& ./work/runtime-cu130/Scripts/video2tenhou.exe web
+uv venv --python 3.12 work/runtime
+uv pip install --python work/runtime/Scripts/python.exe --torch-backend auto .
+& ./work/runtime/Scripts/video2tenhou.exe web
 ```
 
-On Linux, use `work/runtime-cu130/bin/python` for `--python` and launch
-`work/runtime-cu130/bin/video2tenhou web`. A released application wheel can replace
-`.` in the installation command. `--no-sources` bypasses the checkout's CUDA
-12.4 source rule for this explicit experiment. Launch this environment directly;
-the starter launchers intentionally restore the frozen default environment.
-
+On Linux use `work/runtime/bin/python` and `work/runtime/bin/video2tenhou`.
 Keep a separate `VIDEO2TENHOU_HOME` with the same model bundle and copies of the
-review inputs for comparisons. Numerical runtime changes invalidate recognition
-caches; run analysis before rebuilding answers. Record package/tool versions,
-compare evidence and exports, and follow the [benchmark procedure](PERFORMANCE.md).
+review inputs for comparisons. Record package/tool versions and follow the
+[benchmark procedure](PERFORMANCE.md).
 
 ## Data and caches
 
@@ -80,6 +100,12 @@ fixtures and guides. `samples/`, `videos/`, `models/`, `weights/`, `labels/`,
 `work/`, `out/`, logs and build output are local and ignored. Keep backups of
 labels; answers are input data. Do not restore private datasets into Git to make
 a test pass.
+
+Imported `haipai` and `final_hand` annotations carrying `source` must explicitly
+set boolean `soft`: true contributes uncertain evidence, false fixes a
+human-confirmed hand. Unsourced review answers default to confirmed. Source names
+never determine annotation strength, and ambiguous imported annotations are
+rejected without rewriting the saved journal.
 
 Stage data lives under `work/<video>/`: header and hand windows, calm intervals,
 per-hand reads, aggregated observations, dense reads and decoded hands. Results

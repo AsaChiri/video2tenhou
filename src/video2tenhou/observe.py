@@ -10,20 +10,18 @@ and stays changed splits the interval into two observations.
 """
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Optional
 
 import numpy as np
 
 from .calm import Interval, REGIONS
+from .files import atomic_write_json, sha256_file
 from .train.data import CLASSES
-from .perception.evidence_policy import prepare_reading, resolve_policy, restructure as _restructure
+from .perception.evidence_policy import prepare_reading, resolve_policy
 
 NC = len(CLASSES)
 PERSIST = 0.5
@@ -81,11 +79,6 @@ class Observation:
                 "count": self.count, "quality": round(self.quality, 3), "slots": [s.to_dict() for s in self.slots],
                 "indicators": [s.to_dict() for s in self.indicators], "partial": self.partial,
                 "extra": [[s.to_dict() for s in g] for g in self.extra]}
-
-
-def restructure(kind: str, reading: dict) -> None:
-    """Reassign stored boxes in place using the shared evidence preparation rules."""
-    _restructure(kind, reading)
 
 
 def _key(kind: str, b: dict, i: int) -> Optional[tuple]:
@@ -162,7 +155,7 @@ def observe(region: str, readings: list[dict], iv: Interval, *, policy=None) -> 
 def _observe_prepared(region: str, rs: list[dict], iv: Interval) -> Observation:
     """Vote on already structured evidence; the interval split reuses the work."""
     kind = region.partition(":")[0]
-    obs = Observation(region, iv.t0, iv.t1, len(rs), 0, 0, 0.0, partial=bool(getattr(iv, "partial", False)),
+    obs = Observation(region, iv.t0, iv.t1, len(rs), 0, 0, 0.0, partial=iv.partial,
                       iv_t0=iv.t0, iv_t1=iv.t1)
     if not rs:
         return obs
@@ -227,8 +220,7 @@ def _observe_prepared(region: str, rs: list[dict], iv: Interval) -> Observation:
 def _digest(path: Path) -> str | None:
     if not path.exists():
         return None
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    return sha256_file(path)
 
 
 def _observation_inputs(work: Path, hand: dict, ivs: list[Interval], *, policy=None) -> dict:
@@ -250,22 +242,6 @@ def _observation_current(work: Path, hand: dict, inputs: dict) -> bool:
                 and manifest["output_sha256"] == _digest(work / "obs" / f"{hand['hand']:02d}.json"))
     except (OSError, ValueError):
         return False
-
-
-def _atomic_json(path: Path, value: dict) -> None:
-    pending = None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                prefix=".observe-", suffix=".tmp", delete=False) as stream:
-            pending = Path(stream.name)
-            json.dump(value, stream, ensure_ascii=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        pending.replace(path)
-    finally:
-        if pending is not None:
-            pending.unlink(missing_ok=True)
 
 
 def validate_observation_cache(work: Path, hands: list[dict], ivs: list[Interval] | None = None,
@@ -330,8 +306,8 @@ def run_observe(work: Path, hands: list[dict], ivs: list[Interval], *, force: bo
             stats["observations"] += len(obs_list)
         if inputs != _observation_inputs(work, h, ivs, policy=policy):
             raise ValueError("Reading inputs changed while building observations; retry analysis.")
-        _atomic_json(out, result)
-        _atomic_json(odir / "provenance" / f"{h['hand']:02d}.json",
+        atomic_write_json(out, result)
+        atomic_write_json(odir / "provenance" / f"{h['hand']:02d}.json",
                      {"inputs": inputs, "output_sha256": _digest(out)})
         changed.append(h["hand"])
         stats["hands"] += 1

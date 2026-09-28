@@ -50,7 +50,6 @@ class SeatTurn:
     t_discard: float                # when the discard was first seen
     removed: list[str] = field(default_factory=list)   # tiles that left the hand into a meld this turn
     riichi: bool = False
-    rinshan: bool = False           # a draw from the dead wall (after a kan)
     discard_p: Optional[np.ndarray] = None   # 37-kind posterior of the discard: the solver may take the 2nd choice at a cost
     kan: Optional[str] = None       # ankan | kakan | daiminkan when this turn contains a kan
     kan_tile: Optional[str] = None  # the kan's tile kind, None when unknown (the solver chooses it)
@@ -151,7 +150,6 @@ class HandModel:
         self.hand_ev: list[HandEvidence] = []
         self.draw_ev: list[DrawEvidence] = []
         self.facts = Facts()
-        self.end_prior: dict[str, tuple[int, int]] = {}   # seat -> (draws seen at the left end, at the right end)
         self.repair = False                               # every discard a choice over all kinds (DESIGN.md 4.8 Repair)
         self.forbidden_hands: list[tuple[str, int, list[str]]] = []   # (seat, j, tiles): hands the next-best solve must avoid
         self.bound_hands: list[tuple[str, int, list[str]]] = []       # (seat, j, tiles): hands the site's score requires
@@ -390,7 +388,6 @@ class HandModel:
                     terms.append(w * c * d[key][k])
         terms += disc_cost
         m.Minimize(sum(terms) if terms else 0)
-        m._objective_terms = terms                      # for the margin checks (per model: builds run in threads)
         self._x, self._d2, self._y, self._vr, self._mo = x, d2, y, vr, mo
         return m, h0, d, hands
 

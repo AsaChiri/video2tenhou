@@ -17,6 +17,7 @@ import re
 import stat
 import time
 import zipfile
+from video2tenhou.files import sha256_file
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -41,15 +42,6 @@ partial manifest for diagnosis and choose a new destination to retry. Do not
 merge these files into human labels automatically. Retain image and teacher
 provenance when deciding whether the eventual dataset/model can be distributed.
 """
-
-
-def sha256_file(path):
-    """Hash a file without loading it into memory."""
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def validate_classes(names):

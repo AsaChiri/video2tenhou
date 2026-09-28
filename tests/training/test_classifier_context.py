@@ -32,7 +32,7 @@ def corpus(tmp_path, monkeypatch):
         dict(tile="none", quad=[[0, 0], [20, 0], [20, 20], [0, 20]])]),
         dict(kind="pond", corner="BR", t=99., boxes=[]),
         dict(kind="hand", corner="TR", t=40.2, boxes=[])]
-    hands = [dict(t_start=i*10, t_end=i*10+9.8) for i in range(5)]
+    hands = [dict(t_overlay=[i*10, i*10+9.8]) for i in range(5)]
     monkeypatch.setattr(cc, "load_labels", lambda _: labels)
     monkeypatch.setattr(cc, "hand_table", lambda *_: hands)
     monkeypatch.setattr(cc.Calibration, "load", lambda *_: SimpleNamespace(data={"fixture": True}))

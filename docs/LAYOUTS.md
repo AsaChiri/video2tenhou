@@ -67,6 +67,13 @@ Moving a strip works; rearranging the text around the glyph requires changing
 in `overlay.py`. Different fonts need new templates/reader and regression frames.
 The centre-unit template is also PML-specific.
 
+Source-maintenance helpers for rebuilding these packaged assets are
+`overlay.save_digit_templates`, `overlay.save_wind_templates`, and
+`calibfit.write_unit_template`. Supply known text/wind labels and a trusted
+reference calibration; these are offline asset-authoring utilities, not part of
+normal video processing. Review regenerated assets and regression frames before
+shipping them with a layout.
+
 For different tile faces or perspectives, label examples in the browser and
 retrain. Hold out whole hands or recordings, not neighbouring frames. Keep
 calibration, model checksums, label conventions and measured accuracy together

@@ -11,8 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-import os
-import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -23,11 +21,12 @@ import numpy as np
 
 from . import video
 from .cache import source_identity
+from .files import atomic_write_text
 from .calm import Interval, REGIONS, geometry_key, region_key
 from .layout import Calibration
 from .perception.classifier import Classifier
 from .perception.detector import Detector
-from .perception.evidence_policy import DEFAULT_POLICY, prepare_reading
+from .perception.evidence_policy import prepare_reading
 from .perception.reader import read_regions
 from .train.data import region_upright
 
@@ -38,7 +37,7 @@ PREPROCESSING = "upright-bgr-frame1920x1080-v2"
 
 
 def _model_metadata(clf) -> dict:
-    return {"classes": getattr(clf, "classes", None), "temperature": getattr(clf, "T", None)}
+    return {"classes": clf.classes, "temperature": clf.T}
 
 
 def _read_identity(path: str | Path, clf: Classifier) -> dict:
@@ -73,21 +72,6 @@ def validate_read_cache(path: str | Path, cal: Calibration, work: Path, hands: l
         raise ValueError("Saved readings no longer match the recording, recognition models or table geometry "
                          f"for hand(s) {', '.join(stale)}. Choose Analyze recording to refresh evidence "
                          "before rebuilding logs.")
-
-
-def _atomic_text(path: Path, content: str) -> None:
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                         prefix=".read-", suffix=".tmp", delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
 
 
 def planned_times(ivs: list[Interval], t0: float, t1: float, cap: int = CAP, fps: float = FPS) -> dict[str, set[float]]:
@@ -241,9 +225,9 @@ def run_read(path: str | Path, cal: Calibration, work: Path, hands: list[dict], 
         # multi-region replacement from authenticating mixed old/new evidence.
         done.unlink(missing_ok=True)
         for r in REGIONS:
-            _atomic_text(_region_file(hdir, r), "".join(json.dumps(rows[r][t]) + "\n" for t in sorted(rows[r])))
+            atomic_write_text(_region_file(hdir, r), "".join(json.dumps(rows[r][t]) + "\n" for t in sorted(rows[r])))
         total = sum(len(values) for values in rows.values())
-        _atomic_text(done, json.dumps({"hand": h["hand"], "readings": total, "detector": det.id,
+        atomic_write_text(done, json.dumps({"hand": h["hand"], "readings": total, "detector": det.id,
                      "classifier": clf.id, "cap": cap, "geometry": geom, "identity": identity,
                      "window": window, "plan": schedule}, indent=1))
         touched.add(h["hand"])
@@ -263,7 +247,7 @@ def dense_key(det: Detector, clf: Classifier, cal: Calibration) -> str:
     """Bind dense evidence to recognition, geometry and its stage-specific retention policy."""
     return hashlib.sha256(json.dumps([det.id, clf.id, _model_metadata(clf), PREPROCESSING,
                                      geometry_key(cal),
-                                     getattr(det, 'evidence_policy', DEFAULT_POLICY).fingerprint_for('dense')], sort_keys=True).encode()).hexdigest()[:20]
+                                     det.evidence_policy.fingerprint_for('dense')], sort_keys=True).encode()).hexdigest()[:20]
 
 
 def clear_dense(work: Path) -> None:
@@ -322,7 +306,7 @@ def dense_reads(path: str | Path, cal: Calibration, work: Path, det: Detector, c
     not enough), cached under work/dense by window, models and geometry. Returns region -> readings (dicts),
     structure recomputed as in observe. One CPU crop batch is prepared ahead of
     inference; sampled pixels, order and classifier batch boundaries are unchanged."""
-    policy = getattr(det, 'evidence_policy', DEFAULT_POLICY)
+    policy = det.evidence_policy
     ddir = work / "dense"
     ddir.mkdir(parents=True, exist_ok=True)
     signature = {"window": [t0, t1], "fps": fps, "regions": sorted(regions),
@@ -349,7 +333,7 @@ def dense_reads(path: str | Path, cal: Calibration, work: Path, det: Detector, c
     for r in regions:
         kind = r.partition(":")[0]
         out[r] = [prepare_reading(kind, rd, stage='dense', policy=policy) for rd in out[r]]
-    _atomic_text(cache, json.dumps(out))
+    atomic_write_text(cache, json.dumps(out))
     return out
 
 

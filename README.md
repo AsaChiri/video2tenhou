@@ -7,7 +7,7 @@ Analysis runs locally. The included layout supports Pacific Mahjong League
 
 ## Start
 
-1. Download **video2tenhou-0.1.2-starter.zip** from the
+1. Download **video2tenhou-0.1.3-starter.zip** from the
    [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
    It includes the application, PML layout and trained models.
 2. Follow the [one-time setup](docs/QUICKSTART.md#one-time-setup) to install
@@ -15,8 +15,11 @@ Analysis runs locally. The included layout supports Pacific Mahjong League
 3. Extract the ZIP into a folder you can write to. On Windows, double-click
    **Start.cmd**. On Linux, open a terminal in that folder and run **`bash start.sh`**.
 
-The launcher installs Python and the locked dependencies on first use, then
-opens the browser studio. No Git checkout or separate Python installation is
+The launcher installs Python and selects a compatible PyTorch/torchvision build
+for your hardware and driver, checks that inference works, then opens the browser
+studio. uv checks the runtime on each launch and reuses installed packages and
+cached downloads where possible. CPU mode is available when GPU acceleration cannot run.
+No Git checkout or separate Python installation is
 needed. Leave the launcher running while processing recordings. An NVIDIA
 CUDA GPU is recommended for practical analysis times.
 
@@ -49,7 +52,9 @@ uv build
 Tests use small committed fixtures and synthetic legal hands without downloaded
 VODs or model weights. See the [test guide](tests/README.md) for focused runs.
 
-The CLI remains available for scripts (`uv run video2tenhou --help`).
+The CLI remains available for scripts (`uv run video2tenhou --help`). Development
+uses the lockfile; the starter uses its own `.venv-runtime` environment and selects
+PyTorch dynamically within the supported package ranges.
 Generated recordings, labels, work caches and outputs stay local and ignored.
 Set `VIDEO2TENHOU_HOME` before launch to use another data directory.
 

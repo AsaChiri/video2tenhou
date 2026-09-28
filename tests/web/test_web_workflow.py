@@ -36,7 +36,7 @@ class Client:
 
 
 def test_review_items_project_certified_confidence_without_changing_evidence(web):
-    """Old item shapes gain sortable coverage/margins, never candidate gaps."""
+    """Review items gain certified coverage/margins from their confidence rows."""
     client, workspace, _ = web
     project = create_local(client, workspace)
     state = workspace.review_state(project["id"])
@@ -44,7 +44,7 @@ def test_review_items_project_certified_confidence_without_changing_evidence(web
     items = [
         dict(kind="draw", seat="N", j=0, tile="1m"),
         dict(kind="discard", seat="N", j=0, tile="2p"),
-        dict(kind="haipai", seat="N", hand=["1m"] * 13),
+        dict(kind="result", seat="N", tiles=["1m"] * 13),
         dict(kind="draw", seat="N", j=1, margin=0.25),
         dict(kind="discard", seat="N"),  # No turn identity: do not borrow another row.
         dict(kind="call", seat="N", alternative_gap=0.01),
@@ -66,7 +66,7 @@ def test_review_items_project_certified_confidence_without_changing_evidence(web
     assert [row["idx"] for row in rows] == list(range(6))
     assert all(row["hand"] == 0 for row in rows)
     assert [(row.get("margin"), row.get("lost")) for row in rows[:4]] == [
-        (0, True), (0.1, False), (None, False), (0.25, False)
+        (0, True), (0.1, False), (None, None), (0.25, False)
     ]
     assert rows[2]["tiles"] == ["1m"] * 13
     assert "margin" not in rows[4] and "lost" not in rows[4]
@@ -415,10 +415,6 @@ def test_failed_calibration_has_short_action_and_keeps_cli_details_in_log(web):
     assert "Calibration" in failed["job"]["error"] and "\n" not in failed["job"]["error"]
     assert "video2tenhou" not in failed["job"]["error"]
     assert any("video2tenhou review" in line for line in failed["job"]["log"])
-    # Existing failed projects receive the same concise display after an upgrade.
-    project = workspace.project(p["id"])
-    project["job"]["error"] = "The job stopped.\nvideo2tenhou review video.mp4 -> Calibrate"
-    assert client.request(f"/api/projects/{p['id']}")[1]["job"]["error"] == failed["job"]["error"]
 
 
 def test_jobs_are_serialized_and_review_writes_wait(web):
@@ -613,11 +609,11 @@ def test_replaced_source_hides_exports_and_retires_evidence_without_rehashing_po
     saved_facts = facts.read_bytes()
     old_revision = old_state.revision()
     calls = []
-    digest = cache.hashlib.file_digest
-    def counted(stream, algorithm):
-        calls.append(stream.name)
-        return digest(stream, algorithm)
-    monkeypatch.setattr(cache.hashlib, "file_digest", counted)
+    digest = cache.sha256_file
+    def counted(path):
+        calls.append(path)
+        return digest(path)
+    monkeypatch.setattr(cache, "sha256_file", counted)
     for _ in range(3):
         assert client.request(f"/api/projects/{key}")[1]["artifacts"]
     assert calls == []
@@ -660,8 +656,8 @@ def test_missing_source_is_a_recoverable_project_state(web):
     assert result["artifacts"] and not result["stale_exports"]
 
 
-@pytest.mark.parametrize("provenance", ["matching", "missing", "wrong"])
-def test_legacy_export_adoption_requires_each_hands_source_provenance(web, provenance):
+@pytest.mark.parametrize("missing", [("source_sha256",), ("export_signature",), ("source_sha256", "export_signature")])
+def test_missing_project_provenance_requires_regeneration_and_preserves_answers(web, missing):
     from video2tenhou.calm import REGIONS, region_key
     from video2tenhou.layout import Calibration
 
@@ -674,17 +670,57 @@ def test_legacy_export_adoption_requires_each_hands_source_provenance(web, prove
     cal = Calibration.load("pml", p["video"])
     done = workspace.root / "work" / p["name"] / "reads/00/done.json"
     done.parent.mkdir(parents=True)
-    manifest = {"geometry": {r: region_key(cal, r) for r in REGIONS}}
-    if provenance != "missing":
-        manifest["identity"] = {"source": workspace._source(p) if provenance == "matching" else "wrong"}
+    manifest = {"geometry": {r: region_key(cal, r) for r in REGIONS},
+                "identity": {"source": workspace._source(p)}}
     done.write_text(json.dumps(manifest))
+    facts = workspace.root / "labels" / p["name"] / "facts.jsonl"
+    answers = json.dumps({"hand": 0, "game": 0, "kyoku": 0, "honba": 0, "kind": "note", "text": "human answer"}) + "\n"
+    facts.write_text(answers)
     stored = workspace.project(key)
-    del stored["source_sha256"]
-    stored["export_signature"] = "old signature without source identity"
+    for field in missing:
+        del stored[field]
     status, result, _ = client.request(f"/api/projects/{key}")
     assert status == 200
-    assert bool(result["artifacts"]) == (provenance == "matching")
-    assert result["has_hands"] == (provenance == "matching")
+    assert result["artifacts"] == [] and not result["has_hands"] and not result["has_fit"]
+    assert result["needs_prepare"] and result["inputs_changed"]
+    assert result["export_signature"] is None
+    assert facts.read_text() == answers and done.read_text() == json.dumps(manifest)
+    assert client.request(f"/exports/{key}/g0.json")[0] == 404
+    assert client.request(f"/api/projects/{key}/analyze", {})[0] == 400
+    restarted = Workspace(workspace.root)
+    try:
+        assert restarted.snapshot(key)["artifacts"] == []
+    finally:
+        restarted.close()
+    for action in ("prepare", "analyze"):
+        assert client.request(f"/api/projects/{key}/{action}", {})[0] == 202
+        result = wait_for_job(client, key)
+    assert result["artifacts"] and result["has_hands"] and result["has_fit"]
+    assert facts.read_text() == answers
+
+
+def test_new_project_does_not_adopt_untracked_outputs(web):
+    client, workspace, _ = web
+    video = workspace.root / "recording.mp4"
+    video.write_bytes(b"video")
+    work = workspace.root / "work" / video.stem
+    work.mkdir(parents=True)
+    (work / "hands.json").write_text("[]")
+    (work / "record.json").write_text('[{"id":21938}]')
+    labels = workspace.root / "labels" / video.stem
+    labels.mkdir(parents=True)
+    (labels / "calib.json").write_text('{"layout":"pml"}')
+    answers = '{"kind":"note","text":"human answer"}\n'
+    (labels / "facts.jsonl").write_text(answers)
+    out = workspace.root / "out" / video.stem
+    out.mkdir(parents=True)
+    (out / "g0.json").write_text('{"log":[]}')
+    status, project, _ = client.request("/api/projects", {"source": str(video), "games": [21938]})
+    assert status == 201
+    assert project["export_signature"] is None and project["artifacts"] == []
+    assert not project["has_fit"] and not project["has_hands"]
+    assert project["needs_prepare"] and project["inputs_changed"]
+    assert (labels / "facts.jsonl").read_text() == answers
 
 
 def test_clip_cache_does_not_reuse_video_from_replaced_source(web, monkeypatch):
@@ -815,7 +851,7 @@ def test_untrusted_review_text_is_escaped_before_html_insertion(web, tmp_path):
     entry = client.request(f"/review/{p['id']}/api/hand/0")[1]["entry"]
     page = ROOT / "src/video2tenhou/tool/static/index.html"
     script = re.search(r"<script>([\s\S]*)</script>", page.read_text(encoding="utf-8"))[1]
-    helpers = script.split("const GLYPH = {};")[0] + "\nconst GLYPH = {};\n"
+    helpers = script.split("const GLYPH =")[0] + "\nconst GLYPH = {};\n"
     helpers += re.search(r"const tileHtml = .*", script)[0] + "\n"
     helpers += re.search(r"function factDesc\(f\) \{[\s\S]*?\n\}", script)[0] + "\n"
     helpers += "CUR_E = " + json.dumps(entry) + ";\n"

@@ -77,3 +77,15 @@ def test_metadata_does_not_accept_an_unknown_checkpoint_contract(tmp_path):
     with pytest.raises(ValueError, match="standard YOLO9 face"):
         export_detector.write_runtime_metadata(weights, confidence=.08)
     assert not weights.with_name("meta.json").exists()
+
+
+@pytest.mark.parametrize("settings", [
+    {"confidence": "0.2"}, {"confidence": None}, {"confidence": True},
+    {"confidence": float("inf")}, {"iou": 0}, {"imgsz": True}, {"cuda_graph": 1},
+])
+def test_metadata_rejects_invalid_runtime_settings_before_reading_checkpoint(tmp_path, settings):
+    weights = tmp_path / "weights.pt"
+    # Invalid inference settings must fail before a checkpoint is loaded or metadata is written.
+    with pytest.raises(ValueError, match="Detector"):
+        export_detector.write_runtime_metadata(weights, **{**dict(confidence=.08), **settings})
+    assert not weights.with_name("meta.json").exists()

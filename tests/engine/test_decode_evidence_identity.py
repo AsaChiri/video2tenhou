@@ -161,9 +161,9 @@ def test_interrupted_decode_publication_preserves_complete_result(tmp_path, monk
 
     monkeypatch.setattr(decode.json, 'dump', interrupted_dump)
     with pytest.raises(OSError, match='interrupted'):
-        decode._publish_decode(path, {})
+        decode.atomic_write_json(path, {})
     assert path.read_text() == '{"complete":true}'
-    assert not list(tmp_path.glob('.decode-*'))
+    assert not list(tmp_path.glob('.*.tmp'))
 
 
 def _policy(sparse_hand=.2, dense_hand=.2):

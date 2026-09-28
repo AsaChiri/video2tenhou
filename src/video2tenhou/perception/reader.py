@@ -17,7 +17,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..layout import Calibration
+from ..layout import Calibration, box_iou
 from ..train.data import CLASS_INDEX, crop_box, region_upright
 from .classifier import Classifier
 from .detector import Det, Detector
@@ -107,15 +107,6 @@ def _at_side(b: Box, region_w: Optional[float]) -> bool:
     return _at_left(b) or _at_right(b, region_w)
 
 
-def _iou(a: Box, b: Box) -> float:
-    iw = min(a.xyxy[2], b.xyxy[2]) - max(a.xyxy[0], b.xyxy[0])
-    ih = min(a.xyxy[3], b.xyxy[3]) - max(a.xyxy[1], b.xyxy[1])
-    if iw <= 0 or ih <= 0:
-        return 0.0
-    inter = iw * ih
-    return inter / (a.w * a.h + b.w * b.h - inter)
-
-
 def _tile_size(boxes: list[Box], region_h: Optional[float] = None) -> tuple[float, float]:
     """Median width / height of the upright face-up tiles (sideways ones swapped); tile backs and boxes cut
     by the region edge (the wall row) do not shape the estimate."""
@@ -134,12 +125,6 @@ def _cluster_rows(boxes: list[Box], th: float) -> list[list[Box]]:
         else:
             clusters.append([b])
     return clusters
-
-
-def _columns(cl: list[Box], tw: float) -> list[int]:
-    """Column of each box of a row sorted left to right: its rank. A called-away tile leaves no gap (the
-    next discard takes its position), and hand-laid tiles are spaced unevenly, so a gap means nothing."""
-    return list(range(len(cl)))
 
 
 def assign_pond(boxes: list[Box], region_h: Optional[float] = None, region_w: Optional[float] = None) -> bool:
@@ -198,19 +183,17 @@ def assign_pond(boxes: list[Box], region_h: Optional[float] = None, region_w: Op
     # (a player may start a new row under the third tile of the previous one)
     for r, cl in enumerate(rows):
         cl.sort(key=lambda b: b.cx)
-        cols = _columns(cl, tw)
-        if cols[-1] > 5 and not any(_at_side(b, region_w) for b in cl):
+        if len(cl) > 6 and not any(_at_side(b, region_w) for b in cl):
             # rule of six: a seventh position does not exist, and no neighbouring pond reaches this row.
             # A tile seen twice (two boxes on one tile) pushes the real sixth tile out: the less confident
             # of the overlapping boxes goes; if the row is still too long the reading is wrong as a whole
             # and is rejected, never truncated to six
-            dup = [b for b in cl if any(o is not b and _iou(b, o) > OVERLAP_IOU for o in cl)]
+            dup = [b for b in cl if any(o is not b and box_iou(b.xyxy, o.xyxy) > OVERLAP_IOU for o in cl)]
             if dup:
                 worst = min(dup, key=lambda b: b.conf)
                 worst.role = "other"
                 cl = [b for b in cl if b is not worst]
-                cols = _columns(cl, tw)
-            if cols[-1] > 5:
+            if len(cl) > 6:
                 for b in cl:
                     b.role = "other"
                 rejected = True
@@ -220,8 +203,8 @@ def assign_pond(boxes: list[Box], region_h: Optional[float] = None, region_w: Op
         while len(cl) > 6 and (_at_left(cl[0]) or _at_right(cl[-1], region_w)):
             b = cl.pop(0) if _at_left(cl[0]) else cl.pop()
             b.role = "other"
-        cols = _columns(cl, tw)
-        for b, col in zip(cl, cols):
+        # A called-away tile leaves no gap: columns are each row's left-to-right ranks.
+        for col, b in enumerate(cl):
             if col > 5:
                 b.role = "other"
                 continue
@@ -260,7 +243,7 @@ def assign_meld(boxes: list[Box]) -> None:
     for b in sorted(boxes, key=lambda b: -b.conf):
         if b.role != "other":
             for o in boxes:
-                if o is not b and o.role != "other" and _iou(b, o) > DUP_IOU:
+                if o is not b and o.role != "other" and box_iou(b.xyxy, o.xyxy) > DUP_IOU:
                     o.role = "other"
     live = [b for b in boxes if b.role != "other"]
     if not live:

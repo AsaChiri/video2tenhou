@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import subprocess
 from contextlib import closing
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from video2tenhou import read
 from video2tenhou.layout import Calibration
 from video2tenhou.perception.reader import Box, Reading
+from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
 from video2tenhou.train.data import CLASSES
 
 
@@ -55,7 +57,7 @@ def test_dense_prefetch_preserves_batches_pixels_posteriors_and_caller_thread(tm
     monkeypatch.setattr(read, 'region_upright', crop)
     monkeypatch.setattr(read, 'read_regions', infer)
     cal = Calibration.load('pml')
-    stub = type('Stub', (), {'id': 'model'})()
+    stub = SimpleNamespace(id='model', classes=CLASSES, T=1.0, evidence_policy=DEFAULT_POLICY)
     prefetch = read._prefetch_batches
     monkeypatch.setattr(read, '_prefetch_batches', lambda batches: batches)
     serial = read.dense_reads('video', cal, tmp_path/'serial', stub, stub, 3.125, 4.6, ['hand:TL', 'hand:TR'])
@@ -95,7 +97,7 @@ def test_dense_failure_closes_sampler_and_never_publishes_cache(tmp_path, monkey
     monkeypatch.setattr(read.video, 'sample', sample)
     monkeypatch.setattr(read, 'region_upright', lambda frame, *args: (frame, None))
     monkeypatch.setattr(read, 'read_regions', infer)
-    stub = type('Stub', (), {'id': 'model'})()
+    stub = SimpleNamespace(id='model', classes=CLASSES, T=1.0, evidence_policy=DEFAULT_POLICY)
     with pytest.raises(RuntimeError, match='failed'):
         read.dense_reads('video', Calibration.load('pml'), tmp_path, stub, stub, 0, 20, ['hand:TL'])
     assert closed.is_set()

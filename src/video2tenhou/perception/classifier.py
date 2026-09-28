@@ -12,7 +12,9 @@ import torch
 from ..train.data import CLASSES, to_crop
 from ..train.train_classifier import make_model, to_tensor
 from ..paths import MODEL_DIR
+from ..files import sha256_file
 from .runtime import runtime_signature
+from .device import select_device
 
 DEFAULT_DIR = MODEL_DIR / "classifier"
 PREPROCESSING = "resnet18-bgr-upright64x96-to_tensor-v1"
@@ -27,12 +29,11 @@ class Classifier:
         self.classes: list[str] = self.meta["classes"]
         assert self.classes == CLASSES
         self.T = float(self.meta.get("temperature", 1.0))
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = select_device(device)
         self.model = make_model(len(self.classes))
         self.model.load_state_dict(torch.load(model_dir / "weights.pt", map_location="cpu"))
         self.model.to(self.device).eval()
-        with (model_dir / "weights.pt").open("rb") as checkpoint:
-            weights_hash = hashlib.file_digest(checkpoint, "sha256").hexdigest()
+        weights_hash = sha256_file(model_dir / "weights.pt")
         self.id = hashlib.sha256(json.dumps({"weights": weights_hash, "metadata": self.meta,
                                              "preprocessing": PREPROCESSING,
                                              "runtime": runtime_signature(self.device)}, sort_keys=True).encode()).hexdigest()

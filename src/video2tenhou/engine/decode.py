@@ -8,19 +8,17 @@ that settle the hand, and the confidence of every decision. Each step is one met
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
-import os
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Optional
 
 import numpy as np
 
 from ..record import Game, HandResult
 from ..paths import DATA_DIR
+from ..files import atomic_write_json, sha256_file
 from ..train.data import CLASSES
 from . import dense, rules
 from .hand import corner_of, in_window, seat_of, site_seat, site_seat_name
@@ -31,7 +29,7 @@ from .ponds import PondSlot, play_window, track_pond
 from . import pond_evidence
 from .review import MARGIN_REVIEW, changed_discard, confidence_rows, draws_to_reread, facts_for_hand, load_facts, low_margin, ranked, turn_key, unseen_draw, uncertain_tiles, uncertain_discards
 from .scoring import is_tenpai, matches_site, payment, score_hand, score_text
-from .solver import (Culprit, HandEvidence, HandModel, SeatTurn, Solution, TI, TILES, WinSpec, diagnose, hand_evidence,
+from .solver import (Culprit, HandEvidence, HandModel, SeatTurn, Solution, TILES, WinSpec, diagnose, hand_evidence,
                      posterior_to_tiles)
 from .turns import Turn, assign_calls, merge
 
@@ -39,7 +37,7 @@ RIICHI_CLOSE = 0.5          # the two readings of a riichi on a called tile solv
 SWAP_FIVE = {"5m": "0m", "5p": "0p", "5s": "0s", "0m": "5m", "0p": "5p", "0s": "5s"}   # a five read as the other one
 NEXT_HANDS = 6              # next-best reconstructions tried for the site's score ...
 NEXT_BUDGET = 20.0          # ... at most this much costlier than the best (a re-reading beyond it is not the evidence's)
-DECODER_VERSION = 11        # bump when reconstruction semantics change; old cached logs must be rebuilt
+DECODER_VERSION = 12        # bump when reconstruction semantics change; old cached logs must be rebuilt
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -144,7 +142,6 @@ def seat_turns_of(turns: list[Turn], seat: str, dealer: str) -> tuple[list[SeatT
             continue
         kind = t.kind
         removed: list[str] = []
-        rinshan = False
         options: list = []
         if kind == "call" and t.own_call is not None:
             c = t.own_call
@@ -163,7 +160,6 @@ def seat_turns_of(turns: list[Turn], seat: str, dealer: str) -> tuple[list[SeatT
                 removed, options = _hand_tiles(c)
             if c.type != "kakan":
                 n_melds += 1
-            rinshan = True
             if t.slot is None:
                 # the winner's kan after its last discard: the rinshan draw is the winning draw (the final draw
                 # variable), so this turn holds the normal draw only (ankan / kakan) or no draw (daiminkan)
@@ -179,7 +175,7 @@ def seat_turns_of(turns: list[Turn], seat: str, dealer: str) -> tuple[list[SeatT
         draw_min = (predecessor.slot.t_window[0]
                     if predecessor is not None and predecessor.slot is not None and not predecessor.virtual else None)
         out.append(SeatTurn(j, kind, t.slot.tile if t.slot else None, t.slot.t_window[0] if t.slot else t.t, t.t,
-                            removed=removed, riichi=t.riichi, rinshan=rinshan,
+                            removed=removed, riichi=t.riichi,
                             discard_p=posterior_to_tiles(t.slot.p / max(t.slot.p.sum(), 1e-9)) if t.slot is not None else None,
                             kan=kan, kan_tile=kan_tile, two_draws=two, meld_options=options, taken=t.call is not None,
                             t_draw_min=draw_min))
@@ -600,11 +596,10 @@ class HandDecoder:
             model.turns[s], self.melds_before[s] = seat_turns_of(self.turns, s, self.dealer)
         for corner in ("TL", "TR", "BL", "BR"):
             seat = seat_of(self.entry, corner)
-            hev, dev, habit = hand_evidence(seat, model.turns[seat], in_window(self.obs.get(f"hand:{corner}", []), self.t0, self.t1),
+            hev, dev, _ = hand_evidence(seat, model.turns[seat], in_window(self.obs.get(f"hand:{corner}", []), self.t0, self.t1),
                                             self.melds_before[seat], dealer=(seat == self.dealer), wins_by_tsumo=(seat == self.tsumo_winner))
             model.hand_ev += hev
             model.draw_ev += dev
-            model.end_prior[seat] = habit
         self._apply_hand_facts(model)
         self._result_constraint(model)
         self.model = model
@@ -738,6 +733,11 @@ class HandDecoder:
                     model.tenpai.append((s, j, 4 - self.melds_before[s].get(j, 0)))
 
     def _apply_hand_facts(self, model: HandModel) -> None:
+        def add_soft_hand(f, state, t):
+            counts = Counter(f["tiles"])
+            model.hand_ev.append(HandEvidence(f["seat"], state, False,
+                                 np.array([counts[tile] for tile in TILES], dtype=float), 3.0, t, t))
+
         for f in self.facts.get("discard", []) + self.facts.get("missing_discard", []):
             mine = model.turns.get(f["seat"], [])
             if mine and f.get("t") is not None:
@@ -747,7 +747,10 @@ class HandDecoder:
                     # mode. A human identity must remain a hard constraint.
                     nearest.discard, nearest.discard_p = f["tile"], None
         for f in self.facts.get("haipai", []):
-            model.facts.haipai[f["seat"]] = f["tiles"]
+            if f.get("soft"):
+                add_soft_hand(f, -1, self.t0)
+            else:
+                model.facts.haipai[f["seat"]] = f["tiles"]
         for f in self.facts.get("draw", []):
             key = turn_key(model, f, 10.0)
             if key is None:
@@ -765,13 +768,9 @@ class HandDecoder:
                 self.problems.append(f"final-hand fact for {s} has {len(f['tiles'])} tiles, expected {want}"
                                      + (f" or {base} without the winning tile" if tsumo_win else "") + ": ignored")
             elif f.get("soft"):
-                # a legacy annotation: strong evidence on the final state, not a hard constraint
+                # Explicit uncertain evidence can guide a reconstruction but cannot fix its tiles.
                 last = len(model.turns[s]) - 1 + (1 if (tsumo_win and not excl) else 0)
-                e = np.zeros(len(TILES))
-                for t in f["tiles"]:
-                    if t in TI:
-                        e[TI[t]] += 1
-                model.hand_ev.append(HandEvidence(s, last, False, e, 3.0, self.t1, self.t1))
+                add_soft_hand(f, last, self.t1)
             else:
                 model.facts.final[s] = f["tiles"]
                 if excl:
@@ -1283,24 +1282,9 @@ def _decode_input_binding(work: Path, hand: int, *, evidence_policy=None) -> dic
     provenance = work / "obs" / "provenance" / f"{hand:02d}.json"
     if not observation.exists() or not provenance.exists():
         return None
-    return {"observation_sha256": hashlib.sha256(observation.read_bytes()).hexdigest(),
-            "provenance_sha256": hashlib.sha256(provenance.read_bytes()).hexdigest(),
+    return {"observation_sha256": sha256_file(observation),
+            "provenance_sha256": sha256_file(provenance),
             "dense_policy": policy.fingerprint_for('dense')}
-
-
-def _publish_decode(path: Path, decoded: dict) -> None:
-    pending = None
-    try:
-        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".decode-", suffix=".tmp",
-                                delete=False) as stream:
-            pending = Path(stream.name)
-            json.dump(sanitize(decoded), stream, ensure_ascii=False, indent=1)
-            stream.flush()
-            os.fsync(stream.fileno())
-        pending.replace(path)
-    finally:
-        if pending is not None:
-            pending.unlink(missing_ok=True)
 
 
 def run_decode(work: Path, hands: list[dict], games: list[Game], *, force: bool = False, only: Optional[set] = None,
@@ -1381,7 +1365,7 @@ def run_decode(work: Path, hands: list[dict], games: list[Game], *, force: bool 
         result = games[h["game"]].hands[h["site_index"]]
         d = decode_hand(h, obs, result, facts_for_hand(all_facts, h), log=log, models=models, work_dir=work)
         d["decode_inputs"] = bindings[h["hand"]]
-        _publish_decode(p, d)
+        atomic_write_json(p, sanitize(d), indent=1)
         out.append(d)
         sc = d["score"]
         log(f"  hand {h['hand']:2d}: {d['stats']['turns']} turns, {d['stats']['calls']} calls, dora {d['dora']}, "

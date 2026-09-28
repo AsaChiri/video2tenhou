@@ -44,17 +44,9 @@ def load_labels(video_path: str | Path) -> list[dict]:
 
 
 def hand_table(video_path: str | Path, work: Path) -> list[dict]:
-    """Hand windows for the split: the pipeline's hands.json when it exists, else the legacy table."""
+    """Read the pipeline's hand table used to keep training and validation separate."""
     p = work / Path(video_path).stem / "hands.json"
-    if not p.exists():
-        p = labels_dir(video_path) / "legacy_hands.json"
-    return json.load(open(p, encoding="utf-8"))
-
-
-def hand_window(h: dict) -> tuple[float, float]:
-    """The hand's overlay segment (t_overlay) when the table carries it; the legacy table only has its window."""
-    ov = h.get("t_overlay")
-    return (float(ov[0]), float(ov[1])) if ov else (float(h["t_start"]), float(h["t_end"]))
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def hand_of(t: float, hands: list[dict]) -> int | None:
@@ -64,7 +56,7 @@ def hand_of(t: float, hands: list[dict]) -> int | None:
     later hand, since the table is already on it."""
     prev_end = None
     for i, h in enumerate(hands):
-        a, b = hand_window(h)
+        a, b = map(float, h["t_overlay"])
         if prev_end is not None and prev_end < t < a and hands[i - 1].get("game") == h.get("game"):
             return i
         if a <= t <= b:

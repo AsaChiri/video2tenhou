@@ -24,13 +24,16 @@ Use the same source revision for all validation and published artifacts.
    Build the starter download from that model bundle and the source distribution:
 
    ```console
-   uv run python tools/package_starter.py --source dist/video2tenhou-0.1.2.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.1.2-starter.zip
+   uv run python tools/package_starter.py --source dist/video2tenhou-0.1.3.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.1.3-starter.zip
    ```
 
    Use the matching version in the filenames. The starter contains the application,
-   launchers, locked dependency configuration and trained models in one folder.
+   launchers, adaptive runtime setup and trained models in one folder.
    Its checksum accompanies the ZIP. Extract it into a new directory and verify
-   that the launcher installs dependencies and opens the browser studio.
+   that the launcher selects a compatible runtime and opens the browser studio.
+   Check NVIDIA and CPU-only machines, an existing installation, and a repair
+   launch. Record the versions selected on each machine; runtime selection is
+   intentionally independent of the development lockfile.
 5. Install from the artifacts in a fresh environment. Convert a representative
    full recording, inspect review questions, replay every exported hand and
    compare scores and independent human annotations.

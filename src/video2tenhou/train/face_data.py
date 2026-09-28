@@ -8,22 +8,13 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-import hashlib
 import json
 from pathlib import Path
 import re
 import shutil
 
 from .data import HELD_OUT_HANDS, hand_of, hand_table, load_labels
-
-
-def file_hash(path: Path) -> str:
-    """Return a streaming SHA-256 for dataset and checkpoint provenance."""
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+from ..files import sha256_file as file_hash
 
 
 def build_face_dataset(human: Path, drafts: Path | None, output: Path, *, video: Path, hands: list[dict]) -> dict:

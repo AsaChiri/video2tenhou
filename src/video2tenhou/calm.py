@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Optional
@@ -118,6 +119,15 @@ class Interval:
                 "motion": round(self.motion, 3), "skin": round(self.skin, 4), "partial": self.partial}
 
 
+def _runs(values):
+    """Yield half-open spans of equal values, retaining both true and false runs."""
+    start = 0
+    for value, group in groupby(values):
+        end = start + sum(1 for _ in group)
+        yield start, end, bool(value)
+        start = end
+
+
 def intervals(ts: np.ndarray, mot: np.ndarray, skn: np.ndarray, *, motion_thr: float = MOTION_THR,
               skin_thr: float = SKIN_THR, min_calm: int = MIN_CALM_SAMPLES) -> list[Interval]:
     """Maximal runs of calm / disturbed samples per region; calm runs shorter than min_calm become disturbed."""
@@ -126,22 +136,12 @@ def intervals(ts: np.ndarray, mot: np.ndarray, skn: np.ndarray, *, motion_thr: f
         base = float(np.percentile(skn[:, r], 20))
         calm = (mot[:, r] < motion_thr) & (skn[:, r] < base + skin_thr)
         # a calm run shorter than min_calm is disturbed
-        i = 0
-        while i < len(calm):
-            j = i
-            while j < len(calm) and calm[j] == calm[i]:
-                j += 1
-            if calm[i] and j - i < min_calm:
+        for i, j, is_calm in _runs(calm.copy()):
+            if is_calm and j - i < min_calm:
                 calm[i:j] = False
-            i = j
-        i = 0
-        while i < len(calm):
-            j = i
-            while j < len(calm) and calm[j] == calm[i]:
-                j += 1
-            out.append(Interval(name, float(ts[i]), float(ts[j - 1]), j - i, bool(calm[i]),
+        for i, j, is_calm in _runs(calm):
+            out.append(Interval(name, float(ts[i]), float(ts[j - 1]), j - i, is_calm,
                                 float(mot[i:j, r].mean()), float(skn[i:j, r].mean())))
-            i = j
     out.sort(key=lambda iv: (iv.t0, iv.region))
     return out
 
@@ -165,16 +165,11 @@ def fill_gaps(ivs: list[Interval], ts: np.ndarray, mot: np.ndarray, skn: np.ndar
                 continue
             still = mot[sel, r] < motion_thr
             covered: list[tuple[float, float]] = []
-            i = 0
-            while i < len(sel):
-                j = i
-                while j < len(sel) and still[j] == still[i]:
-                    j += 1
-                if still[i] and j - i >= min_calm:
+            for i, j, is_still in _runs(still):
+                if is_still and j - i >= min_calm:
                     out.append(Interval(name, float(ts[sel[i]]), float(ts[sel[j - 1]]), j - i, True,
                                         float(mot[sel[i:j], r].mean()), float(skn[sel[i:j], r].mean()), partial=True))
                     covered.append((float(ts[sel[i]]), float(ts[sel[j - 1]])))
-                i = j
             pts = [a] + [x for c in covered for x in c] + [b]
             for k in range(0, len(pts), 2):
                 c0, c1 = pts[k], pts[k + 1]

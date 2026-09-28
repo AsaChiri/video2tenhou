@@ -8,6 +8,7 @@ success. HTTP handlers never execute shell command strings.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import hashlib
 import os
@@ -15,13 +16,13 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
 
 from .processes import ProcessOwner
+from ..files import atomic_write_json
 
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
 ARTIFACT = re.compile(r"(?:g\d+\.(?:json|html|confidence\.json)|review\.json|report\.md)\Z")
@@ -50,6 +51,16 @@ def _failure_message(lines: list[str]) -> str:
         return "Calibration needs adjustment. Adjust the highlighted table regions, then check again."
     if any("video and site record disagree" in line for line in lines):
         return "The recording does not match the score records. Check the game IDs and their order in Settings, then retry."
+    detail = "\n".join(lines).lower()
+    if "out of memory" in detail and "cuda" in detail:
+        return "The GPU ran out of memory. Close other GPU applications and retry, or relaunch with VIDEO2TENHOU_DEVICE=cpu (slower)."
+    if any(message in detail for message in ("no kernel image is available", "not compiled with cuda",
+                                             "cuda driver version is insufficient", "invalid device function",
+                                             "runtime check failed")):
+        return "The GPU runtime could not run on this computer. Update uv and the NVIDIA driver, then relaunch Start.cmd or start.sh to repair setup, or use VIDEO2TENHOU_DEVICE=cpu (slower). See docs/QUICKSTART.md."
+    if ("filenotfounderror" in detail and any(name in detail for name in ("weights.pt", "meta.json"))
+            or "metadata does not match checkpoint" in detail):
+        return "The trained models are missing or do not match. Extract the complete model bundle from the same release into the active data directory, then retry. See docs/QUICKSTART.md."
     return "Processing stopped. Open the processing log for details, correct the issue, then retry."
 
 
@@ -89,28 +100,7 @@ class Workspace:
         750 ms; a persistent denial is an actionable failure, not a running job.
         """
         path = self.projects_dir / f"{project['id']}.json"
-        temp = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.projects_dir,
-                                             prefix=f".{project['id']}.", suffix=".tmp", delete=False) as stream:
-                temp = Path(stream.name)
-                json.dump(project, stream, ensure_ascii=False, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            for attempt, delay in enumerate((.05, .1, .2, .4, 0)):
-                try:
-                    temp.replace(path)
-                    break
-                except OSError as exc:
-                    if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 4:
-                        raise
-                    time.sleep(delay)
-        finally:
-            if temp is not None:
-                try:
-                    temp.unlink(missing_ok=True)
-                except OSError:
-                    pass  # Cleanup must not hide the publication error.
+        atomic_write_json(path, project, indent=2, retry_windows=True)
 
     def _save_failed(self, project: dict, exc: OSError, *, completed: bool = False) -> None:
         """Expose a retryable failure when storage cannot persist a job transition."""
@@ -173,10 +163,9 @@ class Workspace:
                        "video": str(video), "games": games, "layout": layout,
                        "created": time.time(), "status": "new", "job": {"running": False}}
             project["source_sha256"] = self._source(project)
-            project["export_signature"] = self._signature(project) if self._legacy_outputs_match(project) else None
-            if project["export_signature"] is None and (self.root / "work" / stem / "hands.json").exists():
-                del project["source_sha256"]
-                self._sync_source(project)
+            project["export_signature"] = None
+            if (self.root / "work" / stem / "hands.json").exists():
+                self._invalidate_inputs(project, project["source_sha256"])
             self._save(project)
             self.projects[project["id"]] = project
             return self.snapshot(project["id"])
@@ -249,35 +238,29 @@ class Workspace:
             return None
 
     def _sync_source(self, project: dict) -> None:
-        """Retire old evidence when a source disappears or changes at its path."""
+        """Require regeneration when input provenance is missing or changes."""
         current = self._source(project)
-        if "source_sha256" not in project:
-            project["source_sha256"] = current
-            if self._legacy_outputs_match(project):
-                project["export_signature"] = self._signature(project)
-                self._save(project)
-                return
-            changed = bool(project.get("export_signature")) or (self.root / "work" / project["name"] / "hands.json").exists()
-        else:
-            changed = project["source_sha256"] != current
+        if "source_sha256" not in project or "export_signature" not in project:
+            self._invalidate_inputs(project, current)
+        elif project["source_sha256"] != current:
             # A first download has no earlier evidence to invalidate.
             if project["source_sha256"] is None and project["status"] in ("new", "preparing") and not project.get("inputs_changed"):
-                changed = False
-            if not changed:
-                if project["source_sha256"] != current:
-                    project["source_sha256"] = current
-                    self._save(project)
-                return
-        if changed:
-            project.update(source_sha256=current, export_signature=None, inputs_changed=True, needs_prepare=True)
-            if not project["job"].get("running"):
-                project["status"] = "new"
-            work = self.root / "work" / project["name"]
-            work.mkdir(parents=True, exist_ok=True)
-            (work / "inputs.changed").write_text("Prepare and analyze again: recording contents changed or source provenance is missing.\n", encoding="utf-8")
-            state = self.states.pop(project["id"], None)
-            if state is not None:
-                state.close()
+                project["source_sha256"] = current
+                self._save(project)
+            else:
+                self._invalidate_inputs(project, current)
+
+    def _invalidate_inputs(self, project: dict, source: str | None) -> None:
+        """Retire unverified outputs without changing the saved human answers."""
+        project.update(source_sha256=source, export_signature=None, inputs_changed=True, needs_prepare=True)
+        if not project["job"].get("running"):
+            project["status"] = "new"
+        work = self.root / "work" / project["name"]
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "inputs.changed").write_text("Prepare and analyze again: recording contents changed or input provenance is missing.\n", encoding="utf-8")
+        state = self.states.pop(project["id"], None)
+        if state is not None:
+            state.close()
         self._save(project)
 
     def _record_matches(self, project: dict) -> bool:
@@ -285,26 +268,6 @@ class Workspace:
             record = json.loads((self.root / "work" / project["name"] / "record.json").read_text(encoding="utf-8"))
             return [game["id"] for game in record] == project["games"]
         except (OSError, ValueError, KeyError):
-            return False
-
-    def _legacy_outputs_match(self, project: dict) -> bool:
-        """Adopt old PML runs only when every hand proves source and crop identity."""
-        if project["layout"] != "pml" or not self._record_matches(project):
-            return False
-        try:
-            from ..calm import REGIONS, region_key
-            from ..layout import Calibration
-            cal = Calibration.load(project["layout"], project["video"])
-            if not cal.fit or cal.fit.get("layout") != "pml":
-                return False
-            expected = {r: region_key(cal, r) for r in REGIONS}
-            source = self._source(project)
-            work = self.root / "work" / project["name"]
-            hands = json.loads((work / "hands.json").read_text(encoding="utf-8"))
-            manifests = [json.loads((work / "reads" / f"{h['hand']:02d}" / "done.json").read_text(encoding="utf-8")) for h in hands]
-            return bool(source and manifests) and all(
-                m.get("geometry") == expected and m.get("identity", {}).get("source") == source for m in manifests)
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return False
 
     def project(self, key: str) -> dict:
@@ -318,12 +281,7 @@ class Workspace:
         with self.lock:
             stored = self.project(key)
             self._sync_source(stored)
-            if "export_signature" not in stored:  # Upgrade pre-provenance studio manifests once.
-                stored["export_signature"] = self._signature(stored) if self._legacy_outputs_match(stored) else None
-                self._save(stored)
-            project = json.loads(json.dumps(stored))
-        if project.get("job", {}).get("error") and "\n" in project["job"]["error"]:
-            project["job"]["error"] = _failure_message(project["job"].get("log", []))
+            project = deepcopy(stored)
         name = Path(project["video"]).stem
         out = self.root / "out" / name
         valid = bool(project["export_signature"]) and project["export_signature"] == self._signature(project) and self._record_matches(project)
@@ -364,7 +322,6 @@ class Workspace:
                 self.states[key]._configuration_signature = signature
                 if project.get("inputs_changed"):
                     self.states[key].hands = []
-                    self.states[key].games = []
             return self.states[key]
 
     def artifact(self, key: str, name: str) -> Path:

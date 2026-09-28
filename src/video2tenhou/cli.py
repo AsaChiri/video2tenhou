@@ -160,7 +160,7 @@ def cmd_convert(a):
         return
     print("[4 observe]")
     # a hand with new readings is observed (and decoded) again even when nothing else is forced
-    st = observe.run_observe(work, entries, ivs, force=a.force or a.redo in ("read", "observe") or bool(a.reread), touched=touched, policy=getattr(det, "evidence_policy", None))
+    st = observe.run_observe(work, entries, ivs, force=a.force or a.redo in ("read", "observe") or bool(a.reread), touched=touched, policy=det.evidence_policy)
     touched = set(touched) | set(st.get("changed_hands", []))
     print(f"  {st}")
     if a.stop == "observe":
@@ -171,8 +171,8 @@ def cmd_convert(a):
     force_all = (a.force or a.redo is not None or bool(a.reread)) and not only
     redo = (only or set()) | (set() if force_all else touched)
     if redo:
-        run_decode(work, entries, games, force=True, only=redo, video_path=Path(a.video), cal=cal, evidence_policy=getattr(det, "evidence_policy", None))
-    decodes = run_decode(work, entries, games, force=force_all, video_path=Path(a.video), cal=cal, evidence_policy=getattr(det, "evidence_policy", None))
+        run_decode(work, entries, games, force=True, only=redo, video_path=Path(a.video), cal=cal, evidence_policy=det.evidence_policy)
+    decodes = run_decode(work, entries, games, force=force_all, video_path=Path(a.video), cal=cal, evidence_policy=det.evidence_policy)
     if a.stop == "decode":
         return
     print("[6 write]")
@@ -286,6 +286,12 @@ def cmd_web(a):
         if a.no_browser:
             command.append("--no-browser")
         return subprocess.call(command, env={**os.environ, "VIDEO2TENHOU_HOME": str(root)})
+    from .perception.device import select_device
+    import torch
+    device = select_device()
+    os.environ["VIDEO2TENHOU_DEVICE"] = device
+    description = torch.cuda.get_device_name(device) if device.startswith("cuda") else "CPU (processing will be slower)"
+    print(f"Runtime ready: {description}; PyTorch {torch.__version__}, CUDA {torch.version.cuda or 'none'}.", flush=True)
     from .tool.app import serve_workspace
     serve_workspace(root, a.port, open_browser=not a.no_browser)
 

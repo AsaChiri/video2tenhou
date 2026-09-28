@@ -51,6 +51,7 @@ def test_face_backend_rejects_tile_identity_checkpoint(tmp_path, monkeypatch):
 
 
 def test_graph_metadata_override_and_effective_policy_invalidate_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(detector, "select_device", lambda device: device)
     calls = []
     model = SimpleNamespace(names={0: "face"}, family="yolo9", size="s",
         predict=lambda image, **kw: calls.append(kw) or SimpleNamespace(boxes=None))
@@ -137,6 +138,14 @@ def test_metadata_selects_calibrated_defaults_and_explicit_overrides(tmp_path, m
     explicit = detector.Detector(weights, device="cpu", conf=.15, imgsz=640)
     assert (explicit.conf, explicit.imgsz, explicit.iou) == (.15, 640, .5)
     assert explicit.id != automatic.id
+    meta["inference"]["confidence"] = "invalid metadata default"
+    path.write_text(json.dumps(meta))
+    # Explicit settings replace defaults before validation, as for valid metadata.
+    assert detector.Detector(weights, device="cpu", conf=.15).conf == .15
+    with pytest.raises(ValueError, match="confidence"):
+        detector.Detector(weights, device="cpu")
+    meta["inference"]["confidence"] = .02
+    path.write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="conflicts"):
         detector.Detector(weights, device="cpu", backend="unsupported")
     meta["classes"] = {"0": "back"}

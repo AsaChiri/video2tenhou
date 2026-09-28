@@ -174,14 +174,6 @@ def segment(readings: list[dict], *, min_run: int = 5, min_duration: float = 30.
 # align
 # ---------------------------------------------------------------------------
 
-def corner_wind(winds: dict) -> dict[str, str]:
-    """corner -> the seat wind of this hand (what the overlay shows at that corner; E deals).
-
-    A player is identified by the corner: the chairs and the cameras do not move. The wind is the role in
-    this hand, so it is what the player is called. Nothing is ever named by the wind a player started in."""
-    return dict(winds)
-
-
 def corner_site(winds: dict, kyoku: int) -> dict[str, str]:
     """corner -> the seat name the site record uses (EAST..NORTH), which is fixed for the hanchan: the wind
     that corner held in its first hand. The site keys its player list and its per-hand deltas by it, and the
@@ -223,7 +215,7 @@ def align(hands: list[Hand], games: list[Game], nicks: Optional[dict[int, dict[s
         seat_map = None
         for j, h in enumerate(hs):
             site = game.hands[j] if j < len(game.hands) else None
-            cw, cs = corner_wind(h.winds), corner_site(h.winds, h.kyoku)
+            cw, cs = dict(h.winds), corner_site(h.winds, h.kyoku)
             if seat_map is None:
                 seat_map = cs
             elif cs != seat_map:

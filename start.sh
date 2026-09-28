@@ -22,14 +22,20 @@ if ! tesseract --list-langs 2>/dev/null | grep -qx 'eng'; then
     exit 1
 fi
 
-printf '%s\n' 'Preparing video2tenhou. The first launch downloads Python dependencies.'
-uv sync --frozen --no-dev
+printf '%s\n' 'Checking this computer and preparing video2tenhou. Leave this terminal open.'
+UV_PROJECT_ENVIRONMENT=.venv-runtime
+UV_TORCH_BACKEND=${UV_TORCH_BACKEND:-auto}
+if [ "${VIDEO2TENHOU_DEVICE:-auto}" = cpu ]; then
+    UV_TORCH_BACKEND=cpu
+fi
+export UV_PROJECT_ENVIRONMENT UV_TORCH_BACKEND
+uv venv --allow-existing --python 3.12 .venv-runtime || exit "$?"
+uv pip install --python .venv-runtime --torch-backend "$UV_TORCH_BACKEND" --upgrade-package torch --upgrade-package torchvision --editable .
 status=$?
 if [ "$status" -ne 0 ]; then
-    printf '%s\n' 'Setup failed. See the message above and docs/QUICKSTART.md.' >&2
+    printf '%s\n' 'Setup failed. Check your connection and disk space, and update uv if needed. See docs/QUICKSTART.md.' >&2
     exit "$status"
 fi
-printf '%s\n' 'Opening the studio. Leave this terminal open while using the application.'
 uv run --no-sync video2tenhou web "$@"
 status=$?
 if [ "$status" -ne 0 ]; then

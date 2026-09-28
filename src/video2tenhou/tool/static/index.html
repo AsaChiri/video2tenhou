@@ -223,11 +223,7 @@ function seatName(e, s) {
 // SEAT_NAME is a proxy that resolves against the hand currently shown
 let CUR_E = null;
 const SEAT_NAME = new Proxy({}, {get: (_, s) => seatName(CUR_E, s)});
-const GLYPH = {};
-'123456789'.split('').forEach((n, i) => { GLYPH[n + 'm'] = String.fromCodePoint(0x1F007 + i); GLYPH[n + 'p'] = String.fromCodePoint(0x1F019 + i); GLYPH[n + 's'] = String.fromCodePoint(0x1F010 + i); });
-['1z', '2z', '3z', '4z'].forEach((t, i) => GLYPH[t] = String.fromCodePoint(0x1F000 + i));
-GLYPH['5z'] = '\u{1F006}'; GLYPH['6z'] = '\u{1F005}'; GLYPH['7z'] = '\u{1F004}';
-GLYPH['0m'] = GLYPH['5m']; GLYPH['0p'] = GLYPH['5p']; GLYPH['0s'] = GLYPH['5s']; GLYPH['?'] = '?'; GLYPH['X'] = '\u{1F02B}';
+const GLYPH = {'?': '?'};
 // Vendored CC0 artwork: github.com/FluffyStuff/riichi-mahjong-tiles.
 const TILE_FILES = {};
 for (const [s, prefix] of [['m', 'Man'], ['p', 'Pin'], ['s', 'Sou']]) {
@@ -237,9 +233,6 @@ for (const [s, prefix] of [['m', 'Man'], ['p', 'Pin'], ['s', 'Sou']]) {
 ['Ton', 'Nan', 'Shaa', 'Pei', 'Haku', 'Hatsu', 'Chun'].forEach((name, i) => TILE_FILES[(i + 1) + 'z'] = name);
 TILE_FILES.X = 'Back';
 for (const [tile, file] of Object.entries(TILE_FILES)) GLYPH[tile] = `<img src="/tiles/${file}.svg" alt="${tile}" loading="lazy">`;
-const TILES = [];
-for (const s of 'mps') for (let n = 1; n <= 9; n++) TILES.push(n + s);
-for (let n = 1; n <= 7; n++) TILES.push(n + 'z');
 const PALETTE_ROWS = [...'mps'].map(s => [1,2,3,4,5,0,6,7,8,9].map(n => n+s));
 PALETTE_ROWS.push(Array.from({length:7}, (_,i) => (i+1)+'z'));
 
@@ -327,7 +320,7 @@ function renderNavigator(hand = CUR?.hand ?? FILTER ?? HANDS[0]?.hand) {
   const choices = reviewDecisions(hand).map(({item, choice, decision}) => ({
     idx:item.idx, choice,
     label:choice !== null ? `${SEAT_NAME[decision.seat]}: ${decision.field==='haipai'?'starting hand':'draw '+(decision.j+1)}`
-      : `${['draw','discard','lost'].includes(item.kind) && Number.isInteger(item.j)
+      : `${['draw','discard'].includes(item.kind) && Number.isInteger(item.j)
         ? `${item.kind==='discard'?'Discard':'Draw'} ${item.j+1}` : reviewLabel(item)}${item.seat?' — '+SEAT_NAME[item.seat]:''}`
   }));
   $('#review-nav').innerHTML = `<button type="button" aria-label="Previous hand" ${pos<=0?'disabled':''} onclick="selectReviewHand(${HANDS[pos-1]?.hand ?? hand})">Previous</button>
@@ -399,7 +392,6 @@ function isAnswered(it) {
     case 'solver_incomplete': return false; // Only a completed solver search can settle this item.
     case 'uncertain_tiles': return (it.choices || []).every(choice => choiceAnswered(it, choice));
     case 'draw': return fs.some(f => (f.kind === 'draw' || (f.kind === 'lost' && !f.field)) && near(f));
-    case 'lost': return fs.some(f => (f.kind === 'draw' || (f.kind === 'lost' && !f.field)) && near(f));
     case 'discard': return fs.some(f => f.kind === 'discard' && near(f));
     case 'ura': return fs.some(f => f.kind === 'ura' && (f.tiles || []).length);
     case 'dora': return fs.some(f => (f.kind === 'dora' && (f.tiles || []).length) || (f.kind === 'lost' && f.field === 'dora'));
@@ -428,7 +420,7 @@ function drawNeedsReview(hand, turn) {
 // alternative's gap and the reader's probability are different quantities.
 function decisionRank(decision) {
   if (decision.kind === 'conflict') return [0, 0];
-  if (decision.lost === true || decision.kind === 'lost') return [1, 0];
+  if (decision.lost === true) return [1, 0];
   if (typeof decision.margin === 'number' && Number.isFinite(decision.margin)) return [2, decision.margin];
   return [3, 0];
 }
@@ -461,7 +453,7 @@ function afterTileAnswer(it) {
 
 // ------------------------------------------------------------------ questions view
 function renderSummary() {
-  const total = ITEMS.filter(it => it.kind !== 'lost').length, done = ITEMS.filter(it => it.done && it.kind !== 'lost').length;
+  const total = ITEMS.length, done = ITEMS.filter(it => it.done).length;
   const conflicts = HANDS.filter(h => h.status === 'conflict').length, complete = HANDS.filter(h => h.status === 'complete').length;
   $('#qsummary').innerHTML = `<h2>Questions ${FILTER === null ? '' : 'for hand ' + (FILTER + 1)}</h2>
     <div class="progress"><div style="width:${total ? 100 * done / total : 0}%"></div></div>
@@ -481,8 +473,8 @@ function renderList() {
   let h = '';
   for (const [hand, its] of byHand) {
     const e = HANDS[hand];
-    const left = its.filter(i => !i.done && i.kind !== 'lost').length;
-    const answered = its.filter(i => i.done && i.kind !== 'lost').length;
+    const left = its.filter(i => !i.done).length;
+    const answered = its.filter(i => i.done).length;
     h += `<div class="hand-head"><button type="button" onclick="FILTER=${hand}; renderQuestions()">Hand ${Number(hand) + 1} · Hanchan ${e.game + 1} · ${kyokuName(e)} · ${left} open</button>${answered ? ` · ${answered} answered (<a href="#" onclick="go('hands'); showHandDetail(${hand}); return false">facts</a>)` : ''}${staleNote(e)}</div>`;
     for (const it of its) {
       if (it.done) continue;                       // answered: the fact is listed in the hand details, editable there
@@ -574,7 +566,7 @@ function extendEvidence(id, dBefore, dAfter) {
   box.dataset.t0 = t0; box.dataset.t1 = t1;
   box.innerHTML = evidenceInner(box.dataset.region, t0, t1, box.dataset.label, id, !!box.dataset.stills);
 }
-function handEvidence(e, seat, t, tPrev, isLast = false, tOwnPrev = null) {
+function handEvidence(e, seat, t, tPrev, isLast = false) {
   const c = cornerOf(e, seat);
   // the draw happens between the previous player's discard and this one: start a little before that discard
   // so the row is seen at rest (13 tiles) before the drawn tile arrives; the buttons extend the span further
@@ -585,11 +577,10 @@ function handEvidence(e, seat, t, tPrev, isLast = false, tOwnPrev = null) {
   h += '<h3>Pond of ' + SEAT_NAME[seat] + ' after the discard</h3><div class="evidence">' + img(t + 2, 'pond:' + c, 0.45, fmt(t + 2)) + '</div>';
   return h;
 }
-function palette(guess, onpick, extra = '') {
+function palette(guess) {
   let h = '<div class="palette">';
   for (const row of PALETTE_ROWS) h += '<div class="palette-row">' + row.map(t => tileHtml(t, t === guess ? 'guess' : '', true)).join('') + '</div>';
-  h += extra + '</div>';
-  return h;
+  return h + '</div>';
 }
 function bindPalette(root, onpick) {
   root.querySelectorAll('.palette .tile').forEach(el => el.onclick = () => onpick(el.dataset.tile, el));
@@ -637,11 +628,11 @@ async function showItem(hand, idx, choiceIndex = null) {
     h += `<p class="question">Search incomplete. Rebuild this hand to retry.</p>
       <div class="actions"><button type="button" onclick="go('hands'); showHandDetail(${hand})">Inspect this hand</button></div>
       <details><summary>Processing details</summary><p>${human(e, it.text)}</p></details>`;
-  } else if (view === 'draw' || view === 'lost') {
+  } else if (view === 'draw') {
     const turn = await turnOf(hand, it.seat, it.j);
     span = [Math.max(e.t_start ?? 0, (turn?.t_prev ?? (t - 15)) - 6), t + (turn?.is_last ? 30 : 4)];
     h += `<p class="question">What was drawn before discarding ${esc(turn?.discard ?? '?')} at ${fmt(t)}?</p>`;
-    h += handEvidence(e, it.seat, t, turn?.t_prev, !!turn?.is_last, turn?.t_own_prev);
+    h += handEvidence(e, it.seat, t, turn?.t_prev, !!turn?.is_last);
     h += await contextHtml(hand, it.seat, t);
     h += '<h3>Your answer</h3>' + palette(it.tile) + `<div class="actions">
       <button class="primary" onclick="answerDraw('${it.tile}')">Confirm ${it.tile}</button>
@@ -816,7 +807,7 @@ async function showItem(hand, idx, choiceIndex = null) {
     h += '<div class="evidence">' + img(it.t + 2, 'meld:' + c, 0.5, 'meld camera of ' + SEAT_NAME[it.seat] + ' at ' + fmt(it.t + 2)) + img(it.t, 'pond:' + c, 0.5, 'pond of ' + SEAT_NAME[it.seat] + ' at ' + fmt(it.t)) + '</div>';
     // the pond the called tile came from; with no source known, the three others: the reviewer names it
     const froms = it.source ? [SEATS[(SEATS.indexOf(it.seat) + {kamicha: 3, toimen: 2, shimocha: 1}[it.source]) % 4]]
-                            : SEATS.filter(s => s !== it.seat);
+                            : SEATS.split('').filter(s => s !== it.seat);
     h += '<div class="evidence">' + froms.map(f => clip('pond:' + cornerOf(e, f), it.t - 15, it.t + 2, SEAT_NAME[f] + "'s pond before the call")).join('') + '</div>';
     h += meldEditor(hand, it.seat, it.t, it.type || 'pon', it.tiles || (it.tile ? [it.tile, it.tile, it.tile] : []), it.source);
     h += `<div class="actions">${it.source ? '<button onclick="answerNote()">It is right</button>' : ''}<button onclick="nextItem()">Skip</button></div>`;
@@ -867,7 +858,7 @@ async function showItem(hand, idx, choiceIndex = null) {
     $('#qcard').querySelectorAll('.wincand .tile').forEach(el => el.onclick = () => answerWinTile(el.dataset.tile));
     $('#qcard').querySelectorAll('.doracand').forEach(c => c.querySelectorAll('.tile').forEach(el => el.onclick = () => answerDoraAt(+c.dataset.i, el.dataset.tile)));
     bindMeldEditors($('#qcard'));             // the winner's melds edit themselves
-  } else if (view === 'draw' || view === 'lost') {
+  } else if (view === 'draw') {
     bindPalette($('#qcard'), tile => answerDraw(tile));
   } else if (view === 'discard') {
     bindPalette($('#qcard'), tile => answerDiscard(tile));
@@ -1022,8 +1013,6 @@ async function turnOf(hand, seat, j) {
   const t = r.decode?.turns.find(t => t.seat === seat && t.j === j);
   if (t) {
     t.is_last = r.decode.t_last !== undefined && t.t >= r.decode.t_last - 1;
-    const own = r.decode.turns.filter(x => x.seat === seat && x.t < t.t);
-    t.t_own_prev = own.length ? own[own.length - 1].t : r.decode.play_window?.[0] ?? null;
   }
   return t;
 }
@@ -1161,7 +1150,7 @@ async function redecodeAll(resume = false) {
     if (s.error) { showError(s.error); return; }
     NOTES = {}; for (const k in DECODES) delete DECODES[k];
     await loadAll();
-    msg(`all ${s.hands_total} hands rebuilt: ${ITEMS.filter(i => !i.done && i.kind !== 'lost').length} questions open`);
+    msg(`all ${s.hands_total} hands rebuilt: ${ITEMS.filter(i => !i.done).length} questions open`);
     CUR = null; renderQuestions(); renderHands();
   };
   setTimeout(poll, 2000);
@@ -1183,7 +1172,7 @@ function showHandsList() {
 function renderHands() {
   let h = '<h2>Hands</h2><table><tr><th>Hand</th><th>Hanchan</th><th>Round</th><th>Video time</th><th>Status</th><th>Turns</th><th>Open questions</th><th>Winning hand vs site</th></tr>';
   for (const e of HANDS) {
-    const openN = ITEMS.filter(i => i.hand === e.hand && !i.done && i.kind !== 'lost').length;
+    const openN = ITEMS.filter(i => i.hand === e.hand && !i.done).length;
     h += `<tr><td>${e.hand + 1}</td><td>${e.game + 1}</td><td><button type="button" onclick="showHandDetail(${e.hand})" aria-label="Open hanchan ${e.game + 1}, ${kyokuName(e)}, hand ${e.hand + 1}">${kyokuName(e)}</button></td><td>${fmt(e.t_start)}–${fmt(e.t_end)}</td>
       <td class="status-${e.status}">${e.status ?? '-'}</td><td>${e.turns ?? ''}</td><td>${openN}</td>
       <td>${e.score === null || e.score === undefined ? '' : (e.score ? '<span class="status-complete">matches</span>' : '<span class="status-review">differs</span>')}</td></tr>`;
@@ -1224,7 +1213,6 @@ async function turnEvidence(hand, i) {
   const request=++TURN_REQUEST;
   const r = await api('api/hand/' + hand); const e = r.entry, t = r.decode.turns[i];
   if (request!==TURN_REQUEST || DETAIL_HAND!==hand || REVIEW_VIEW!=='hands') return;
-  const own = r.decode.turns.filter(x => x.seat === t.seat && x.t < t.t);
   const context=await contextHtml(hand, t.seat, t.t);
   if (request!==TURN_REQUEST || DETAIL_HAND!==hand || REVIEW_VIEW!=='hands') return;
   const isLast=r.decode.t_last!==undefined && t.t>=r.decode.t_last-1;
@@ -1232,11 +1220,10 @@ async function turnEvidence(hand, i) {
   $('#turnev').querySelectorAll('video').forEach(video=>video.pause());
   $('#turnev').innerHTML = `<div class="card"><h3>Turn ${i + 1}: ${SEAT_NAME[t.seat]} discards ${esc(t.discard)} at ${fmt(t.t)}</h3>` +
     primaryVideo(start,end,'turn-primary-evidence') + '<details class="review-details"><summary>Additional evidence</summary>' +
-    handEvidence(e,t.seat,t.t,t.t_prev,isLast,own.length?own[own.length-1].t:null) + context + '</details></div>';
+    handEvidence(e,t.seat,t.t,t.t_prev,isLast) + context + '</details></div>';
   $('#turnev').scrollIntoView();
 }
 function editHaipai(hand, seat) {
-  const e = HANDS[hand];
   const v = prompt(`Starting hand of ${SEAT_NAME[seat]} (13 tiles, 14 for the dealer), separated by spaces:`);
   if (!v) return;
   saveFact({kind: 'haipai', hand, seat, tiles: v.trim().split(/\s+/)}).then(() => msg('starting hand saved'));
@@ -1264,7 +1251,7 @@ function drawLabel() {
     ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
     ctx.fillStyle = '#000'; ctx.fillRect(x0, y0 - 18, 34, 18); ctx.fillStyle = '#ff0'; ctx.fillText(b.tile, x0 + 2, y0 - 3);
   });
-  $('#boxlist').innerHTML = L.boxes.map((b, i) => tileHtml(b.tile + (b.sideways ? '' : ''), '')).join('');
+  $('#boxlist').innerHTML = L.boxes.map(b => tileHtml(b.tile)).join('');
 }
 function canvasPoint(ev) {
   const r = ev.target.getBoundingClientRect();
@@ -1307,7 +1294,6 @@ async function saveLabel() {
   const r = await api('api/label', {t, kind, corner, boxes: L.boxes});
   $('#lstatus').textContent = 'saved ' + r.saved;
 }
-function labelFrom(region, t) { go('label'); $('#lreg').value = region; $('#lt').value = t; loadLabel(); }
 
 // ------------------------------------------------------------------ calibrate (stage 0)
 // The page edits this video's fit: the overhead (centre, angle, scale) and one rectangle per corner panel.

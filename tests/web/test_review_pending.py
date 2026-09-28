@@ -1,6 +1,7 @@
 """Correction freshness across hand rebuilds, exported games and server restarts."""
 import json
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -127,3 +128,37 @@ def test_existing_dated_facts_are_detected_without_ledger(review):
     (state.labels / "facts.jsonl").write_text(json.dumps({
         "hand": 99, "game": 1, "kyoku": 0, "honba": 0, "ts": 200, "kind": "note"}) + "\n")
     assert state.pending_rebuilds() == [2]  # Current game/round identity wins over a stale global hand index.
+
+
+@pytest.mark.parametrize("single_hand", [True, False])
+def test_review_jobs_share_exclusion_failure_and_shutdown(review, monkeypatch, single_hand):
+    state, clock = review
+    started, release = threading.Event(), threading.Event()
+
+    def fail(*args):
+        started.set()
+        assert release.wait(5)
+        raise RuntimeError("rebuild interrupted")
+
+    monkeypatch.setattr(state, "_run_decode", fail)
+    launch = state.start_redecode if single_hand else lambda _: state.start_job("calib", fail)
+    status = launch(0)
+    try:
+        assert started.wait(5)
+        assert status["key"] == (0 if single_hand else "calib")
+        assert launch(0) is status  # Retrying a running job never starts another worker.
+        with pytest.raises(ValueError, match="Another review job"):
+            state.start_redecode(1)
+        with pytest.raises(ValueError, match="Another review job"):
+            state.start_job("check", lambda: None)
+    finally:
+        release.set()
+        for worker in state._threads:
+            worker.join(timeout=5)
+    assert status["running"] is False
+    assert status["error"] == "rebuild interrupted"
+    assert status["done"] == clock[0]
+    assert set(status) == {"key", "running", "started", "done", "error", "result"}
+    state.close()
+    with pytest.raises(ValueError, match="app is closing"):
+        launch(0)

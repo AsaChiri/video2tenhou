@@ -12,7 +12,7 @@ from pathlib import Path
 import platform
 import time
 
-from .face_data import file_hash
+from ..files import sha256_file as file_hash
 
 
 def main(argv=None):

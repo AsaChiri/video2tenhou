@@ -48,7 +48,6 @@ class State:
         self.processes = ProcessOwner()
         self._threads: list[threading.Thread] = []
         from ..layout import Calibration
-        from ..record import from_dict
         self.video = video
         self.name = video.stem
         self.work = work / self.name
@@ -59,8 +58,6 @@ class State:
         # a video whose geometry has not been measured has not been converted either, so there is no
         # header and no record yet: the tool still opens, on the Calibrate page, which needs neither
         self.hands = self._read_json(self.work / "hands.json") or []
-        rec = self._read_json(self.work / "record.json") or []
-        self.games = [from_dict(d) for d in rec]
         self.lock = threading.Lock()
         self._models = None
         self._checks: dict[str, dict] = {}
@@ -154,7 +151,7 @@ class State:
         self.reload_calib()
         return {"saved": str(p), "fit": fit}
 
-    def start_job(self, key: str, fn, *, hands: list[int] | None = None) -> dict:
+    def start_job(self, key: str | int, fn, *, hands: list[int] | None = None) -> dict:
         """Run one review operation in the background and expose its failure."""
         with self.lock:
             if self.processes.closing:
@@ -250,9 +247,9 @@ class State:
             d = json.load(open(p, encoding="utf-8"))
             for k, it in enumerate(d["items"]):
                 row = dict(it)
-                field = "draw" if row.get("kind") == "lost" else row.get("kind")
-                if field in ("draw", "discard", "haipai"):
-                    turn = -1 if field == "haipai" else row.get("j")
+                field = row.get("kind")
+                if field in ("draw", "discard"):
+                    turn = row.get("j")
                     confidence = next((c for c in d.get("confidence", [])
                                        if turn is not None and c.get("field") == field and c.get("seat") == row.get("seat")
                                        and c.get("turn") == turn), None)
@@ -260,16 +257,13 @@ class State:
                         row.setdefault("lost", bool(confidence.get("lost")))
                         if row.get("margin") is None:
                             row["margin"] = confidence.get("margin")
-                if isinstance(row.get("hand"), list):
-                    row["tiles"] = row.pop("hand")          # a reconstructed hand, not the hand number
                 row.update({"hand": h["hand"], "idx": k, "kyoku": h["kyoku"], "honba": h["honba"], "game": h["game"]})
                 out.append(row)
         return out
 
     def facts(self, hand: int | None = None) -> list[dict]:
         """Read human facts, optionally restricted to one game's kyoku and honba."""
-        p = self.labels / "facts.jsonl"
-        rows = [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()] if p.exists() else []
+        rows = self.all_facts()
         if hand is None:
             return rows
         e = self.hands[hand]
@@ -290,18 +284,16 @@ class State:
 
     def all_facts(self) -> list[dict]:
         """Read the append-only human evidence file for this recording."""
-        p = self.labels / "facts.jsonl"
-        return [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()] if p.exists() else []
+        from ..engine.review import load_facts
+        return load_facts(self.labels)
 
     def _review_changes(self) -> dict:
         return self._read_json(self.work / "review-changes.json") or {"changes": {}, "rebuilds": {}}
 
     def _save_review_changes(self, data: dict) -> None:
-        self.work.mkdir(parents=True, exist_ok=True)
+        from ..files import atomic_write_json
         path = self.work / "review-changes.json"
-        temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, data, sort_keys=True)
 
     def _fact_hand(self, fact: dict) -> int | None:
         if all(key in fact for key in ("game", "kyoku", "honba")):
@@ -440,7 +432,6 @@ class State:
         """An mp4 of one camera (or the whole frame) between t0 and t1, cached under work/<video>/clips."""
         if region not in ["frame", *self.cal.regions()]:
             raise ValueError("Unknown video region.")
-        import subprocess
         import hashlib
         d = self.work / "clips"
         d.mkdir(parents=True, exist_ok=True)
@@ -501,38 +492,11 @@ class State:
 
     def start_redecode(self, i: int) -> dict:
         """Start the re-decode of hand i in a background thread (fresh process); returns its status."""
-        with self.lock:
-            if self.processes.closing:
-                raise ValueError("The app is closing. Restart it to continue.")
-            st = self.jobs.get(i)
-            if st and st.get("running"):
-                return st
-            if any(j.get("running") for j in self.jobs.values()):
-                raise ValueError("Another review job is running. Wait for it to finish.")
-            st = {"hand": i, "running": True, "started": time.time(), "done": None, "error": None}
-            self.jobs[i] = st
-
-        def work():
-            try:
-                self.redecode(i)
-            except Exception as e:  # noqa: BLE001
-                st["error"] = str(e)
-            st["running"] = False
-            st["done"] = time.time()
-        thread = threading.Thread(target=work, daemon=True)
-        self._threads.append(thread)
-        thread.start()
-        return st
+        return self.start_job(i, lambda: self._run_decode(str(i)))
 
     def redecode_status(self, i: int) -> dict:
         """Return a hand job's current state, including its last error."""
-        return self.jobs.get(i) or {"hand": i, "running": False, "started": None, "done": None, "error": None}
-
-    def redecode(self, i: int) -> dict:
-        """Reconstruct one hand and refresh the complete project's exports."""
-        self._run_decode(str(i))
-        p = self.decode_path(i)
-        return json.load(open(p, encoding="utf-8")) if p.exists() else {}
+        return self.jobs.get(i) or {"key": i, "running": False, "started": None, "done": None, "error": None, "result": None}
 
     def start_redecode_all(self) -> dict:
         """Re-decode every hand with the facts saved so far, in the background (one fresh process)."""
@@ -573,7 +537,6 @@ class State:
     def _run_decode(self, which: str, *, job_key=None) -> None:
         """Decode selected comma-separated hand IDs or "all" in a fresh process, so engine code on disk runs
         (the server may have been up for hours)."""
-        import subprocess
         selected = None if which == "all" else {int(value) for value in which.split(",")}
         if selected is not None and not selected <= {h["hand"] for h in self.hands}:
             raise ValueError("Unknown hand selected for rebuilding.")
@@ -652,9 +615,15 @@ class Handler(SimpleHTTPRequestHandler):
             self._drain_rejected_body()
         from ..engine.decode import sanitize
         data = json.dumps(sanitize(obj), ensure_ascii=False).encode()
+        self._bytes(data, "application/json; charset=utf-8", code)
+
+    def _bytes(self, data: bytes, content_type: str, code: int = 200, *, headers: dict | None = None):
+        """Send a complete response with the shared cache and security headers."""
         self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -722,25 +691,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"entry": self.state.hands[i], "decode": d, "facts": self.state.facts(i)})
             if u.path == "/api/frame":
                 data = self.state.render(float(q["t"]), q.get("region", "frame"), float(q.get("scale", "1")))
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                return
+                return self._bytes(data, "image/jpeg")
             if u.path == "/api/read":
                 return self._json(self.state.read(float(q["t"]), q["region"]))
             if u.path == "/api/context":
                 return self._json(self.state.context(int(q["hand"]), q["seat"], float(q["t"])))
             if u.path == "/api/clip":
                 p = self.state.clip(float(q["t0"]), float(q["t1"]), q.get("region", "frame"))
-                data = p.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "video/mp4")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                return
+                return self._bytes(p.read_bytes(), "video/mp4")
             if u.path == "/api/facts":
                 return self._json(self.state.facts(int(q["hand"]) if "hand" in q else None))
             if u.path == "/api/calib":
@@ -750,13 +708,7 @@ class Handler(SimpleHTTPRequestHandler):
             if u.path == "/api/plate":
                 img = self.state.plate()
                 ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                data = buf.tobytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                return
+                return self._bytes(buf.tobytes(), "image/jpeg")
         except Exception as e:  # noqa: BLE001
             return self._json({"error": str(e)}, 500)
         if u.path == "/":

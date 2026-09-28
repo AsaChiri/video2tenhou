@@ -135,7 +135,7 @@ def test_failed_atomic_publication_never_authenticates_changed_evidence(cache, m
         assert cache.output.read_bytes() == before_output
     else:
         assert _votes(cache)[0]["slots"][0]["tile"] == "2p"
-    assert not list((cache.work / "obs").rglob(".observe-*.tmp"))
+    assert not list((cache.work / "obs").rglob(".*.tmp"))
     with pytest.raises(ValueError, match="stale"):
         stage.validate_observation_cache(cache.work, cache.hands)
     assert _run(cache, touched=set())["hands"] == 1
@@ -154,7 +154,7 @@ def test_failed_forced_output_write_preserves_previous_usable_cache(cache, monke
             _run(cache, force=True)
     assert stage.json.dump is real_dump
     assert (cache.output.read_bytes(), cache.proof.read_bytes()) == original
-    assert not list((cache.work / "obs").rglob(".observe-*.tmp"))
+    assert not list((cache.work / "obs").rglob(".*.tmp"))
     stage.validate_observation_cache(cache.work, cache.hands)
 
 

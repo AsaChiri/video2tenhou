@@ -15,6 +15,7 @@ detector on the real crops, so it measures the thing the pipeline will do.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ import numpy as np
 
 from . import video as videomod
 from .cache import source_identity
-from .layout import CALIB_DIR, CORNERS, Calibration, Rect, apply_fit, fit_path
+from .layout import CALIB_DIR, CORNERS, Calibration, Rect, apply as _apply, apply_fit, fit_path
 
 PLATE_FRAMES = 60             # frames of the median plate: enough to average tiles and arms away
 CHECK_FRAMES = 8              # frames of the border check
@@ -415,11 +416,6 @@ def grown(cal: Calibration, name: str, margin: int) -> tuple[np.ndarray, tuple[f
     return M, inner, size
 
 
-def _apply(M: np.ndarray, pts) -> np.ndarray:
-    p = np.asarray(pts, np.float64).reshape(-1, 2)
-    return (M @ np.hstack([p, np.ones((len(p), 1))]).T).T[:, :2]
-
-
 def render(frame: np.ndarray, M: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     """Warp a BGR frame with a homogeneous frame-to-region matrix and (width, height)."""
     return cv2.warpAffine(frame, M[:2], size, flags=cv2.INTER_CUBIC)
@@ -531,17 +527,6 @@ def check_times(video: Path, hands: Optional[list[dict]], k: int) -> list[float]
 
 # -- orchestration ---------------------------------------------------------------------
 
-def load_hands(work: Path) -> Optional[list[dict]]:
-    """Load cached hand windows, or return None before the header stage exists."""
-    p = work / "hands.json"
-    if p.exists():
-        try:
-            return json.load(open(p, encoding="utf-8"))
-        except Exception:                                      # noqa: BLE001
-            return None
-    return None
-
-
 def prepare_hands(video: Path, cal: Calibration, work: Path) -> list[dict]:
     """Find play windows from hash-verified overlay evidence before checking tiles.
 
@@ -620,7 +605,7 @@ def run_fit(video: Path, cal: Calibration, work: Path, det=None, force: bool = F
     fit["overhead"] = old["overhead"] if "overhead" in keep and old.get("overhead") else fit_overhead(plate, cal)
     for part in ("cam", "hand", "meld"):
         if old.get(part):
-            fit[part] = json.loads(json.dumps(old[part]))
+            fit[part] = deepcopy(old[part])
     hands = prepare_hands(video, cal, work) if det is not None else None
     if det is not None and "hand" not in keep:
         times = check_times(video, hands, 10)

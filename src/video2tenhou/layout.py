@@ -29,6 +29,7 @@ right for the video the layout was drawn on.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -36,7 +37,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from .paths import ASSET_DIR, DATA_DIR as ROOT, LABEL_DIR
+from .paths import ASSET_DIR, LABEL_DIR
 
 CALIB_DIR = ASSET_DIR / "calib"
 CORNERS = ("TL", "TR", "BL", "BR")
@@ -54,7 +55,7 @@ def apply_fit(data: dict, fit: dict) -> dict:
     Only what the fit names is replaced, so a fit that measured the overhead alone keeps the
     layout's panels. The pond and unit rectangles are never in a fit: they are the table.
     """
-    d = json.loads(json.dumps(data))                      # the layout is shared; never edit it in place
+    d = deepcopy(data)                                  # the layout is shared; never edit it in place
     oh = fit.get("overhead") or {}
     if "center" in oh:
         d["overhead"]["center"] = [float(oh["center"][0]), float(oh["center"][1])]
@@ -222,7 +223,7 @@ class Calibration:
 
 # Default calibration and the overlay rectangles the overlay reader uses.
 DEFAULT = Calibration.load("pml")
-WIND, ROUND_WIND, ROUND_NUM, HONBA_NUM, RIICHI_NUM = DEFAULT.wind, DEFAULT.round_wind, DEFAULT.round_num, DEFAULT.honba, DEFAULT.sticks
+WIND = DEFAULT.wind
 
 
 # -- coordinate helpers ---------------------------------------------------------------
@@ -245,6 +246,15 @@ def box_to_quad(M: np.ndarray, box) -> list[list[float]]:
     x0, y0, x1, y1 = box
     q = apply(np.linalg.inv(M), [[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
     return [[round(float(x), 1), round(float(y), 1)] for x, y in q]
+
+
+def box_iou(a, b) -> float:
+    """Intersection over union of pixel xyxy boxes; zero for an empty union."""
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
 
 
 # -- contact sheet ---------------------------------------------------------------------

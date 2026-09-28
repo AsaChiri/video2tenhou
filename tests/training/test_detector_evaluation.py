@@ -8,6 +8,7 @@ import pytest
 
 from video2tenhou.eval import evaluate_detector_images, eval_perception
 from video2tenhou.perception.detector import Det
+from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
 
 
 def test_class_mismatch_is_not_a_localization_true_positive(tmp_path):
@@ -54,7 +55,7 @@ def test_perception_counts_misses_and_reviewed_negatives(tmp_path, monkeypatch, 
     monkeypatch.setattr(data, "region_upright", lambda frame, *_: (frame, np.eye(3)))
     monkeypatch.setattr(layout.Calibration, "load", lambda *_: None)
     detector_inputs = []
-    monkeypatch.setattr(detector, "Detector", lambda **kwargs: detector_inputs.append(kwargs) or object())
+    monkeypatch.setattr(detector, "Detector", lambda **kwargs: detector_inputs.append(kwargs) or SimpleNamespace(evidence_policy=DEFAULT_POLICY))
     classifier_inputs = []
     monkeypatch.setattr(classifier, "Classifier", lambda model_dir: classifier_inputs.append(model_dir) or SimpleNamespace(classes=data.CLASSES))
     probability = np.zeros(len(data.CLASSES)); probability[0] = 1

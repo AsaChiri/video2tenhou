@@ -119,9 +119,8 @@ def load_policy(metadata_path: str | Path | None = None) -> EvidencePolicy:
 def restructure(kind: str, reading: dict) -> None:
     """Recompute stored box roles/order in place using the reader's geometry rules.
 
-    Raw probabilities and confidence are unchanged. Invalid pond layouts retain
-    the existing rejected-reading behavior. This is also the compatibility
-    implementation for ``observe.restructure``.
+    Raw probabilities and confidence are unchanged. Invalid pond layouts are
+    rejected after filtering, using the same geometry rules as live readings.
     """
     import numpy as np
     from .reader import Box, assign_hand, assign_meld, assign_pond
@@ -157,8 +156,8 @@ def prepare_reading(kind: str, reading: dict, *, stage: str,
                     policy: EvidencePolicy | None = None, none_index: int | None = None) -> dict:
     """Return a filtered/restructured copy without changing cached raw readings.
 
-    Sparse callers supply the classifier's none index. Dense callers preserve
-    their historical confidence-only filter. Comparisons use serialized scores
+    Sparse voting excludes classifier background predictions. Dense event
+    searches apply their separate detector-confidence floors. Comparisons use serialized scores
     as stored; this function never rounds, rescales, reclassifies or votes.
     Probability arrays/lists are shared without mutation; callers should treat
     them as read-only rather than editing the retained output's probabilities.

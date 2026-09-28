@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 ENDPOINT = "https://scoremj.com/api/graphql"
@@ -124,7 +124,7 @@ def walk_container(container_id: int) -> list[dict]:
 
 def to_dict(g: Game) -> dict:
     """JSON-ready cache representation, including each hand result as a mapping."""
-    return {**g.__dict__, "hands": [h.__dict__ for h in g.hands]}
+    return asdict(g)
 
 
 def from_dict(d: dict) -> Game:

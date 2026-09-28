@@ -31,9 +31,6 @@ class AppHandler(Handler):
         """Resolve review state from this request's project route."""
         return self.workspace.review_state(self.project_key)
 
-    def _host_ok(self) -> bool:
-        return self.headers.get("Host") in (f"localhost:{self.server.server_port}", f"127.0.0.1:{self.server.server_port}")
-
     def _review_route(self, path: str) -> bool:
         match = re.fullmatch(r"/review/([a-f0-9]{32})/(.*)", path)
         if not match:
@@ -62,16 +59,10 @@ class AppHandler(Handler):
             match = re.fullmatch(r"/exports/([a-f0-9]{32})/([^/]+)", path)
             if match:
                 file = self.workspace.artifact(match[1], unquote(match[2]))
-                data = file.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8" if file.suffix == ".html" else
-                                 "application/json; charset=utf-8" if file.suffix == ".json" else "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                if file.suffix != ".html":
-                    self.send_header("Content-Disposition", f'attachment; filename="{file.name}"')
-                self.end_headers()
-                self.wfile.write(data)
-                return
+                content_type = ("text/html; charset=utf-8" if file.suffix == ".html" else
+                                "application/json; charset=utf-8" if file.suffix == ".json" else "text/plain; charset=utf-8")
+                headers = {} if file.suffix == ".html" else {"Content-Disposition": f'attachment; filename="{file.name}"'}
+                return self._bytes(file.read_bytes(), content_type, headers=headers)
             if self._review_route(path):
                 if self.path.startswith("/api/read") and any(p.get("job", {}).get("running") for p in self.workspace.projects.values()):
                     return self._json({"error": "Analysis is running. Tile labeling becomes available when it finishes."}, 409)

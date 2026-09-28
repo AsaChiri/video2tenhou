@@ -11,7 +11,7 @@ not forcibly synchronized; API timings include their normal synchronization only
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from functools import wraps
 import hashlib
 from importlib import metadata
@@ -25,6 +25,8 @@ import sys
 import tempfile
 import threading
 import time
+from unittest.mock import patch as mock_patch
+from video2tenhou.files import sha256_file
 
 
 def runtime_threads():
@@ -234,11 +236,10 @@ def instrument(recorder):
     from video2tenhou.perception.classifier import Classifier
     from ortools.sat.python.cp_model import CpSolver
 
-    patches = []
+    patches = ExitStack()
 
     def patch(owner, attribute, wrapper):
-        patches.append((owner, attribute, getattr(owner, attribute)))
-        setattr(owner, attribute, wrapper)
+        patches.enter_context(mock_patch.object(owner, attribute, wrapper))
 
     stages = [(cli, "_gate"), (record, "fetch_game"), (timeline, "run_header"),
               (calm, "run_calm"), (read, "run_read"), (observe, "run_observe"),
@@ -248,7 +249,7 @@ def instrument(recorder):
                (video, "frame_at"), (overlay, "read_overlay"), (overlay, "_tess"),
                (solver.HandModel, "build"), (solver.HandModel, "solve"), (solver.HandModel, "_resolve"),
                (decode.HandDecoder, "_solve")]
-    try:
+    with patches:
         for owner, name in stages + details:
             label = owner.__name__.replace("video2tenhou.", "") + "." + name
             patch(owner, name, recorder.wrap(getattr(owner, name), label,
@@ -279,9 +280,6 @@ def instrument(recorder):
         patch(dense, "dense_reads", wrapped_dense)
         patch(decode, "decode_hand", recorder.wrap(decode.decode_hand, "decode.decode_hand", progress=True, hand_call=True))
         yield
-    finally:
-        for owner, attribute, original in reversed(patches):
-            setattr(owner, attribute, original)
 
 
 def file_identity(path):
@@ -290,11 +288,7 @@ def file_identity(path):
     if not path.is_file():
         return dict(path=str(path), exists=False)
     stat = path.stat()
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return dict(path=str(path), exists=True, bytes=stat.st_size, mtime_ns=stat.st_mtime_ns, sha256=digest.hexdigest())
+    return dict(path=str(path), exists=True, bytes=stat.st_size, mtime_ns=stat.st_mtime_ns, sha256=sha256_file(path))
 
 
 def tool_versions():
@@ -398,10 +392,7 @@ def main(argv=None):
         setup_start = time.perf_counter()
         with instrument(recorder):
             recorder.add("profile.instrumentation_setup", time.perf_counter() - setup_start)
-            import torch
-            import cv2
-            info["runtime_threads"] = dict(torch=torch.get_num_threads(), torch_interop=torch.get_num_interop_threads(),
-                                           opencv=cv2.getNumThreads())
+            info["runtime_threads"] = runtime_threads()
             (recorder.output / "metadata.json").write_text(json.dumps(info, indent=2, default=str), encoding="utf-8")
             resources.start()
             conversion_started = time.perf_counter()
@@ -409,16 +400,15 @@ def main(argv=None):
             with recorder.span("cli.cmd_convert", progress=True):
                 return original(args)
 
-    cli.cmd_convert = profiled
     try:
-        return cli.main(["convert", *convert_args])
+        with mock_patch.object(cli, "cmd_convert", profiled):
+            return cli.main(["convert", *convert_args])
     except BaseException as error:
         failure = dict(type=type(error).__name__, message=str(error))
         raise
     finally:
         wall = None if conversion_started is None else time.perf_counter() - conversion_started
         cpu = None if conversion_cpu is None else time.process_time() - conversion_cpu
-        cli.cmd_convert = original
         if resources.thread.ident is not None:
             resource_summary = resources.finish()
         summary = dict(conversion_wall_seconds=wall, conversion_process_cpu_seconds=cpu,

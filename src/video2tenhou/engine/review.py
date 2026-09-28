@@ -70,7 +70,12 @@ def load_facts(labels_dir: Path) -> list[dict]:
 
 
 def facts_for_hand(all_facts: list[dict], entry: dict) -> dict:
-    """Facts of this hand keyed for decode_hand: haipai / final_hand (seat, tiles), draw (seat, t, tile), ura, dora."""
+    """Normalize this hand's annotations, keeping soft evidence distinct from confirmed facts.
+
+    Hand annotations may explicitly set boolean ``soft``. Unsourced review
+    answers default to confirmed; imported annotations carrying a ``source``
+    must declare their strength instead of deriving trust from its name.
+    """
     out: dict = {"haipai": [], "final_hand": [], "draw": [], "discard": [], "missing_discard": [], "meld_remove": [], "meld": [],
                  "ura": [], "dora": [], "riichi_turn": [], "kan_time": [], "lost": [], "lost_haipai": [], "lost_dora": False,
                  "site_score": None}
@@ -81,7 +86,13 @@ def facts_for_hand(all_facts: list[dict], entry: dict) -> dict:
         seat = entry["corner_wind"].get(f.get("corner") or "", None)
         kind = f.get("kind")
         if kind in ("haipai", "final_hand") and seat and f.get("tiles") and "?" not in f["tiles"]:
-            out[kind].append({"seat": seat, "tiles": f["tiles"], "soft": str(f.get("source", "")).startswith("legacy")})
+            if "source" in f and "soft" not in f:
+                raise ValueError(f"{kind} annotation from {f['source']!r} must explicitly set soft=true for evidence "
+                                 "or soft=false after human confirmation. Review the annotation before rebuilding.")
+            soft = f.get("soft", False)
+            if not isinstance(soft, bool):
+                raise ValueError(f"{kind} annotation soft must be a boolean.")
+            out[kind].append({"seat": seat, "tiles": f["tiles"], "soft": soft})
         elif kind == "draw" and seat and f.get("tile"):
             t = f.get("t_discard") if f.get("t_discard") is not None else f.get("t")
             out["draw"].append({"seat": seat, "t": t, "tile": f["tile"], "j": f.get("j")})
@@ -174,7 +185,7 @@ def uncertain_tiles(rows: list[dict], items: list[dict]) -> Optional[dict]:
     Image coverage alone does not establish identity. Keep these alternatives
     visible in completion status, while preserving explicit Can't tell answers.
     """
-    asked = {(item.get("seat"), item.get("j")) for item in items if item.get("kind") in ("draw", "lost", "haipai")}
+    asked = {(item.get("seat"), item.get("j")) for item in items if item.get("kind") == "draw"}
     pending = [row for row in rows if row.get("field") in ("draw", "haipai") and low_margin(row.get("margin"))
                and not row.get("human") and not row.get("lost") and (row.get("seat"), row.get("turn")) not in asked]
     if not pending:

@@ -9,11 +9,16 @@ from video2tenhou import read
 from video2tenhou.calm import Interval, REGIONS
 from video2tenhou.layout import Calibration
 from video2tenhou.perception.reader import Reading
+from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
+from video2tenhou.train.data import CLASSES
 
 
 class Stub:
     def __init__(self, id_):
         self.id = id_
+        self.classes = CLASSES
+        self.T = 1.0
+        self.evidence_policy = DEFAULT_POLICY
 
 
 def fake_pipeline(monkeypatch):
@@ -362,18 +367,18 @@ def test_interrupted_region_publication_cannot_authenticate_mixed_models(tmp_pat
     hands = [{"hand": 0, "t_start": 0., "t_end": 1.}]
     ivs = [Interval(r, 0., 1., 3, True, 0., 0.) for r in REGIONS]
     read.run_read("v.mp4", cal, tmp_path, hands, ivs, Stub("old"), clf)
-    publish = read._atomic_text
+    publish = read.atomic_write_text
     calls = []
     def interrupted(path, content):
         calls.append(path)
         if len(calls) == 2:
             raise OSError("disk unavailable")
         publish(path, content)
-    monkeypatch.setattr(read, "_atomic_text", interrupted)
+    monkeypatch.setattr(read, "atomic_write_text", interrupted)
     with pytest.raises(OSError, match="disk unavailable"):
         read.run_read("v.mp4", cal, tmp_path, hands, ivs, Stub("new"), clf)
     assert not (tmp_path / "reads/00/done.json").exists()
-    monkeypatch.setattr(read, "_atomic_text", publish)
+    monkeypatch.setattr(read, "atomic_write_text", publish)
     seen.clear()
     read.run_read("v.mp4", cal, tmp_path, hands, ivs, Stub("new"), clf)
     assert len(seen) == 3 * len(REGIONS)

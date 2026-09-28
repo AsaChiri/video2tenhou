@@ -39,11 +39,6 @@ YAKU_JA = {
 }
 
 
-def tile_id(t: str) -> int:
-    """Convert an internal tile token to tenhou's numeric identity, preserving red fives."""
-    return T.tile(t)
-
-
 def _yaku_text(yaku: list[str]) -> list[str]:
     """"Name (han)" from the scoring library -> tenhou's "名前(n飜)" (a yakuman: "名前(役満)")."""
     out = []
@@ -85,25 +80,24 @@ def call_string(c: dict, caller: str) -> str:
         if base is None:
             raise ValueError("ankan without a known tile")
         # a concealed kan of fives is all four fives, the red one among them
-        return T.ankan(tile_id(base), has_aka=base in ("5m", "5p", "5s"))
-    tiles = [tile_id(t) for t in c["tiles"]]
+        return T.ankan(T.tile(base), has_aka=base in ("5m", "5p", "5s"))
+    tiles = [T.tile(t) for t in c["tiles"]]
     pos = c.get("called_pos")
+    pos = pos if pos is not None else 0
     typ = c["type"]
-    if typ == "chi":
-        called = tiles[pos if pos is not None else 0]
-        rest = [x for i, x in enumerate(tiles) if i != (pos if pos is not None else 0)]
-        return T.chi(called, rest[0], rest[1])
+    if typ in ("chi", "pon", "kan"):
+        if typ == "kan":
+            tiles = _one_red(tiles, pos)
+        called = tiles[pos]
+        rest = [x for i, x in enumerate(tiles) if i != pos]
+        if typ == "chi":
+            return T.chi(called, rest[0], rest[1])
     src = c.get("source") or "kamicha"
     rel = {"kamicha": 0, "toimen": 1, "shimocha": 2}[src]
     if typ == "pon":
-        called = tiles[pos] if pos is not None else tiles[0]
-        rest = [x for i, x in enumerate(tiles) if i != (pos if pos is not None else 0)]
         return T.pon(called, rest[0], rest[1], rel=rel)
     if typ == "kan":
-        p = pos if pos is not None else 0
-        tiles = _one_red(tiles, p)
-        rest = [x for i, x in enumerate(tiles) if i != p]
-        return T.daiminkan(tiles[p], rest[0], rest[1], rest[2], rel=rel)
+        return T.daiminkan(called, rest[0], rest[1], rest[2], rel=rel)
     if typ == "kakan":
         # the added tile is the last one (for fives, the plain or red one the solver decided)
         tiles = _one_red(tiles, 3)
@@ -117,7 +111,7 @@ def kyoku_from_decode(d: dict, entry: dict, result: HandResult) -> tuple[T.Kyoku
     for s in rules.SEATS:
         scores[player_index(s, entry["kyoku"])] = entry["scores"][s]
     k = T.Kyoku(entry["kyoku"], entry["honba"], entry["sticks"], scores,
-                dora=[tile_id(t) for t in d["dora"]], ura=[tile_id(t) for t in d.get("ura", [])])
+                dora=[T.tile(t) for t in d["dora"]], ura=[T.tile(t) for t in d.get("ura", [])])
     conf: list[dict] = list(d.get("confidence", []))
     dealer = d["dealer"]
     turns_by_seat: dict[str, list[dict]] = {s: [] for s in rules.SEATS}
@@ -137,11 +131,11 @@ def kyoku_from_decode(d: dict, entry: dict, result: HandResult) -> tuple[T.Kyoku
             first_tsumogiri = bool(mine) and mine[0]["discard"] == fd and mine[0]["kind"] == "draw"
             conf.append({"seat": s, "turn": 0, "field": "first_draw", "margin": None, "human": False, "lost": False,
                          "note": "dealer split is arbitrary"})
-        k.haipai[i] = sorted(tile_id(t) for t in haipai)
+        k.haipai[i] = sorted(T.tile(t) for t in haipai)
         draws: list = []
         discards: list = []
         if first_draw is not None:
-            draws.append(tile_id(first_draw))
+            draws.append(T.tile(first_draw))
         for t in turns_by_seat[s]:
             if t["kind"] in ("call", "kan") and t.get("own_call"):
                 c = t["own_call"]
@@ -150,10 +144,10 @@ def kyoku_from_decode(d: dict, entry: dict, result: HandResult) -> tuple[T.Kyoku
                     if c["type"] == "kan":
                         discards.append(0)
                         if t["draw"] is not None:
-                            draws.append(tile_id(t["draw"]))
+                            draws.append(T.tile(t["draw"]))
                 elif c["type"] in ("ankan", "kakan"):
                     if t["draw"] is not None:
-                        draws.append(tile_id(t["draw"]))
+                        draws.append(T.tile(t["draw"]))
                     try:
                         discards.append(call_string(c, s))
                     except (ValueError, KeyError) as ex:
@@ -161,19 +155,19 @@ def kyoku_from_decode(d: dict, entry: dict, result: HandResult) -> tuple[T.Kyoku
                         conf.append({"seat": s, "turn": t["j"], "field": "kan", "margin": None, "human": False, "lost": True, "note": str(ex)})
                         discards.append(0)
                     if t.get("draw2") is not None:
-                        draws.append(tile_id(t["draw2"]))
+                        draws.append(T.tile(t["draw2"]))
             elif t["kind"] in ("draw",) and t["draw"] is not None:
-                draws.append(tile_id(t["draw"]))
+                draws.append(T.tile(t["draw"]))
             dealer_first = s == dealer and t["j"] == 0 and t["kind"] == "draw"      # no draw of its own: the 14th tile
             if t["discard"] is not None:
                 tsumogiri = first_tsumogiri if dealer_first else bool(t["tsumogiri"])
-                discards.append(T.discard(tile_id(t["discard"]), tsumogiri=tsumogiri, riichi=bool(t["riichi"])))
+                discards.append(T.discard(T.tile(t["discard"]), tsumogiri=tsumogiri, riichi=bool(t["riichi"])))
         # the winning tsumo draw
         if result.outcome == "tsumo" and d["result"]["winner"] == s:
             jw = len(turns_by_seat[s])
             wd = d["draws"].get(f"{s}:{jw}")
             if wd:
-                draws.append(tile_id(wd))
+                draws.append(T.tile(wd))
         k.draws[i] = draws
         k.discards[i] = discards
     # result

@@ -1,6 +1,6 @@
 # PML quick start
 
-Download **video2tenhou-0.1.2-starter.zip** from the
+Download **video2tenhou-0.1.3-starter.zip** from the
 [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
 The starter includes the application, PML layout and trained models.
 
@@ -50,12 +50,40 @@ must be available on PATH.
 
 ### First launch
 
-The launcher runs `uv sync --frozen --no-dev` to install Python 3.12 and the
-locked dependencies, then `uv run --no-sync video2tenhou web` to open the studio.
-The first launch needs internet access and downloads PyTorch; subsequent launches
-reuse the installed environment. Leave the launcher running while using the studio.
-An NVIDIA GPU is recommended; the locked environment uses PyTorch's CUDA 12.4
-builds, so keep a compatible NVIDIA driver installed.
+The launcher installs Python 3.12 and creates a local `.venv-runtime` environment.
+It asks uv to select a matched PyTorch/torchvision build for your hardware and
+driver, without a fixed CUDA or PyTorch version. You do not need to install a
+separate CUDA toolkit. It tests inference kernels before opening the studio;
+if the automatically selected GPU cannot run, it uses CPU mode and tells you
+that processing will be slower.
+
+The first launch needs internet access and enough disk space for large PyTorch
+downloads. Each launch asks uv to select a compatible current PyTorch/torchvision
+pair; uv reuses installed packages and cached downloads where possible. Keep uv
+and your graphics driver up to date. Leave the launcher running while using the studio.
+
+To repair a failed or outdated installation, update your NVIDIA driver, then
+open PowerShell in the extracted folder and run:
+
+```powershell
+winget upgrade --id astral-sh.uv --exact
+.\Start.cmd
+```
+
+To use CPU mode explicitly:
+
+```powershell
+$env:VIDEO2TENHOU_DEVICE = 'cpu'
+.\Start.cmd
+```
+
+These settings apply to that terminal session. Close it and launch normally to
+return to automatic selection. On Linux update uv using your installation method
+and rerun `sh start.sh`, or use `VIDEO2TENHOU_DEVICE=cpu sh start.sh`.
+The launch window prints the chosen GPU, device and package versions for support.
+After a successful initial setup, set `UV_OFFLINE=1` to use uv's local cache
+without network access. If required packages are absent from the cache, reconnect
+and launch normally to finish setup.
 
 ## Convert a recording
 
@@ -126,12 +154,12 @@ from the application folder:
 
 ```powershell
 $env:VIDEO2TENHOU_HOME = 'D:/Mahjong'
-uv run --no-sync video2tenhou web
+.\Start.cmd
 ```
 
 ```sh
 export VIDEO2TENHOU_HOME="$HOME/Mahjong"
-uv run --no-sync video2tenhou web
+sh start.sh
 ```
 
 The server is for your own machine, not a multi-user hosted service. Videos
@@ -146,7 +174,9 @@ require network access.
 | FFmpeg/Tesseract missing | Fix PATH, restart the terminal and relaunch. |
 | Geometry check fails | Open Calibration, inspect the named region and save corrected borders. |
 | Video/site mismatch | Verify IDs/order, recording completeness and overlay recognition. |
-| CUDA unavailable | Check the driver and `uv run python -c "import torch; print(torch.cuda.is_available())"`. |
+| GPU incompatible / no kernel image / CUDA unavailable | Update the NVIDIA driver and uv, then use the repair command above. The launcher chooses and checks a compatible build; CPU mode is available as a slower fallback. |
+| Setup download interrupted or disk full | Free disk space or restore internet access and relaunch. Incomplete setup is retried automatically. |
+| xFormers not available | This optional acceleration message alone is not a setup failure. Read the final error in the log. |
 | Correction not in Results | Rebuild after saving review answers, then refresh Results. |
 | Project could not be saved | Check that the active data directory is writable and available, then retry the action. The previous project file is retained. |
 
@@ -156,22 +186,18 @@ and `review`; see `--help` on each command.
 ## Source setup
 
 The source archive and Git checkout exclude trained weights. Install the
-prerequisites above, then open a terminal in the source folder and run:
-
-```console
-uv sync --frozen --no-dev
-```
-
-Install the matching models below, then launch with
-`uv run --no-sync video2tenhou web`. For development and tests, use
-`uv sync --frozen` to include the development dependencies. To choose another
-Torch/CUDA stack, follow the [separate environment setup](MAINTENANCE.md#dependency-environments).
+prerequisites above and the matching models below, then use **Start.cmd** or
+`sh start.sh`, just as with the starter. For development and tests,
+`uv sync --frozen` creates a separate `.venv` using the development lockfile.
+It does not choose a GPU build for your machine; use the starter launcher for
+automatic runtime selection. For advanced runtime choices, see
+[dependency environments](MAINTENANCE.md#dependency-environments).
 
 ## Models
 
 The starter already contains the required models. Source users can download
 **video2tenhou-pml-models.zip** and **video2tenhou-pml-models.sha256** from the
-[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.1.2),
+[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.1.3),
 or [train their own models](MAINTENANCE.md#training).
 
 With both downloaded files in the application folder, verify and extract them:

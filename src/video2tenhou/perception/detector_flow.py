@@ -7,6 +7,13 @@ from concurrent.futures import ThreadPoolExecutor
 import math
 
 
+def input_shape(image, image_size):
+    """Return the same stride-aligned rectangular shape for both inference paths."""
+    height, width = image.shape[:2]
+    ratio = image_size / max(height, width)
+    return (math.ceil(height * ratio / 32) * 32, math.ceil(width * ratio / 32) * 32)
+
+
 def prepare_input(image, image_size):
     """Return a CPU NCHW tensor, original W/H and stride-aligned target H/W.
 
@@ -18,8 +25,7 @@ def prepare_input(image, image_size):
     import cv2
     from libreyolo.preprocess.yolo9 import preprocess_numpy
     height, width = image.shape[:2]
-    ratio = image_size / max(height, width)
-    shape = (math.ceil(height * ratio / 32) * 32, math.ceil(width * ratio / 32) * 32)
+    shape = input_shape(image, image_size)
     # These bytes match ImageLoader._from_numpy's BGR→RGB conversion. Keep
     # preprocess_numpy's uint8 resize/pad, float32 division and CHW strides.
     chw, _ = preprocess_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), shape)

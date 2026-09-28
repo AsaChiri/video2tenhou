@@ -6,7 +6,7 @@ from video2tenhou.engine.solver import DrawEvidence, HandModel, SeatTurn, Soluti
 
 
 def test_open_kan_replacement_acquisition_is_unique_and_respects_facts_and_evidence():
-    turns = [SeatTurn(j, 'kan', '1s', 10*j, 10*j+5, kan='daiminkan', rinshan=True)
+    turns = [SeatTurn(j, 'kan', '1s', 10*j, 10*j+5, kan='daiminkan')
              for j in range(6)]
     turns[4].kan, turns[4].two_draws = 'ankan', True
     turns[5].kind = 'call'  # Winning daiminkan: no ordinary draw variable here.

@@ -23,7 +23,7 @@ import numpy as np
 
 from ..train.data import CLASS_INDEX, CLASSES
 from . import rules
-from .melds import Call
+from .melds import POSITION, Call
 from .ponds import PondSlot
 
 SEATS = rules.SEATS
@@ -81,15 +81,6 @@ def removal_gap(c: Call, slot: PondSlot) -> Optional[float]:
     return d if d <= CALL_TOL else None
 
 
-def _call_on(calls: list[Call], slot: PondSlot, discarder: str) -> Optional[Call]:
-    best = None
-    for c in calls:
-        d = _call_dist(c, slot, discarder)
-        if d is not None and (best is None or d < best[0]):
-            best = (d, c)
-    return best[1] if best else None
-
-
 def assign_calls(calls: list[Call], seq: dict[str, list[PondSlot]]) -> dict[str, list[Optional[Call]]]:
     """Which call took each removed slot. A call takes one tile, so every call is assigned to its single
     nearest compatible removal and every removal to at most one call (nearest pairs first)."""
@@ -122,7 +113,7 @@ def virtual_discards(logs: dict[str, list[PondSlot]], calls: list[Call]) -> dict
         src = next((s for s in SEATS if rules.relative(c.seat, s) == c.source), None)
         if src is None:
             continue
-        if any(_call_on([c], sl, src) is c for sl in out[src]):
+        if any(_call_dist(c, sl, src) is not None for sl in out[src]):
             continue
         p = np.zeros(len(CLASSES))
         p[CLASS_INDEX[c.called_tile]] = 1.0
@@ -148,11 +139,9 @@ def merge(logs: dict[str, list[PondSlot]], calls: list[Call], dealer: str,
     if not unknown:
         turns, problems, _ = _merge(logs, calls, dealer, end, wall, exhaustive)
         return turns, problems
-    pos_of = {"pon": {"kamicha": 0, "toimen": 1, "shimocha": 2}, "kan": {"kamicha": 0, "toimen": 1, "shimocha": 3}}
-
     def set_source(c: Call, src: str) -> None:
         c.source = src
-        c.called_pos = pos_of[c.type][src]
+        c.called_pos = POSITION[c.type][src]
         c.called_tile = c.tiles[c.called_pos] if c.called_pos < len(c.tiles) else c.tiles[0]
 
     choices = []
@@ -316,7 +305,7 @@ def _merge(logs: dict[str, list[PondSlot]], calls: list[Call], dealer: str, end:
 def _hidden_call(caller: str, discarder: str, sl: PondSlot) -> Call:
     """A call the turn order shows and no camera did: a pon of the removed tile until the solver chooses its tiles."""
     source = rules.relative(caller, discarder)
-    pos = {"kamicha": 0, "toimen": 1, "shimocha": 2}[source]
+    pos = POSITION["pon"][source]
     tiles = [rules.plain(sl.tile)] * 3
     tiles[pos] = sl.tile
     return Call(caller, sl.t_removed, (sl.t_first, sl.t_removed), "pon", tiles, pos, source, sl.tile, [], 0.0, anchor="hidden")

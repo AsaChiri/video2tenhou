@@ -7,7 +7,6 @@ training data, videos or external base checkpoints.
 import argparse
 import hashlib
 import json
-import math
 from pathlib import Path
 import tempfile
 import zipfile
@@ -30,19 +29,8 @@ def _members(models: Path) -> dict[str, bytes]:
     actual = hashlib.sha256(members["detector/weights.pt"]).hexdigest()
     if meta.get("weights_sha256") != actual:
         raise ValueError("Detector metadata does not match its weights SHA-256")
-    inference = meta.get("inference", {})
-    if not isinstance(inference, dict) or set(inference) - {"imgsz", "confidence", "iou", "cuda_graph"}:
-        raise ValueError("Unsupported detector inference metadata")
-    size = inference.get("imgsz", 1024)
-    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
-        raise ValueError("Detector image size must be a positive integer")
-    for key, default in (("confidence", .15), ("iou", .5)):
-        value = inference.get(key, default)
-        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-                not math.isfinite(value) or not 0 < value <= 1):
-            raise ValueError("Detector confidence and IoU must be finite numbers in (0, 1]")
-    if not isinstance(inference.get("cuda_graph", False), bool):
-        raise ValueError("Detector CUDA graph setting must be boolean")
+    from video2tenhou.perception.detector_metadata import inference_settings
+    inference_settings(meta.get("inference", {}))
     from video2tenhou.perception.evidence_policy import resolve_policy
     resolve_policy(meta.get("evidence_policy"))
     required = ("detector/provenance.json", "detector/LICENSE")

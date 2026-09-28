@@ -222,7 +222,7 @@ def test_ura_indicators_count_against_the_four():
 def test_kakan_of_fives_reports_which_five_was_added():
     turns = {s: [] for s in rules.SEATS}
     turns["S"] = [SeatTurn(0, "call", "1z", 10, 20, removed=["5p", "5p"]),
-                  SeatTurn(1, "kan", "2z", 100, 120, kan="kakan", kan_tile="5p", two_draws=True, rinshan=True)]
+                  SeatTurn(1, "kan", "2z", 100, 120, kan="kakan", kan_tile="5p", two_draws=True)]
     model = HandModel("E", turns, ["9s"])
     model.facts.haipai["S"] = ["1m", "2m", "3m", "5p", "5p", "0p", "7s", "8s", "9s", "1z", "2z", "3z", "6z"]
     sol = model.solve(time_limit=5, margins=False)
@@ -232,7 +232,7 @@ def test_kakan_of_fives_reports_which_five_was_added():
 def test_ankan_after_riichi_is_of_the_drawn_tile_and_the_rinshan_draw_is_discarded():
     turns = {s: [] for s in rules.SEATS}
     turns["S"] = [SeatTurn(0, "draw", "1z", 10, 20, riichi=True),
-                  SeatTurn(1, "kan", "9p", 100, 120, kan="ankan", kan_tile="3m", two_draws=True, rinshan=True)]
+                  SeatTurn(1, "kan", "9p", 100, 120, kan="ankan", kan_tile="3m", two_draws=True)]
     model = HandModel("E", turns, ["9s"])
     model.facts.haipai["S"] = ["3m", "3m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "1z", "1z", "2z", "6z"]
     sol = model.solve(time_limit=5, margins=False)
@@ -550,7 +550,7 @@ def test_dense_draws_read_the_hand_before_and_after_the_turn(monkeypatch):
               + [_dframe(55 + 0.2 * k, after) for k in range(10)])         # at rest after the discard
     monkeypatch.setattr(dense, "dense_reads", lambda *a, **k: {"hand:TL": [f for f in frames if a[5] <= f["t"] <= a[6]]})
     st = [SeatTurn(0, "draw", "6z", 10, 20), SeatTurn(1, "draw", "9m", 40, 50)]
-    model = SimpleNamespace(turns={"S": st}, hand_ev=[], draw_ev=[], dealer="E", tsumo_winner=None, end_prior={})
+    model = SimpleNamespace(turns={"S": st}, hand_ev=[], draw_ev=[], dealer="E", tsumo_winner=None)
     turns = [Turn(0, "S", "draw", None, 20.0), Turn(1, "W", "draw", None, 30.0), Turn(2, "S", "draw", None, 50.0),
              Turn(3, "W", "draw", None, 60.0)]
     entry = {"corner_wind": {"TL": "S", "TR": "W", "BL": "E", "BR": "N"}}

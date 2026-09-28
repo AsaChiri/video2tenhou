@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Iterable, Optional
+from typing import Iterable
 
 SEATS = "ESWN"
 KINDS = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + [f"{n}z" for n in range(1, 8)]   # 34
 REDS = {"0m": "5m", "0p": "5p", "0s": "5s"}
-SUITS = "mpsz"
 
 
 def plain(tile: str) -> str:
@@ -68,34 +67,11 @@ def is_pon(tiles: list[str]) -> bool:
     return len(tiles) == 3 and len({plain(t) for t in tiles}) == 1
 
 
-def is_kan(tiles: list[str]) -> bool:
-    """Check four tiles of one visible kind, allowing X for concealed tile backs."""
-    return len(tiles) == 4 and len({plain(t) for t in tiles if t != "X"}) == 1
-
-
 def kan_tiles(kind: str) -> list[str]:
     """The four tiles of any kan of `kind`: a kan of fives is all four fives, three plain and the red one."""
     k = plain(kind)
     red = next((r for r, p in REDS.items() if p == k), None)
     return [k] * 3 + [red] if red else [k] * 4
-
-
-def meld_type(tiles: list[str], face_down: int = 0) -> Optional[str]:
-    """chi | pon | kan (four shown) | ankan (two face-down) | None."""
-    if face_down >= 2 and len(tiles) == 4:
-        return "ankan"
-    if is_kan(tiles):
-        return "kan"
-    if is_pon(tiles):
-        return "pon"
-    if is_chi(tiles):
-        return "chi"
-    return None
-
-
-def hand_size(melds: int, after_draw: bool = False, kans: int = 0) -> int:
-    """Concealed tiles a player holds: 13 - 3 per meld (a kan counts as a meld of three here), +1 after a draw."""
-    return 13 - 3 * melds + (1 if after_draw else 0)
 
 
 DEALER = "E"        # seats are the winds of the hand being decoded, so the dealer is always East

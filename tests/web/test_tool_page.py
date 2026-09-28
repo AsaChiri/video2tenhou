@@ -83,6 +83,40 @@ console.log(JSON.stringify({answered:isAnswered(ITEMS[0]),card:nodes.get('#qcard
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_call_without_known_source_offers_all_other_ponds(tmp_path):
+    script = re.search(r"<script>([\s\S]*)</script>", PAGE.read_text(encoding="utf-8"))[1]
+    script = script.split("// ------------------------------------------------------------------ label view")[0]
+    harness = """
+const nodes = new Map();
+const document = {querySelectorAll(){return [];},querySelector(selector) {
+  if (selector === '#tilelist') return null;
+  if (!nodes.has(selector)) nodes.set(selector, {innerHTML:'',offsetWidth:0,children:[],
+    querySelectorAll(){return [];},classList:{add(){},remove(){},toggle(){}}});
+  return nodes.get(selector);
+}};
+const window = {scrollTo(){}};
+const fetch = () => { throw new Error('Unexpected network call'); };
+"""
+    scenario = """
+HANDS[0] = {hand:0,game:0,kyoku:0,honba:0,t_start:10,t_end:80,
+  corner_wind:{TL:'E',TR:'S',BR:'W',BL:'N'}};
+ITEMS = [{hand:0,idx:0,kind:'call',seat:'E',t:30,type:'pon',tile:'2p',text:'Unknown source'}];
+FACTS[0] = []; NOTES[0] = [];
+const ponds = [];
+clip = region => { ponds.push(region); return ''; };
+await showItem(0, 0);
+console.log(JSON.stringify({ponds,card:nodes.get('#qcard').innerHTML}));
+"""
+    path = tmp_path / "unknown-call-source.mjs"
+    path.write_text(harness + script + scenario, encoding="utf-8")
+    result = subprocess.run(["node", str(path)], capture_output=True, text=True, encoding="utf-8")
+    assert result.returncode == 0, result.stderr
+    rendered = json.loads(result.stdout)
+    assert rendered["ponds"] == ["pond:TR", "pond:BR", "pond:BL"]
+    assert "Correct this meld" in rendered["card"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 def test_uncertain_tile_group_answers_only_the_selected_choice(tmp_path):
     """Render the real group/editors and save distinct facts through their handlers.
 
@@ -224,7 +258,7 @@ ITEMS=[
  {hand:1,idx:2,kind:'conflict'},
  {hand:1,idx:3,kind:'draw',seat:'N',j:5,margin:.15},
  {hand:1,idx:4,kind:'solver_incomplete',alternative_gap:0},
- {hand:1,idx:5,kind:'lost',seat:'N',j:6}
+ {hand:1,idx:5,kind:'draw',seat:'N',j:6,lost:true}
 ];
 FACTS={0:[{kind:'draw',seat:'N',j:0,ts:9}],1:[{kind:'draw',seat:'N',j:5,ts:11}]};
 ITEMS.forEach(item=>item.done=isAnswered(item));

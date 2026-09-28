@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,10 +113,11 @@ def download(url: str, out: str | Path, start: Optional[str] = None, end: Option
     """Download a video URL (or a section of it) at the best 1080p quality with yt-dlp."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["uvx", "yt-dlp", "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]", "--merge-output-format", "mp4",
-           "-o", str(out), "--", url]
+    cmd = [sys.executable, "-m", "yt_dlp", "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+           "--merge-output-format", "mp4", "-o", str(out)]
     if start or end:
         sec = f"*{start or '0'}-{end or 'inf'}"
-        cmd[2:2] = ["--download-sections", sec]
+        cmd += ["--download-sections", sec]
+    cmd += ["--", url]
     subprocess.run(cmd, check=True)
     return out

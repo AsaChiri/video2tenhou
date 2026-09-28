@@ -21,7 +21,6 @@ import numpy as np
 from ..train.data import CLASS_INDEX, CLASSES
 from . import rules
 
-NC = len(CLASSES)
 FLOOR = 0.15                    # a meld hypothesis needs each tile's reading at this posterior on average
 REDS = {"5m": "0m", "5p": "0p", "5s": "0s"}
 

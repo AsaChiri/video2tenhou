@@ -10,6 +10,7 @@ import pytest
 
 from video2tenhou import cli, record, tenhou6, timeline
 from video2tenhou.observe import run_observe as actual_run_observe
+from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
 
 
 @pytest.fixture
@@ -29,7 +30,7 @@ def conversion(tmp_path, monkeypatch):
     monkeypatch.setattr(record, "fetch_game", lambda *args: calls.append("record") or game)
     monkeypatch.setattr(timeline, "run_header", lambda *args, **kwargs: (entries, []))
     monkeypatch.setattr(calm, "run_calm", lambda *args, **kwargs: [])
-    monkeypatch.setattr(detector, "Detector", lambda: object())
+    monkeypatch.setattr(detector, "Detector", lambda: SimpleNamespace(evidence_policy=DEFAULT_POLICY))
     monkeypatch.setattr(classifier, "Classifier", lambda: object())
     monkeypatch.setattr(read, "run_read", lambda *args, **kwargs: ({"readings": 0}, {0}))
     def observations(*args, **kwargs):

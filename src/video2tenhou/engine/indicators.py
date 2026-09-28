@@ -22,7 +22,7 @@ import numpy as np
 from ..train.data import CLASSES
 from . import rules
 from .hand import corner_of, in_window
-from .melds import Call
+from .melds import POSITION, Call
 from .ponds import PondSlot
 
 MIN_VIEWS = 3          # a real indicator is seen in at least this many full views ...
@@ -261,7 +261,7 @@ def _kan_the_cameras_missed(ind: dict, logs: dict[str, list[PondSlot]], calls: l
         tile = sl.tile
         src = rules.relative(seat, s2)
         problems.append(f"kan by {seat} at {t:.0f}s inferred from the new indicator {ind['tile']} (daiminkan on {s2}'s {tile})")
-        pos = {"kamicha": 0, "toimen": 1, "shimocha": 3}[src]
+        pos = POSITION["kan"][src]
         return Call(seat, t, window, "kan", rules.kan_tiles(tile), pos, src, tile, [], 0.5, 0, 3)
     pairs = pair_groups(obs.get(f"meld:{corner_of(entry, seat)}", []), t)
     if pairs:

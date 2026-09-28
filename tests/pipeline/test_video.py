@@ -58,8 +58,17 @@ def test_download_cli_passes_source_as_literal_to_ytdlp(tmp_path, monkeypatch, s
     output = tmp_path / "video.mp4"
     main(["download", "--", source, str(output)])
     command, kwargs = commands[0]
+    assert command[:3] == [video.sys.executable, "-m", "yt_dlp"]
     assert command[-4:] == ["-o", str(output), "--", source]
     assert kwargs["check"] is True
+
+
+def test_download_section_uses_installed_ytdlp_and_preserves_literal_url(tmp_path, monkeypatch):
+    commands = []
+    monkeypatch.setattr(video.subprocess, "run", lambda command, **kwargs: commands.append(command))
+    video.download("--version", tmp_path / "clip.mp4", start="00:01:00", end="00:02:00")
+    assert commands[0][:3] == [video.sys.executable, "-m", "yt_dlp"]
+    assert commands[0][-4:] == ["--download-sections", "*00:01:00-00:02:00", "--", "--version"]
 
 
 def test_download_propagates_ytdlp_failure(tmp_path, monkeypatch):

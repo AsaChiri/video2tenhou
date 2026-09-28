@@ -15,15 +15,7 @@ import cv2
 import numpy as np
 
 from .paths import DATA_DIR as ROOT
-
-
-def iou(a, b) -> float:
-    """Intersection over union of two (left, top, right, bottom) boxes; zero for empty union."""
-    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
-    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-    inter = ix * iy
-    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-    return inter / ua if ua > 0 else 0.0
+from .layout import box_iou as iou
 
 
 def match(pred, gt, thr: float = 0.5) -> list[tuple[int, int]]:
@@ -36,19 +28,6 @@ def match(pred, gt, thr: float = 0.5) -> list[tuple[int, int]]:
         if i in used_p or j in used_g:
             continue
         used_p.add(i); used_g.add(j); out.append((i, j))
-    return out
-
-
-def read_yolo_labels(p: Path, w: int, h: int) -> list[tuple[float, float, float, float]]:
-    """Convert normalized YOLO labels to pixel boxes; a missing file means no annotations."""
-    out = []
-    if not p.exists():
-        return out
-    for line in p.read_text().splitlines():
-        if not line.strip():
-            continue
-        _, cx, cy, bw, bh = (float(v) for v in line.split())
-        out.append(((cx - bw / 2) * w, (cy - bh / 2) * h, (cx + bw / 2) * w, (cy + bh / 2) * h))
     return out
 
 
@@ -201,7 +180,7 @@ def eval_perception(video_path: str, work: Path = ROOT / "work", *, weights: Opt
     cal = Calibration.load("pml", video_path)
     det = Detector(weights, backend=backend, conf=conf) if weights is not None else Detector(backend=backend, conf=conf)
     clf = Classifier(classifier_dir) if classifier_dir is not None else Classifier()
-    policy = resolve_policy(evidence_policy if evidence_policy is not None else getattr(det, "evidence_policy", None))
+    policy = resolve_policy(evidence_policy if evidence_policy is not None else det.evidence_policy)
     hands = hand_table(video_path, work)
     frames_dir = work / Path(video_path).stem / "frames"
     stats = defaultdict(lambda: defaultdict(int))

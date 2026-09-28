@@ -10,6 +10,7 @@ from video2tenhou import read
 from video2tenhou.calm import Interval, REGIONS
 from video2tenhou.layout import Calibration
 from video2tenhou.perception.reader import Reading
+from video2tenhou.train.data import CLASSES
 
 
 def test_sparse_plan_holes_keep_window_order_batches_and_caller_inference(tmp_path, monkeypatch):
@@ -45,7 +46,7 @@ def test_sparse_plan_holes_keep_window_order_batches_and_caller_inference(tmp_pa
     monkeypatch.setattr(read.video, "sample", sample)
     monkeypatch.setattr(read, "region_upright", lambda image, *_: (image.copy(), None))
     monkeypatch.setattr(read, "read_regions", infer)
-    model = SimpleNamespace(id="same")
+    model = SimpleNamespace(id="same", classes=CLASSES, T=1.0)
     stats, touched = read.run_read("video", Calibration.load("pml"), tmp_path,
                                    [row], ivs, model, model, log=lambda *_: None)
     assert windows == [dict(fps=2., start=1., end=3.625)]
@@ -94,7 +95,7 @@ def test_sparse_failure_joins_producer_and_preserves_previous_publication(tmp_pa
     monkeypatch.setattr(read.video, "sample", sample)
     monkeypatch.setattr(read, "region_upright", crop)
     monkeypatch.setattr(read, "read_regions", infer)
-    model = SimpleNamespace(id="same")
+    model = SimpleNamespace(id="same", classes=CLASSES, T=1.0)
     with pytest.raises(RuntimeError, match="failed"):
         read.run_read("video", Calibration.load("pml"), tmp_path,
                       [dict(hand=2, t_start=0., t_end=9.)],

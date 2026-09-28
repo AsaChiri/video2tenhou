@@ -22,7 +22,7 @@ def inputs(tmp_path, monkeypatch, *, duplicate=False, unknown=False):
     (drafts / "boxes.json").write_text(json.dumps(dict(boxes=[dict(class_id=1 if unknown else 0, yolo=[.5, .5, .2, .4])])))
     row = dict(status="unreviewed_predictions", image="photo.png", predictions="boxes.json", sha256=hashlib.sha256(b"unreviewed photo").hexdigest())
     (drafts / "manifest.jsonl").write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n")
-    hands = [dict(t_start=index * 10., t_end=index * 10. + 9.) for index in range(5)]
+    hands = [dict(t_overlay=[index * 10., index * 10. + 9.]) for index in range(5)]
     return human, drafts, hands
 
 

@@ -44,7 +44,7 @@ def _recognition(monkeypatch):
 def test_dense_policy_recomputes_structure_and_only_dense_changes_invalidate(tmp_path, monkeypatch):
     calls, raw_boxes = _recognition(monkeypatch)
     det = SimpleNamespace(id='unchanged-detector', evidence_policy=DEFAULT_POLICY)
-    clf = SimpleNamespace(id='unchanged-classifier')
+    clf = SimpleNamespace(id='unchanged-classifier', classes=CLASSES, T=1.0)
     cal = Calibration.load('pml')
 
     def acquire():
@@ -68,7 +68,7 @@ def test_dense_policy_recomputes_structure_and_only_dense_changes_invalidate(tmp
 def test_policy_only_changes_leave_sparse_read_manifest_and_raw_bytes_reusable(tmp_path, monkeypatch):
     calls, _ = _recognition(monkeypatch)
     det = SimpleNamespace(id='unchanged-detector', evidence_policy=DEFAULT_POLICY)
-    clf = SimpleNamespace(id='unchanged-classifier')
+    clf = SimpleNamespace(id='unchanged-classifier', classes=CLASSES, T=1.0)
     cal = Calibration.load('pml')
     hands = [dict(hand=0, t_start=0., t_end=1.)]
     intervals = [Interval('hand:TL', 0., 0., 1, True, 0., 0.)]
