@@ -15,6 +15,8 @@ def test_identity_tracks_checkpoint_metadata_and_preprocessing(tmp_path, monkeyp
             return self
     monkeypatch.setattr(classifier, "make_model", lambda n: Model())
     monkeypatch.setattr(classifier.torch, "load", lambda *a, **k: {})
+    # This test hashes simulated runtimes; kernel/device checks have their own tests.
+    monkeypatch.setattr(classifier, "select_device", lambda device: device)
     weights = tmp_path / "weights.pt"
     weights.write_bytes(b"checkpoint-a")
     meta = {"classes": classifier.CLASSES, "temperature": 1.}
