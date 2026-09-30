@@ -3,8 +3,9 @@
 A release consists of tested source and Python distributions, a compatible
 model bundle, its provenance and checksums, and installation instructions.
 Use the same source revision for all validation and published artifacts.
-The current [0.2.0 release notes](RELEASE_NOTES_0.2.0.md) record the prepared
-changes and remaining publication gates.
+Record all changes in the root [changelog](../CHANGELOG.md). Keep pending changes
+under Unreleased, then add a dated version section when releasing. Use that
+section for the GitHub release notes; do not commit separate per-version notes.
 
 1. Verify that the source license text and package license metadata describe
    the intended distribution. Check dependency and model redistribution terms

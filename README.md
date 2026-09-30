@@ -40,6 +40,7 @@ Using a source checkout instead? Follow [source setup and models](docs/QUICKSTAR
 - [Design](docs/DESIGN.md): reconstruction rules and evidence model.
 - [Third-party notices](THIRD_PARTY_NOTICES.md): tile art and model dependencies.
 - [Release checklist](docs/RELEASING.md): artifact, model and distribution checks.
+- [Changelog](CHANGELOG.md): changes and upgrade notes for each release.
 
 ## Development
 

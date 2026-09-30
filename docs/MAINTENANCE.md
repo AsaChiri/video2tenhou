@@ -214,8 +214,8 @@ GitHub Actions, with an up-to-date branch, including for administrators. Keep
 those protection settings aligned with the workflow job names; workflow files
 alone cannot set that repository policy.
 
-The initial Ruff ALL and ty rollout exposes existing Python diagnostics.
-Those diagnostics fail CI and must be fixed rather than hidden by a baseline.
+Ruff ALL and strict typing pass across the repository. New diagnostics fail CI
+and must be fixed rather than hidden by a baseline.
 
 ### Regression suite
 

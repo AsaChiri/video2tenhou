@@ -50,7 +50,7 @@ packages = ["src/video2tenhou"]
 artifacts = ["src/video2tenhou/tool/static/index.html", "src/video2tenhou/tool/static/assets/**"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/", "frontend/", "tests/", "docs/", "tools/", "README.md", "LICENSE*", "THIRD_PARTY_NOTICES.md", "pyproject.toml", "uv.lock", ".python-version", "Start.cmd", "start.sh"]
+include = ["src/", "frontend/", "tests/", "docs/", "tools/", "README.md", "CHANGELOG.md", "LICENSE*", "THIRD_PARTY_NOTICES.md", "pyproject.toml", "uv.lock", ".python-version", "Start.cmd", "start.sh"]
 exclude = ["frontend/node_modules/"]
 
 [tool.coverage.run]
