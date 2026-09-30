@@ -1,22 +1,28 @@
 """Contradictory terminal readings remain reviewable without invented turns."""
-from types import SimpleNamespace
+
 from copy import deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 
-from video2tenhou.engine.ponds import track_pond
-from video2tenhou.engine.pond_evidence import consume_replacement, replacement_question, replacement_requests
 from tests.engine.helpers import obs, row
+from video2tenhou.engine.pond_evidence import (
+    consume_replacement,
+    replacement_question,
+    replacement_requests,
+)
+from video2tenhou.engine.ponds import track_pond
 
 
 def sequence():
-    return [obs(0, 2, row(["2p", "7m"])),
-            obs(5, 6, row(["2p", "1m"]))]
+    return [obs(0, 2, row(["2p", "7m"])), obs(5, 6, row(["2p", "1m"]))]
 
 
 def requests(log, *, call=None, facts=None, end=6):
     turns = [SimpleNamespace(seat="N", slot=s, t=s.t_first, call=call) for s in log]
-    return replacement_requests(turns, {"corner_wind": {"BR": "N"}}, facts or {}, 0, end)
+    return replacement_requests(
+        turns, {"corner_wind": {"BR": "N"}}, facts or {}, 0, end
+    )
 
 
 def test_terminal_replacement_survives_serialization_without_extra_discard():
@@ -29,7 +35,7 @@ def test_terminal_replacement_survives_serialization_without_extra_discard():
     assert payload["prefix_complete"] and payload["t0"] == 5
     payload["views"][0]["tile"]["p"][0] = -1
     assert log[-1].pending_replacement["views"][0]["tile"]["p"][0] >= 0
-    request, = requests(log)
+    (request,) = requests(log)
     assert request["window"] == [0, 6] and request["j"] == 1
     item = replacement_question(request)
     assert item["kind"] == "discard" and item["runner_up"] == "1m"
@@ -52,7 +58,9 @@ def test_repeated_refill_preserves_removal_but_requires_independent_call():
     assert log[1].t_removed == 5
     hidden = SimpleNamespace(human=False, anchor="hidden", seen=10, partial_only=False)
     assert len(requests(log, call=hidden, end=10)) == 1
-    independent = SimpleNamespace(human=False, anchor="discard", seen=2, partial_only=False)
+    independent = SimpleNamespace(
+        human=False, anchor="discard", seen=2, partial_only=False
+    )
     assert not requests(log, call=independent, end=10)
 
 
@@ -63,7 +71,7 @@ def test_partial_or_long_gap_stays_uncertain_and_fact_suppresses_identity():
     assert log[1].t_removed is None
     assert requests(log)[0]["pending"]["views"][0]["partial"]
     log[1].pending_replacement["t1"] = 100
-    request, = requests(log, end=100)
+    (request,) = requests(log, end=100)
     assert request["window"] is None
     assert replacement_question(request)["tracking_uncertain"]
     assert not requests(log, facts={"discard": [{"seat": "N", "t": 0, "tile": "7m"}]})
@@ -73,22 +81,27 @@ def dense_frames():
     frames = []
     for i in range(31):
         tiles = row(["2p", "7m" if i < 10 else "1m"])
-        boxes = [{**tile, "row": tile["key"][0], "col": tile["key"][1], "role": "tile"} for tile in tiles]
+        boxes = [
+            {**tile, "row": tile["key"][0], "col": tile["key"][1], "role": "tile"}
+            for tile in tiles
+        ]
         frames.append({"t": i / 5, "boxes": boxes})
     return frames
 
 
 def test_continuous_evidence_substitutes_once_without_changing_turns():
     log = track_pond(sequence())
-    request, = requests(log)
+    (request,) = requests(log)
     before = log[-1].p.copy()
     frames = dense_frames()
     sparse = np.asarray(request["pending"]["stable_view"]["tile"]["p"]) * 3
-    expected = before - sparse + sum(np.asarray(frame["boxes"][-1]["p"]) for frame in frames)
+    expected = (
+        before - sparse + sum(np.asarray(frame["boxes"][-1]["p"]) for frame in frames)
+    )
     assert consume_replacement(log[-1], request, frames)
     np.testing.assert_allclose(log[-1].p, expected)
     assert len(log) == 2 and log[-1].t_removed is None
-    fresh, = requests(log)
+    (fresh,) = requests(log)
     assert fresh["signature"] == request["signature"] and fresh["acquired"]
     assert not replacement_question(fresh)["tracking_uncertain"]
     assert not consume_replacement(log[-1], fresh, frames)
@@ -98,7 +111,7 @@ def test_continuous_evidence_substitutes_once_without_changing_turns():
 def test_occlusion_changed_prefix_or_possible_call_cannot_fuse():
     for defect in ("count", "gap", "geometry", "prefix", "call"):
         log = track_pond(sequence())
-        request, = requests(log)
+        (request,) = requests(log)
         before = log[-1].p.copy()
         frames = deepcopy(dense_frames())
         if defect == "count":

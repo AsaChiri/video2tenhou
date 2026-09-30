@@ -29,18 +29,12 @@ The [benchmark workloads](BENCHMARKS.md) define representative inputs and checks
 - Dense cache keys include the exact sampling rate and millisecond window bounds.
   Stored timestamps are nominal sampling positions; filtering a longer scan by
   timestamp does not establish equivalent frame selection at shorter endpoints.
-- Header caches bind source, overlay geometry, frame dimensions and sampling
-  settings. Table-camera edits can reuse unchanged overlay readings. Calm scores
-  bind source and region geometry; matching scores can produce new intervals after
-  a threshold change. Refreshes publish atomically and retain complete files until
-  replacement succeeds.
-- Header recognition precomputes normalized templates and caches up to 2,048 exact
-  normalized digit signatures. Tesseract results are reused only for identical
-  prepared pixels, dimensions, type, configuration and executable. Numeric scans
-  stop once a required field is missing or a repeated wind makes a row unusable;
-  diagnostic reads examine every corner.
-- Scoremj supplies the expected score trajectory. Observed headers still determine
-  hand timing, seat mapping and riichi-stick changes.
+- Table timing caches bind source, region geometry, calm intervals and detector
+  identity. Calm scores bind source and region geometry; matching scores can
+  produce new intervals after a threshold change. Refreshes publish atomically
+  and retain complete files until replacement succeeds.
+- Scoremj supplies scores, rounds, players, starting seats and riichi sticks.
+  Pond clearings determine hand timing; East 1's dealer occupies the TL chair.
 - Decoder failures propagate as errors. Closing a sampler stops its decoder.
 
 See [maintenance](MAINTENANCE.md#data-and-caches) for invalidation and data ownership.
@@ -48,9 +42,10 @@ See [maintenance](MAINTENANCE.md#data-and-caches) for invalidation and data owne
 ## Reconstruction and confidence
 
 A main solve has a 60-second ceiling and returns when optimality is proved.
-Alternative searches have four-second ceilings, with four searches running
-concurrently and eight CP-SAT workers each. A hand can require several solves and
-video rereads. Incomplete main searches remain provisional in review.
+Alternative searches share a ten-second budget across the hand's solves, with
+four-second ceilings per check and CPU allocation shared across concurrent checks.
+A hand can require several solves and video rereads. Incomplete searches remain
+recorded in confidence data and hand notes without creating retry questions.
 
 Draw alternatives clone the built constraint model while preserving variable
 indices, constraint order, objective and exclusion placement. Starting-hand
@@ -85,7 +80,7 @@ workload guarantees a cold operating-system file cache.
 
 The profile records input hashes, geometry, library versions, effective thread
 counts, stage/hand events and five-second resource samples. It also records
-resolved executable paths and versions for FFmpeg, ffprobe, Tesseract and uv;
+resolved executable paths and versions for FFmpeg, ffprobe and uv;
 unavailable or failed version probes are reported without stopping conversion.
 `summary.json`
 contains conversion wall time, process CPU time and inclusive timing totals.
@@ -118,20 +113,3 @@ The benchmark warms scalar and batched reader paths, excludes JPEG loading from
 timing, and reports probability and geometry drift. Changed detection counts,
 identities, roles or rejection status cause a nonzero exit. For trained model
 changes, use [model qualification](DETECTOR_BACKENDS.md#qualification).
-
-## Header comparisons
-
-```powershell
-uv run python -m video2tenhou.benchmark --video videos/broadcast.mp4 --window 450 750 --window 1800 2100 --calib pml --output work/header-benchmark.json
-```
-
-Windows use seconds; `--window` is repeatable and `--fps` defaults to 1. `--calib`
-also accepts a custom layout. This mode requires FFmpeg, packaged templates and
-Tesseract for fallback, but no detector or classifier weights.
-
-The scalar reference and production matcher receive the same windows. Template
-initialization is outside timing. The report separates pass time, frame wait and
-recognition time; serialized fields, missing readings and checksums must match.
-Run in a separate process because the benchmark temporarily swaps the matcher.
-Repeat with representative score changes and unreadable overlays; the second pass
-can benefit from filesystem caching.

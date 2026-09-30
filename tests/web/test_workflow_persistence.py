@@ -1,4 +1,5 @@
 """Job admission and completion stay truthful when project storage fails."""
+
 import ctypes
 import json
 import os
@@ -7,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from video2tenhou.tool import workflow
 from video2tenhou import files
+from video2tenhou.tool import workflow
 
 
 @pytest.fixture
@@ -16,7 +17,9 @@ def project(tmp_path):
     video = tmp_path / "recording.mp4"
     video.write_bytes(b"local recording identity")
     commands = []
-    workspace = workflow.Workspace(tmp_path, runner=lambda args, p: commands.append(args))
+    workspace = workflow.Workspace(
+        tmp_path, runner=lambda args, p: commands.append(args)
+    )
     value = workspace.create({"source": str(video), "games": [22002]})
     key = value["id"]
     path = workspace.projects_dir / f"{key}.json"
@@ -31,7 +34,9 @@ def finish(workspace):
 
 
 @pytest.mark.parametrize("boundary", ["temporary_file", "replacement"])
-def test_failed_admission_keeps_manifest_and_allows_retry(project, monkeypatch, boundary):
+def test_failed_admission_keeps_manifest_and_allows_retry(
+    project, monkeypatch, boundary
+):
     workspace, key, path, commands = project
     before = path.read_bytes()
     attempts = []
@@ -101,8 +106,15 @@ def test_persistent_windows_denial_is_bounded_and_retryable(project, monkeypatch
 def test_real_windows_reader_contention_recovers_before_launch(project, monkeypatch):
     workspace, key, path, commands = project
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong,
-                                  ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    kernel.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    ]
     kernel.CreateFileW.restype = ctypes.c_void_p
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
     handle = kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0, None)
@@ -140,20 +152,24 @@ def test_real_windows_reader_contention_recovers_before_launch(project, monkeypa
 def test_completion_save_failure_is_visible_and_restart_recovers(project, monkeypatch):
     workspace, key, path, commands = project
     entered, release = threading.Event(), threading.Event()
+
     def runner(args, value):
         commands.append(args)
         entered.set()
         assert release.wait(5)
+
     workspace.runner = runner
     workspace.start(key, "prepare")
     assert entered.wait(5)
     admitted = path.read_bytes()
     assert json.loads(admitted)["job"]["running"]
     original = Path.replace
+
     def replace(source, target):
         if target == path:
             raise PermissionError("completion cannot be saved")
         return original(source, target)
+
     with monkeypatch.context() as patch:
         patch.setattr(Path, "replace", replace)
         release.set()
@@ -164,7 +180,9 @@ def test_completion_save_failure_is_visible_and_restart_recovers(project, monkey
         assert "Could not save" in value["job"]["error"]
         assert "completion cannot be saved" in value["job"]["log"][-1]
         assert path.read_bytes() == admitted
-    reopened = workflow.Workspace(workspace.root, runner=lambda args, p: commands.append(args))
+    reopened = workflow.Workspace(
+        workspace.root, runner=lambda args, p: commands.append(args)
+    )
     try:
         assert reopened.snapshot(key)["status"] == "interrupted"
         assert not reopened.snapshot(key)["job"]["running"]
@@ -180,8 +198,10 @@ def test_create_failure_does_not_leave_an_unopenable_project(tmp_path, monkeypat
     video = tmp_path / "recording.mp4"
     video.write_bytes(b"recording")
     workspace = workflow.Workspace(tmp_path)
+
     def denied(*args, **kwargs):
         raise PermissionError("cannot create manifest")
+
     try:
         with monkeypatch.context() as patch:
             patch.setattr(files.tempfile, "NamedTemporaryFile", denied)

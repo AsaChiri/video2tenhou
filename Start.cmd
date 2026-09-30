@@ -5,11 +5,9 @@ if errorlevel 1 goto failed
 
 if exist "%USERPROFILE%\.local\bin\uv.exe" set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 if exist "%LOCALAPPDATA%\Microsoft\WinGet\Links" set "PATH=%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
-where tesseract >nul 2>nul
-if errorlevel 1 if exist "%ProgramFiles%\Tesseract-OCR\tesseract.exe" set "PATH=%ProgramFiles%\Tesseract-OCR;%PATH%"
 
 set "missing=0"
-for %%T in (uv ffmpeg ffprobe tesseract) do (
+for %%T in (uv ffmpeg ffprobe) do (
     where %%T >nul 2>nul
     if errorlevel 1 (
         echo Missing prerequisite: %%T
@@ -17,11 +15,6 @@ for %%T in (uv ffmpeg ffprobe tesseract) do (
     )
 )
 if "%missing%"=="1" goto prerequisites
-call tesseract --list-langs 2>nul | findstr /x /c:"eng" >nul
-if errorlevel 1 (
-    echo Missing Tesseract English language data: eng
-    goto prerequisites
-)
 
 echo Checking this computer and preparing video2tenhou. Leave this window open.
 set "UV_PROJECT_ENVIRONMENT=.venv-runtime"
@@ -40,7 +33,6 @@ echo Install the missing prerequisites, then run Start.cmd again.
 echo In PowerShell, install only the missing tools:
 echo   winget install --id astral-sh.uv --exact
 echo   winget install "FFmpeg (Essentials Build)"
-echo   winget install --id UB-Mannheim.TesseractOCR --exact
 echo See docs\QUICKSTART.md or:
 echo https://github.com/AsaChiri/video2tenhou/blob/main/docs/QUICKSTART.md
 pause

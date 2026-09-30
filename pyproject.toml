@@ -1,6 +1,6 @@
 [project]
 name = "video2tenhou"
-version = "0.1.3"
+version = "0.2.0"
 description = "Review and convert riichi mahjong broadcast recordings into Tenhou game logs locally"
 readme = "README.md"
 license = "Apache-2.0"
@@ -9,13 +9,14 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy>=2.5.3,<3",
     "opencv-python>=5.0.0.93,<6",
-    "pytesseract>=0.3.13",
     "yt-dlp>=2026.8.19",
     "torch>=2.6,<3",
     "torchvision>=0.21,<0.30",
     "mahjong>=2.0.0",
     "ortools>=9.15.6755",
     "libreyolo>=1.5,<1.6",
+    "psutil>=7.2.2",
+    "pywin32>=312; sys_platform == 'win32'",
 ]
 
 [project.scripts]
@@ -29,7 +30,8 @@ Issues = "https://github.com/AsaChiri/video2tenhou/issues"
 dev = [
     "pytest>=9.1.1",
     "pytest-cov>=6.0",
-    "psutil>=7.2.2",
+    "ruff>=0.16.9",
+    "ty>=0.0.84",
 ]
 
 [build-system]
@@ -39,8 +41,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/video2tenhou"]
 
+[tool.hatch.build]
+artifacts = ["src/video2tenhou/tool/static/index.html", "src/video2tenhou/tool/static/assets/**"]
+
 [tool.hatch.build.targets.sdist]
-include = ["src/", "tests/", "docs/", "tools/", "README.md", "LICENSE*", "THIRD_PARTY_NOTICES.md", "pyproject.toml", "uv.lock", ".python-version", "Start.cmd", "start.sh"]
+include = ["src/", "frontend/", "tests/", "docs/", "tools/", "README.md", "LICENSE*", "THIRD_PARTY_NOTICES.md", "pyproject.toml", "uv.lock", ".python-version", "Start.cmd", "start.sh"]
+exclude = ["frontend/node_modules/"]
 
 [tool.coverage.run]
 source = ["video2tenhou"]
@@ -52,3 +58,24 @@ skip_empty = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.format]
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = ["ALL"]
+# Approved by the maintainer: incompatible docstring/formatter rules.
+ignore = ["D203", "D213", "COM812"]
+
+[tool.ruff.lint.per-file-ignores]
+# Approved by the maintainer: pytest uses assertions for failure introspection.
+"tests/**/*.py" = ["S101"]
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[tool.ty.analysis]
+respect-type-ignore-comments = false

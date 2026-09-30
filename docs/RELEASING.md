@@ -3,13 +3,17 @@
 A release consists of tested source and Python distributions, a compatible
 model bundle, its provenance and checksums, and installation instructions.
 Use the same source revision for all validation and published artifacts.
+The current [0.2.0 release notes](RELEASE_NOTES_0.2.0.md) record the prepared
+changes and remaining publication gates.
 
 1. Verify that the source license text and package license metadata describe
    the intended distribution. Check dependency and model redistribution terms
    and include required [third-party notices](../THIRD_PARTY_NOTICES.md).
 2. Verify distribution rights for included broadcast-derived calibration
    templates and regression images. Keep private recordings, full annotation
-   collections, credentials and generated outputs out of both archives.
+   collections, credentials and generated analysis outputs out of both archives.
+   Build the frontend before packaging; its generated assets belong in release
+   archives but are excluded from Git.
 3. Run the [validation commands](MAINTENANCE.md#tests), including coverage,
    wheel resource checks and the source archive's isolated test suite. Inspect
    the resulting wheel and source archive for unintended local data.
@@ -24,7 +28,7 @@ Use the same source revision for all validation and published artifacts.
    Build the starter download from that model bundle and the source distribution:
 
    ```console
-   uv run python tools/package_starter.py --source dist/video2tenhou-0.1.3.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.1.3-starter.zip
+   uv run python tools/package_starter.py --source dist/video2tenhou-0.2.0.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.2.0-starter.zip
    ```
 
    Use the matching version in the filenames. The starter contains the application,

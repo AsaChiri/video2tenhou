@@ -6,6 +6,7 @@ window supplies the frames (no seeking). Output:
 `work/<video>/reads/<hand>/<region>.jsonl`, one Reading per line, and
 `done.json` with the model ids the readings came from.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -15,14 +16,13 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
 from . import video
 from .cache import source_identity
+from .calm import REGIONS, Interval, geometry_key, region_key
 from .files import atomic_write_text
-from .calm import Interval, REGIONS, geometry_key, region_key
 from .layout import Calibration
 from .perception.classifier import Classifier
 from .perception.detector import Detector
@@ -41,12 +41,22 @@ def _model_metadata(clf) -> dict:
 
 
 def _read_identity(path: str | Path, clf: Classifier) -> dict:
-    return {"source": source_identity(path, refresh=True), "fps": FPS,
-            "preprocessing": PREPROCESSING, "classifier_metadata": _model_metadata(clf)}
+    return {
+        "source": source_identity(path, refresh=True),
+        "fps": FPS,
+        "preprocessing": PREPROCESSING,
+        "classifier_metadata": _model_metadata(clf),
+    }
 
 
-def validate_read_cache(path: str | Path, cal: Calibration, work: Path, hands: list[dict],
-                        det: Detector, clf: Classifier) -> None:
+def validate_read_cache(
+    path: str | Path,
+    cal: Calibration,
+    work: Path,
+    hands: list[dict],
+    det: Detector,
+    clf: Classifier,
+) -> None:
     """Require sparse evidence compatible with the models used for dense rereads.
 
     Review-only rebuilds bypass ``run_read``. Check every requested manifest
@@ -59,22 +69,35 @@ def validate_read_cache(path: str | Path, cal: Calibration, work: Path, hands: l
     stale = []
     for h in hands:
         try:
-            done = json.loads((work / "reads" / f"{h['hand']:02d}" / "done.json").read_text(encoding="utf-8"))
+            done = json.loads(
+                (work / "reads" / f"{h['hand']:02d}" / "done.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             window = [round(h["t_start"] * FPS) / FPS, h["t_end"] + 1.0 / FPS]
-            valid = (isinstance(done, dict) and done.get("detector") == det.id
-                     and done.get("classifier") == clf.id and done.get("identity") == identity
-                     and done.get("geometry") == geom and done.get("window") == window)
-        except (OSError, ValueError):
+            valid = (
+                isinstance(done, dict)
+                and done.get("detector") == det.id
+                and done.get("classifier") == clf.id
+                and done.get("identity") == identity
+                and done.get("geometry") == geom
+                and done.get("window") == window
+            )
+        except (FileNotFoundError, json.JSONDecodeError):
             valid = False
         if not valid:
             stale.append(str(h["hand"]))
     if stale:
-        raise ValueError("Saved readings no longer match the recording, recognition models or table geometry "
-                         f"for hand(s) {', '.join(stale)}. Choose Analyze recording to refresh evidence "
-                         "before rebuilding logs.")
+        raise ValueError(
+            "Saved readings no longer match the recording, recognition models or table geometry "
+            f"for hand(s) {', '.join(stale)}. Choose Analyze recording to refresh evidence "
+            "before rebuilding logs."
+        )
 
 
-def planned_times(ivs: list[Interval], t0: float, t1: float, cap: int = CAP, fps: float = FPS) -> dict[str, set[float]]:
+def planned_times(
+    ivs: list[Interval], t0: float, t1: float, cap: int = CAP, fps: float = FPS
+) -> dict[str, set[float]]:
     """Per region: the sample times (multiples of 1/fps) to read inside [t0, t1]."""
     out: dict[str, set[float]] = defaultdict(set)
     for iv in ivs:
@@ -92,31 +115,22 @@ def _region_file(hdir: Path, r: str) -> Path:
     return hdir / f"{r.replace(':', '_')}.jsonl"
 
 
-def read_lines(p: Path, log=print) -> list[dict]:
-    """The readings of one jsonl file. A crash mid-write leaves a truncated last line; it is dropped from
-    the file (the plan reads that time again) instead of stopping every later run."""
-    if not p.exists():
+def read_lines(p: Path) -> list[dict]:
+    """Read an atomically published region file; corrupted evidence fails visibly."""
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return []
-    out: list[dict] = []
-    bad = 0
-    for line in open(p, encoding="utf-8").read().splitlines():
-        if not line.strip():
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            bad += 1
-    if bad:
-        log(f"  {p.parent.name}/{p.name}: {bad} malformed line(s) dropped, their times will be read again")
-        with open(p, "w", encoding="utf-8") as f:
-            for d in out:
-                f.write(json.dumps(d) + "\n")
-    return out
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def _same_models(done: dict, det: Detector, clf: Classifier, cap: int) -> bool:
-    return (isinstance(done, dict) and done.get("detector") == det.id
-            and done.get("classifier") == clf.id and done.get("cap") == cap)
+    return (
+        isinstance(done, dict)
+        and done.get("detector") == det.id
+        and done.get("classifier") == clf.id
+        and done.get("cap") == cap
+    )
 
 
 def _moved_regions(done: dict, geom: dict[str, str]) -> set[str]:
@@ -127,7 +141,7 @@ def _moved_regions(done: dict, geom: dict[str, str]) -> set[str]:
     did not move keep theirs, so correcting one meld camera does not re-read the whole video.
     """
     old = done.get("geometry") or {}
-    if not isinstance(old, dict):                 # unproven geometry cannot authenticate any region
+    if not isinstance(old, dict):  # unproven geometry cannot authenticate any region
         return set(geom)
     return {r for r, k in geom.items() if old.get(r) != k}
 
@@ -151,13 +165,23 @@ def _sparse_batches(path, cal, window, plan):
         if pending:
             yield pending
     finally:
-        if hasattr(samples, "close"):
-            samples.close()
+        samples.close()
 
 
-def run_read(path: str | Path, cal: Calibration, work: Path, hands: list[dict], ivs: list[Interval],
-             det: Detector, clf: Classifier, *, cap: int = CAP, force: bool = False, reread: Optional[set] = None,
-             log=print) -> tuple[dict, set[int]]:
+def run_read(
+    path: str | Path,
+    cal: Calibration,
+    work: Path,
+    hands: list[dict],
+    ivs: list[Interval],
+    det: Detector,
+    clf: Classifier,
+    *,
+    cap: int = CAP,
+    force: bool = False,
+    reread: set | None = None,
+    log=print,
+) -> tuple[dict, set[int]]:
     """Fill missing planned evidence and return statistics plus changed hand ids.
 
     ``force`` replaces all readings; ``reread`` replaces only named kinds
@@ -183,24 +207,31 @@ def run_read(path: str | Path, cal: Calibration, work: Path, hands: list[dict], 
         plan = planned_times(ivs, t0, t1, cap)
         try:
             prev = json.loads(done.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (FileNotFoundError, json.JSONDecodeError):
             prev = None
         # readings from another detector, classifier or cap are stale as a whole: the hand is read again.
         # A region that merely moved is re-read on its own.
         window = [round(t0 * FPS) / FPS, t1 + 1.0 / FPS]
-        append = (prev is not None and not force and _same_models(prev, det, clf, cap)
-                  and prev.get("identity") == identity and prev.get("window") == window)
+        append = (
+            prev is not None
+            and not force
+            and _same_models(prev, det, clf, cap)
+            and prev.get("identity") == identity
+            and prev.get("window") == window
+        )
         moved = _moved_regions(prev, geom) if append else set()
         fresh = asked | moved
         if prev is not None and not force and not append:
             log(f"  read hand {h['hand']:2d}: evidence inputs changed, reading again")
         elif moved and h["hand"] == hands[0]["hand"]:
-            log(f"  read: the geometry of {', '.join(sorted(moved))} changed; those regions are read again")
+            log(
+                f"  read: the geometry of {', '.join(sorted(moved))} changed; those regions are read again"
+            )
         schedule = {r: sorted(plan[r]) for r in REGIONS}
         rows = {r: {} for r in REGIONS}
         changed = not append or bool(fresh)
         for r in REGIONS:
-            old = read_lines(_region_file(hdir, r), log) if append and r not in fresh else []
+            old = read_lines(_region_file(hdir, r)) if append and r not in fresh else []
             rows[r] = {round(d["t"], 3): d for d in old if round(d["t"], 3) in plan[r]}
             changed |= len(rows[r]) != len(old)
             plan[r] -= rows[r].keys()
@@ -210,26 +241,50 @@ def run_read(path: str | Path, cal: Calibration, work: Path, hands: list[dict], 
         if any(plan.values()):
             # The decode window is part of frame identity. Narrowing a retry to
             # missing timestamps can select different frames in ffmpeg's fps filter.
-            with closing(_prefetch_batches(_sparse_batches(path, cal, window, plan))) as batches:
+            with closing(
+                _prefetch_batches(_sparse_batches(path, cal, window, plan))
+            ) as batches:
                 for batch in batches:
                     for rd in read_regions(batch, det, clf):
                         rows[rd.region][round(rd.t, 3)] = rd.to_dict()
                     n += len(batch)
         # the count is what the files hold (a re-read kind replaced its lines, it did not add to them);
         # done.json is written last so that a crash leaves the previous one and the missing times are planned again
-        missing = {r: sorted(set(schedule[r]) - rows[r].keys()) for r in REGIONS
-                   if set(schedule[r]) - rows[r].keys()}
+        missing = {
+            r: sorted(set(schedule[r]) - rows[r].keys())
+            for r in REGIONS
+            if set(schedule[r]) - rows[r].keys()
+        }
         if missing:
-            raise RuntimeError(f"Video ended before planned evidence for hand {h['hand']}: {missing}")
+            raise RuntimeError(
+                f"Video ended before planned evidence for hand {h['hand']}: {missing}"
+            )
         # Removing the manifest before publishing prevents an interrupted
         # multi-region replacement from authenticating mixed old/new evidence.
         done.unlink(missing_ok=True)
         for r in REGIONS:
-            atomic_write_text(_region_file(hdir, r), "".join(json.dumps(rows[r][t]) + "\n" for t in sorted(rows[r])))
+            atomic_write_text(
+                _region_file(hdir, r),
+                "".join(json.dumps(rows[r][t]) + "\n" for t in sorted(rows[r])),
+            )
         total = sum(len(values) for values in rows.values())
-        atomic_write_text(done, json.dumps({"hand": h["hand"], "readings": total, "detector": det.id,
-                     "classifier": clf.id, "cap": cap, "geometry": geom, "identity": identity,
-                     "window": window, "plan": schedule}, indent=1))
+        atomic_write_text(
+            done,
+            json.dumps(
+                {
+                    "hand": h["hand"],
+                    "readings": total,
+                    "detector": det.id,
+                    "classifier": clf.id,
+                    "cap": cap,
+                    "geometry": geom,
+                    "identity": identity,
+                    "window": window,
+                    "plan": schedule,
+                },
+                indent=1,
+            ),
+        )
         touched.add(h["hand"])
         stats["hands"] += 1
         stats["readings"] += n
@@ -238,21 +293,34 @@ def run_read(path: str | Path, cal: Calibration, work: Path, hands: list[dict], 
 
 
 def load_reads(work: Path, hand: int) -> dict[str, list[dict]]:
-    """Load all region evidence for one hand, repairing interrupted JSONL tails."""
+    """Load all region evidence for one hand, rejecting malformed JSONL."""
     hdir = work / "reads" / f"{hand:02d}"
     return {r: read_lines(_region_file(hdir, r)) for r in REGIONS}
 
 
 def dense_key(det: Detector, clf: Classifier, cal: Calibration) -> str:
     """Bind dense evidence to recognition, geometry and its stage-specific retention policy."""
-    return hashlib.sha256(json.dumps([det.id, clf.id, _model_metadata(clf), PREPROCESSING,
-                                     geometry_key(cal),
-                                     det.evidence_policy.fingerprint_for('dense')], sort_keys=True).encode()).hexdigest()[:20]
+    return hashlib.sha256(
+        json.dumps(
+            [
+                det.id,
+                clf.id,
+                _model_metadata(clf),
+                PREPROCESSING,
+                geometry_key(cal),
+                det.evidence_policy.fingerprint_for("dense"),
+            ],
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()[:20]
 
 
 def clear_dense(work: Path) -> None:
     """Forget every dense read (a forced re-read starts them over as well)."""
-    shutil.rmtree(work / "dense", ignore_errors=True)
+    try:
+        shutil.rmtree(work / "dense")
+    except FileNotFoundError:
+        pass
 
 
 def _dense_batches(path, cal, t0, t1, regions, fps):
@@ -271,8 +339,7 @@ def _dense_batches(path, cal, t0, t1, regions, fps):
         if pending:
             yield pending
     finally:
-        if hasattr(samples, "close"):
-            samples.close()
+        samples.close()
 
 
 def _prefetch_batches(batches):
@@ -296,48 +363,81 @@ def _prefetch_batches(batches):
     finally:
         future.cancel()
         pool.shutdown(wait=True, cancel_futures=True)
-        if hasattr(iterator, "close"):
-            iterator.close()
+        iterator.close()
 
 
-def dense_reads(path: str | Path, cal: Calibration, work: Path, det: Detector, clf: Classifier,
-                t0: float, t1: float, regions: list[str], *, fps: float = 5.0) -> dict[str, list[dict]]:
+def dense_reads(
+    path: str | Path,
+    cal: Calibration,
+    work: Path,
+    det: Detector,
+    clf: Classifier,
+    t0: float,
+    t1: float,
+    regions: list[str],
+    *,
+    fps: float = 5.0,
+) -> dict[str, list[dict]]:
     """Read the given regions on every frame of [t0, t1] at `fps` (a short window where the calm reads were
     not enough), cached under work/dense by window, models and geometry. Returns region -> readings (dicts),
     structure recomputed as in observe. One CPU crop batch is prepared ahead of
-    inference; sampled pixels, order and classifier batch boundaries are unchanged."""
+    inference; sampled pixels, order and classifier batch boundaries are unchanged.
+    """
     policy = det.evidence_policy
     ddir = work / "dense"
     ddir.mkdir(parents=True, exist_ok=True)
-    signature = {"window": [t0, t1], "fps": fps, "regions": sorted(regions),
-                 "models_geometry": dense_key(det, clf, cal), "source": source_identity(path)}
-    digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:32]
+    signature = {
+        "window": [t0, t1],
+        "fps": fps,
+        "regions": sorted(regions),
+        "models_geometry": dense_key(det, clf, cal),
+        "source": source_identity(path),
+    }
+    digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[
+        :32
+    ]
     # Short names also work in deeply nested Windows project workspaces.
     key = f"{t0:.3f}_{t1:.3f}_{digest}.json"
     cache = ddir / key
     if cache.exists():
         try:
             saved = json.loads(cache.read_text(encoding="utf-8"))
-            if (isinstance(saved, dict) and set(saved) == set(regions)
-                    and all(isinstance(rows, list) and all(isinstance(row, dict)
-                            and "t" in row and isinstance(row.get("boxes"), list)
-                            for row in rows) for rows in saved.values())):
+            if (
+                isinstance(saved, dict)
+                and set(saved) == set(regions)
+                and all(
+                    isinstance(rows, list)
+                    and all(
+                        isinstance(row, dict)
+                        and "t" in row
+                        and isinstance(row.get("boxes"), list)
+                        for row in rows
+                    )
+                    for rows in saved.values()
+                )
+            ):
                 return saved
-        except (OSError, ValueError):
+        except (FileNotFoundError, json.JSONDecodeError):
             pass  # an interrupted write is recomputed, never evidence
     out: dict[str, list[dict]] = {r: [] for r in regions}
-    with closing(_prefetch_batches(_dense_batches(path, cal, t0, t1, regions, fps))) as batches:
+    with closing(
+        _prefetch_batches(_dense_batches(path, cal, t0, t1, regions, fps))
+    ) as batches:
         for batch in batches:
             for rd in read_regions(batch, det, clf):
                 out[rd.region].append(rd.to_dict())
     for r in regions:
         kind = r.partition(":")[0]
-        out[r] = [prepare_reading(kind, rd, stage='dense', policy=policy) for rd in out[r]]
+        out[r] = [
+            prepare_reading(kind, rd, stage="dense", policy=policy) for rd in out[r]
+        ]
     atomic_write_text(cache, json.dumps(out))
     return out
 
 
 def dense_pond_reads(path, cal, work, det, clf, t0, t1, corners, *, fps=5.0):
     """Read dense pond evidence, returning corner keys for engine callers."""
-    out = dense_reads(path, cal, work, det, clf, t0, t1, [f"pond:{c}" for c in corners], fps=fps)
+    out = dense_reads(
+        path, cal, work, det, clf, t0, t1, [f"pond:{c}" for c in corners], fps=fps
+    )
     return {c: out[f"pond:{c}"] for c in corners}

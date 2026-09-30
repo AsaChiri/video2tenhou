@@ -31,3 +31,9 @@ coverage.xml
 !.env.example
 .DS_Store
 Thumbs.db
+node_modules/
+frontend/test-results/
+frontend/playwright-report/
+# Vite output; source lives in frontend/.
+/src/video2tenhou/tool/static/index.html
+/src/video2tenhou/tool/static/assets/

@@ -7,9 +7,9 @@ The studio resolves relative paths from its data directory; CLI paths are relati
 to the launch directory. Use an absolute path when those directories differ.
 
 This configures geometry for a four-player composite with overhead, hand and
-meld cameras and a PML-style overlay. A single-camera broadcast, new score
-provider, different overlay font/arrangement or different rules also needs
-code or model adaptation. The record adapter requires scoremj;
+meld cameras. A single-camera broadcast, new score provider or different
+rules also needs code or model adaptation. The starting dealer must occupy
+the top-left chair; starting South, West and North occupy BL, BR and TR. The record adapter requires scoremj;
 another provider must supply the `record.Game` contract.
 
 ## Coordinate contract
@@ -21,9 +21,6 @@ fixed camera corners. Winds change by round; player identity does not.
 | Field | Meaning |
 |---|---|
 | `frame` | Keep `[1920, 1080]`; frames are normalized to this size. |
-| `overlay.strip` | Search strip containing each wind glyph and score/name block. |
-| `overlay.score`, `name`, `wind` | Nominal rectangles for previews/template work. |
-| `overlay.round_wind`, `round_num`, `honba`, `sticks` | Header crops read directly. |
 | `cam` | Full player camera panels in frame pixels. |
 | `hand`, `meld` | Frame-pixel `rect`, rendering `scale`; hand also has `roll` in degrees. |
 | `overhead.center`, `angle`, `scale`, `side` | Frame-to-table transform and output square size. |
@@ -58,21 +55,11 @@ records placement for one broadcast and overrides named overhead/panel fields;
 pond rectangles remain properties of the table. Give CLI videos unique stems
 so their local labels do not collide.
 
-## Overlay and model changes
+## Table fitting and model changes
 
-`timeline.scan` passes the selected calibration to `overlay.read_overlay`.
-Corner text is located relative to its wind glyph inside the configured strip.
-Moving a strip works; rearranging the text around the glyph requires changing
-`read_corner`. Glyph sizes, white text masking and templates are PML assumptions
-in `overlay.py`. Different fonts need new templates/reader and regression frames.
-The centre-unit template is also PML-specific.
-
-Source-maintenance helpers for rebuilding these packaged assets are
-`overlay.save_digit_templates`, `overlay.save_wind_templates`, and
-`calibfit.write_unit_template`. Supply known text/wind labels and a trusted
-reference calibration; these are offline asset-authoring utilities, not part of
-normal video processing. Review regenerated assets and regression frames before
-shipping them with a layout.
+The centre-unit template is PML-specific. `calibfit.write_unit_template`
+rebuilds it from a trusted reference calibration. Review the resulting fit
+and border checks before shipping it with a layout.
 
 For different tile faces or perspectives, label examples in the browser and
 retrain. Hold out whole hands or recordings, not neighbouring frames. Keep

@@ -7,11 +7,11 @@ Analysis runs locally. The included layout supports Pacific Mahjong League
 
 ## Start
 
-1. Download **video2tenhou-0.1.3-starter.zip** from the
+1. Download **video2tenhou-0.2.0-starter.zip** from the
    [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
    It includes the application, PML layout and trained models.
 2. Follow the [one-time setup](docs/QUICKSTART.md#one-time-setup) to install
-   uv, FFmpeg and Tesseract on Windows or Linux.
+   uv and FFmpeg on Windows or Linux.
 3. Extract the ZIP into a folder you can write to. On Windows, double-click
    **Start.cmd**. On Linux, open a terminal in that folder and run **`bash start.sh`**.
 
@@ -24,7 +24,7 @@ needed. Leave the launcher running while processing recordings. An NVIDIA
 CUDA GPU is recommended for practical analysis times.
 
 The browser studio covers Video, Calibrate, Analyze, Review and Results.
-Upload a recording, enter a local video path, or paste a video URL supported by yt-dlp.
+Choose a **Local file** from your computer or paste a **Remote URL** supported by yt-dlp.
 Supply the scoremj game IDs in broadcast order. Calibration, progress,
 review questions, replay links and file downloads stay in the browser.
 
@@ -45,12 +45,19 @@ Using a source checkout instead? Follow [source setup and models](docs/QUICKSTAR
 
 ```console
 uv sync --frozen
+npm --prefix frontend ci
+npm --prefix frontend test
+npm --prefix frontend run build
 uv run pytest -q --cov --cov-report=term-missing
 uv build
 ```
 
 Tests use small committed fixtures and synthetic legal hands without downloaded
 VODs or model weights. See the [test guide](tests/README.md) for focused runs.
+The UI uses Vue and Vite; see [frontend development](frontend/README.md) for
+components, local development and asset packaging. Node is needed to build
+the UI from source; releases include the built assets. Generated frontend files
+are ignored by Git. `video2tenhou web` is the single browser command.
 
 The CLI remains available for scripts (`uv run video2tenhou --help`). Development
 uses the lockfile; the starter uses its own `.venv-runtime` environment and selects

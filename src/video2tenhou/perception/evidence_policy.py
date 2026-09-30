@@ -4,14 +4,14 @@ Policies do not rescale scores or change recognition. Sparse reads remain reusab
 when retention changes; caches of filtered evidence must include the relevant
 stage fingerprint. Missing metadata selects the default filtering contract.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
-
 
 KINDS = ("hand", "pond", "meld")
 PREPARATION_VERSION = 1
@@ -19,16 +19,25 @@ PREPARATION_VERSION = 1
 
 def _floors(values) -> tuple[float, float, float]:
     if not isinstance(values, dict) or set(values) != set(KINDS):
-        raise ValueError("Evidence policy must specify exactly hand, pond and meld floors")
+        raise ValueError(
+            "Evidence policy must specify exactly hand, pond and meld floors"
+        )
     result = tuple(values[kind] for kind in KINDS)
-    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or
-           not math.isfinite(value) or not 0 <= value <= 1 for value in result):
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+        for value in result
+    ):
         raise ValueError("Evidence floors must be finite numbers in [0, 1]")
     return tuple(float(value) for value in result)
 
 
 def _digest(value: dict) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -39,6 +48,7 @@ class EvidencePolicy:
     without renormalization. Sparse preparation also retains the
     ``p(none) < .5`` condition; dense preparation has no additional none filter.
     """
+
     sparse: tuple[float, float, float]
     dense: tuple[float, float, float]
 
@@ -46,8 +56,12 @@ class EvidencePolicy:
         for stage in ("sparse", "dense"):
             values = getattr(self, stage)
             if not isinstance(values, tuple) or len(values) != len(KINDS):
-                raise ValueError("Evidence policy requires three immutable floors per stage")
-            object.__setattr__(self, stage, _floors(dict(zip(KINDS, values))))
+                raise ValueError(
+                    "Evidence policy requires three immutable floors per stage"
+                )
+            object.__setattr__(
+                self, stage, _floors(dict(zip(KINDS, values, strict=False)))
+            )
 
     def minimum(self, stage: str, kind: str) -> float:
         """Return the inclusive detection floor; unknown stages/kinds are errors."""
@@ -57,8 +71,13 @@ class EvidencePolicy:
 
     def to_dict(self) -> dict:
         """Return independent JSON metadata; callers cannot mutate this policy."""
-        return {"schema_version": 1, **{stage: dict(zip(KINDS, getattr(self, stage)))
-                                       for stage in ("sparse", "dense")}}
+        return {
+            "schema_version": 1,
+            **{
+                stage: dict(zip(KINDS, getattr(self, stage), strict=False))
+                for stage in ("sparse", "dense")
+            },
+        }
 
     @property
     def fingerprint(self) -> str:
@@ -68,12 +87,18 @@ class EvidencePolicy:
     def fingerprint_for(self, stage: str) -> str:
         """Identify one derived-evidence stage without invalidating the other."""
         self.minimum(stage, "hand")
-        return _digest({"schema_version": 1, "preparation_version": PREPARATION_VERSION,
-                        "stage": stage, "floors": self.to_dict()[stage],
-                        "none_max_exclusive": .5 if stage == "sparse" else None})
+        return _digest(
+            {
+                "schema_version": 1,
+                "preparation_version": PREPARATION_VERSION,
+                "stage": stage,
+                "floors": self.to_dict()[stage],
+                "none_max_exclusive": 0.5 if stage == "sparse" else None,
+            }
+        )
 
 
-DEFAULT_POLICY = EvidencePolicy((.2, .2, .35), (.2, .2, .2))
+DEFAULT_POLICY = EvidencePolicy((0.2, 0.2, 0.35), (0.2, 0.2, 0.2))
 
 
 def resolve_policy(value=None) -> EvidencePolicy:
@@ -87,8 +112,12 @@ def resolve_policy(value=None) -> EvidencePolicy:
         return DEFAULT_POLICY
     if isinstance(value, EvidencePolicy):
         return value
-    if (not isinstance(value, dict) or set(value) != {"schema_version", "sparse", "dense"}
-            or type(value["schema_version"]) is not int or value["schema_version"] != 1):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "sparse", "dense"}
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+    ):
         raise ValueError("Unsupported or incomplete evidence policy metadata")
     return EvidencePolicy(_floors(value["sparse"]), _floors(value["dense"]))
 
@@ -102,16 +131,18 @@ def load_policy(metadata_path: str | Path | None = None) -> EvidencePolicy:
     """
     if metadata_path is None:
         from ..paths import MODEL_DIR
+
         metadata_path = MODEL_DIR / "detector" / "meta.json"
     path = Path(metadata_path)
     try:
         metadata = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return DEFAULT_POLICY
-    except (OSError, ValueError) as error:
-        raise ValueError(f"Cannot read detector evidence metadata: {path}") from error
-    if (not isinstance(metadata, dict) or type(metadata.get("schema_version")) is not int
-            or metadata["schema_version"] != 1):
+    if (
+        not isinstance(metadata, dict)
+        or type(metadata.get("schema_version")) is not int
+        or metadata["schema_version"] != 1
+    ):
         raise ValueError("Unsupported detector metadata schema for evidence policy")
     return resolve_policy(metadata.get("evidence_policy"))
 
@@ -123,20 +154,40 @@ def restructure(kind: str, reading: dict) -> None:
     rejected after filtering, using the same geometry rules as live readings.
     """
     import numpy as np
+
     from .reader import Box, assign_hand, assign_meld, assign_pond
+
     if kind not in ("pond", "meld", "hand"):
         return
     reading["rejected"] = False
     if not reading["boxes"]:
         return
-    boxes = [Box(tuple(b["xyxy"]), b["conf"], b["sideways"], np.asarray(b["p"])) for b in reading["boxes"]]
+    boxes = [
+        Box(tuple(b["xyxy"]), b["conf"], b["sideways"], np.asarray(b["p"]))
+        for b in reading["boxes"]
+    ]
     if kind == "pond":
-        reading["rejected"] = assign_pond(boxes, region_h=reading["size"][1], region_w=reading["size"][0])
-        order = sorted(range(len(boxes)), key=lambda i: (boxes[i].role != "tile", boxes[i].row if boxes[i].row is not None else 99,
-                                                          boxes[i].col if boxes[i].col is not None else 99, boxes[i].cx))
+        reading["rejected"] = assign_pond(
+            boxes, region_h=reading["size"][1], region_w=reading["size"][0]
+        )
+        order = sorted(
+            range(len(boxes)),
+            key=lambda i: (
+                boxes[i].role != "tile",
+                boxes[i].row if boxes[i].row is not None else 99,
+                boxes[i].col if boxes[i].col is not None else 99,
+                boxes[i].cx,
+            ),
+        )
     else:
         (assign_meld if kind == "meld" else assign_hand)(boxes)
-        order = sorted(range(len(boxes)), key=lambda i: (boxes[i].group if boxes[i].group is not None else 99, boxes[i].cx))
+        order = sorted(
+            range(len(boxes)),
+            key=lambda i: (
+                boxes[i].group if boxes[i].group is not None else 99,
+                boxes[i].cx,
+            ),
+        )
     new = []
     for i in order:
         d = dict(reading["boxes"][i])
@@ -152,8 +203,14 @@ def restructure(kind: str, reading: dict) -> None:
     reading["boxes"] = new
 
 
-def prepare_reading(kind: str, reading: dict, *, stage: str,
-                    policy: EvidencePolicy | None = None, none_index: int | None = None) -> dict:
+def prepare_reading(
+    kind: str,
+    reading: dict,
+    *,
+    stage: str,
+    policy: EvidencePolicy | None = None,
+    none_index: int | None = None,
+) -> dict:
     """Return a filtered/restructured copy without changing cached raw readings.
 
     Sparse voting excludes classifier background predictions. Dense event
@@ -167,7 +224,10 @@ def prepare_reading(kind: str, reading: dict, *, stage: str,
     if stage == "sparse" and (type(none_index) is not int or none_index < 0):
         raise ValueError("Sparse evidence preparation requires the none class index")
     prepared = dict(reading)
-    prepared["boxes"] = [dict(box) for box in reading["boxes"] if box["conf"] >= floor
-                         and (stage != "sparse" or box["p"][none_index] < .5)]
+    prepared["boxes"] = [
+        dict(box)
+        for box in reading["boxes"]
+        if box["conf"] >= floor and (stage != "sparse" or box["p"][none_index] < 0.5)
+    ]
     restructure(kind, prepared)
     return prepared

@@ -1,14 +1,53 @@
-
-from tests.paths import DATA
 import json
-from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
-from video2tenhou.layout import Calibration, apply, box_to_quad, quad_to_box
+from tests.paths import DATA
+from video2tenhou.layout import (
+    Calibration,
+    Rect,
+    apply,
+    box_to_quad,
+    contact_sheet,
+    quad_to_box,
+)
 
 LABELS = DATA / "layout_boxes"
+
+
+@pytest.mark.parametrize("channels", [(), (3,)])
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        (1, 1, 3, 2),
+        (-2, 1, 5, 3),
+        (2, -2, 3, 5),
+        (4, 1, 5, 3),
+        (1, 3, 3, 5),
+        (-8, -8, 3, 3),
+        (9, 9, 3, 3),
+    ],
+)
+def test_rectangle_crop_matches_frame_coordinates_at_image_edges(channels, bounds):
+    frame = np.arange(np.prod((5, 7, *channels)), dtype=np.uint8).reshape(
+        5, 7, *channels
+    )
+    rect = Rect(*bounds)
+    expected = cv2.warpAffine(
+        frame,
+        np.float32([[1, 0, -rect.x], [0, 1, -rect.y]]),
+        (rect.w, rect.h),
+        flags=cv2.INTER_NEAREST,
+    )
+    assert np.array_equal(rect.crop(frame), expected)
+
+
+@pytest.mark.parametrize("size", [(0, 2), (2, 0), (-1, 2)])
+def test_rectangle_crop_rejects_nonpositive_dimensions(size):
+    with pytest.raises(ValueError, match="Crop dimensions must be positive"):
+        Rect(0, 0, *size).crop(np.zeros((5, 7, 3), np.uint8))
 
 
 @pytest.fixture(scope="module")
@@ -33,6 +72,12 @@ def test_region_shapes(cal):
         assert img.shape[:2] == (h, w), name
 
 
+def test_contact_sheet_renders_table_only_layout(cal):
+    assert "overlay" not in cal.data
+    sheet = contact_sheet(np.zeros((1080, 1920, 3), np.uint8), cal)
+    assert sheet.shape == (1620, 1920, 3)
+
+
 def _labels(kind):
     out = []
     for p in sorted(LABELS.glob(f"{kind}_*.json")):
@@ -55,12 +100,15 @@ def test_labels_fall_inside_their_region(cal, kind):
             total += 1
             if x0 < -2 or y0 < -2 or x1 > w + 2 or y1 > h + 2:
                 outside += 1
-    assert outside / total < 0.01, f"{outside}/{total} {kind} boxes fall outside the region"
+    assert outside / total < 0.01, (
+        f"{outside}/{total} {kind} boxes fall outside the region"
+    )
 
 
 def test_pond_rows_grow_toward_player_and_cols_to_the_right(cal):
     """In the upright pond region (owner at the bottom) row 0 is nearest the centre (smallest y)
-    and columns increase with x (the owner's left is the region's left)."""
+    and columns increase with x (the owner's left is the region's left).
+    """
     bad_rows = bad_cols = checked = 0
     for d in _labels("pond"):
         M, _ = cal.transform(f"pond:{d['corner']}")
@@ -69,14 +117,16 @@ def test_pond_rows_grow_toward_player_and_cols_to_the_right(cal):
             if "row" not in b:
                 continue
             x0, y0, x1, y1 = quad_to_box(M, b["quad"])
-            rows.setdefault(b["row"], []).append((b["col"], (x0 + x1) / 2, (y0 + y1) / 2))
+            rows.setdefault(b["row"], []).append(
+                (b["col"], (x0 + x1) / 2, (y0 + y1) / 2)
+            )
         ys = [np.mean([c[2] for c in cells]) for r, cells in sorted(rows.items())]
-        for a, b2 in zip(ys, ys[1:]):
+        for a, b2 in zip(ys, ys[1:], strict=False):
             checked += 1
             bad_rows += b2 <= a
         for cells in rows.values():
             cells.sort()
-            for (c0, x0, _), (c1, x1, _) in zip(cells, cells[1:]):
+            for (_c0, x0, _), (_c1, x1, _) in zip(cells, cells[1:], strict=False):
                 checked += 1
                 bad_cols += x1 <= x0
     assert checked > 100

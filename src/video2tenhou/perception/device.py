@@ -1,9 +1,10 @@
 """Test the installed inference stack before trusting CUDA availability."""
+
 from __future__ import annotations
 
-from functools import lru_cache
 import os
 import warnings
+from functools import lru_cache
 
 
 def smoke_test(device: str) -> None:
@@ -16,11 +17,16 @@ def smoke_test(device: str) -> None:
         weight = torch.ones((4, 3, 3, 3), device=device)
         result = torch.nn.functional.conv2d(x, weight)
         matrix = torch.ones((8, 8), device=device)
-        if not torch.isfinite(result).all().item() or (matrix @ matrix)[0, 0].item() != 8:
+        if (
+            not torch.isfinite(result).all().item()
+            or (matrix @ matrix)[0, 0].item() != 8
+        ):
             raise RuntimeError("Inference kernel check returned invalid values")
-        boxes = torch.tensor([[0., 0., 2., 2.], [0., 0., 2., 2.]], device=device)
-        scores = torch.tensor([.9, .8], device=device)
-        if nms(boxes, scores, .5).tolist() != [0]:
+        boxes = torch.tensor(
+            [[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 2.0, 2.0]], device=device
+        )
+        scores = torch.tensor([0.9, 0.8], device=device)
+        if nms(boxes, scores, 0.5).tolist() != [0]:
             raise RuntimeError("torchvision detection kernel check failed")
         if device.startswith("cuda"):
             torch.cuda.synchronize(device)
@@ -32,7 +38,9 @@ def _select(request: str) -> str:
 
     if request != "auto":
         selected = f"cuda:{request}" if request.isdigit() else request
-        smoke_test(selected)  # Explicit choices fail clearly, never silently change devices.
+        smoke_test(
+            selected
+        )  # Explicit choices fail clearly, never silently change devices.
         return selected
     try:
         if torch.cuda.is_available():
@@ -42,12 +50,19 @@ def _select(request: str) -> str:
         warnings.warn(
             f"GPU check failed: {exc}. Using CPU; processing will be slower. "
             "Update uv and your NVIDIA driver, then relaunch Start.cmd or start.sh "
-            "to choose a compatible runtime.", RuntimeWarning, stacklevel=2)
+            "to choose a compatible runtime.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     smoke_test("cpu")
     return "cpu"
 
 
 def select_device(device: str | int | None = None) -> str:
     """Share one verified device across detector and classifier in this process."""
-    request = str(device) if device is not None else os.environ.get("VIDEO2TENHOU_DEVICE", "auto")
+    request = (
+        str(device)
+        if device is not None
+        else os.environ.get("VIDEO2TENHOU_DEVICE", "auto")
+    )
     return _select(request)

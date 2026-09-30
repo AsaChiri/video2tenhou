@@ -1,24 +1,35 @@
 """Starter archives validate untrusted paths and preserve release inputs."""
+
 import hashlib
 import importlib.util
 import io
 import json
-from contextlib import nullcontext
 import stat
 import tarfile
 import zipfile
+from contextlib import nullcontext
+from pathlib import Path
 
 import pytest
 
 from tests.paths import ROOT
 
-spec = importlib.util.spec_from_file_location("package_starter", ROOT / "tools/package_starter.py")
+spec = importlib.util.spec_from_file_location(
+    "package_starter", ROOT / "tools/package_starter.py"
+)
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
 
+FRONTEND_ASSETS = {
+    "src/video2tenhou/tool/static/assets/index-test.js",
+    "src/video2tenhou/tool/static/assets/index-test.css",
+}
+
 
 def source_archive(path, extra=(), missing=None):
-    members = {name: name.encode() for name in package.SOURCE_REQUIRED}
+    members = {
+        name: name.encode() for name in package.SOURCE_REQUIRED | FRONTEND_ASSETS
+    }
     members["pyproject.toml"] = b'[project]\nname="video2tenhou"\nversion="0.1.0"\n'
     if missing:
         members.pop(missing)
@@ -34,8 +45,13 @@ def source_archive(path, extra=(), missing=None):
 
 def model_archive(path, *, change=None, extra=()):
     members = {name: name.encode() for name in package.MODEL_REQUIRED}
-    manifest = {"format": 1, "files": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-                                          for name, data in members.items()}}
+    manifest = {
+        "format": 1,
+        "files": {
+            name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            for name, data in members.items()
+        },
+    }
     if change:
         change(members, manifest)
     members["models/manifest.json"] = json.dumps(manifest).encode()
@@ -49,7 +65,9 @@ def model_archive(path, *, change=None, extra=()):
 
 @pytest.fixture
 def archives(tmp_path):
-    return source_archive(tmp_path / "source.tar.gz"), model_archive(tmp_path / "models.zip")
+    return source_archive(tmp_path / "source.tar.gz"), model_archive(
+        tmp_path / "models.zip"
+    )
 
 
 def test_starter_is_reproducible_and_colocates_models_and_launchers(archives, tmp_path):
@@ -61,18 +79,47 @@ def test_starter_is_reproducible_and_colocates_models_and_launchers(archives, tm
     assert (source.read_bytes(), models.read_bytes()) == before
     with zipfile.ZipFile(first) as archive:
         prefix = "video2tenhou-0.1.0/"
-        expected = package.SOURCE_REQUIRED | package.MODEL_REQUIRED | {"models/manifest.json"}
+        expected = (
+            package.SOURCE_REQUIRED
+            | FRONTEND_ASSETS
+            | package.MODEL_REQUIRED
+            | {"models/manifest.json"}
+        )
         assert set(archive.namelist()) == {prefix + name for name in expected}
         assert archive.getinfo(prefix + "start.sh").external_attr >> 16 & 0o111 == 0o111
         manifest = json.loads(archive.read(prefix + "models/manifest.json"))
         assert set(manifest["files"]) == package.MODEL_REQUIRED
         assert not any(str(tmp_path) in name for name in archive.namelist())
-    assert first.with_suffix(".sha256").read_text().split()[0] == hashlib.sha256(first.read_bytes()).hexdigest()
+    assert (
+        first.with_suffix(".sha256").read_text().split()[0]
+        == hashlib.sha256(first.read_bytes()).hexdigest()
+    )
 
 
-@pytest.mark.parametrize("name", ["/escape", "../escape", "a/../escape", "a\\escape", "C:/escape",
-                                  "video2tenhou-0.1.0/README.md", "video2tenhou-0.1.0/readme.md",
-                                  "video2tenhou-0.1.0/src", "video2tenhou-0.1.0/NUL.txt"])
+@pytest.mark.parametrize("missing", sorted(FRONTEND_ASSETS))
+def test_starter_rejects_unbuilt_frontend(tmp_path: Path, missing: str) -> None:
+    """Reject an incomplete application before publishing its starter archive."""
+    source = source_archive(tmp_path / "source.tar.gz", missing=missing)
+    models = model_archive(tmp_path / "models.zip")
+    with pytest.raises(ValueError, match="built frontend"):
+        package.bundle(source, models, tmp_path / "starter.zip")
+    assert not (tmp_path / "starter.zip").exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "/escape",
+        "../escape",
+        "a/../escape",
+        "a\\escape",
+        "C:/escape",
+        "video2tenhou-0.1.0/README.md",
+        "video2tenhou-0.1.0/readme.md",
+        "video2tenhou-0.1.0/src",
+        "video2tenhou-0.1.0/NUL.txt",
+    ],
+)
 def test_source_rejects_unsafe_duplicate_and_colliding_paths(archives, tmp_path, name):
     source, models = archives
     info = tarfile.TarInfo(name)
@@ -105,12 +152,26 @@ def test_source_rejects_a_second_root_even_when_empty(archives, tmp_path):
         package.bundle(source, models, tmp_path / "starter.zip")
 
 
-@pytest.mark.parametrize("name", ["/escape", "../escape", "models\\escape", "C:/escape",
-                                  "models/detector/weights.pt", "models/Detector/weights.pt",
-                                  "models/detector", "models/private-video.mp4"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "/escape",
+        "../escape",
+        "models\\escape",
+        "C:/escape",
+        "models/detector/weights.pt",
+        "models/Detector/weights.pt",
+        "models/detector",
+        "models/private-video.mp4",
+    ],
+)
 def test_models_reject_unsafe_duplicate_and_unlisted_entries(archives, tmp_path, name):
     source, models = archives
-    with pytest.warns(UserWarning) if name == "models/detector/weights.pt" else nullcontext():
+    with (
+        pytest.warns(UserWarning)
+        if name == "models/detector/weights.pt"
+        else nullcontext()
+    ):
         model_archive(models, extra=[(name, b"x")])
     with pytest.raises(ValueError):
         package.bundle(source, models, tmp_path / "starter.zip")
@@ -126,9 +187,14 @@ def test_model_symlink_is_never_followed(archives, tmp_path):
         package.bundle(source, models, tmp_path / "starter.zip")
 
 
-@pytest.mark.parametrize("defect", ["missing", "hash", "size", "extra_inventory", "missing_inventory"])
-def test_partial_or_unauthenticated_models_preserve_previous_release(archives, tmp_path, defect):
+@pytest.mark.parametrize(
+    "defect", ["missing", "hash", "size", "extra_inventory", "missing_inventory"]
+)
+def test_partial_or_unauthenticated_models_preserve_previous_release(
+    archives, tmp_path, defect
+):
     source, models = archives
+
     def damage(members, manifest):
         name = "models/classifier/weights.pt"
         if defect == "missing":
@@ -141,6 +207,7 @@ def test_partial_or_unauthenticated_models_preserve_previous_release(archives, t
             manifest["files"]["models/unlisted"] = {"bytes": 0, "sha256": "0" * 64}
         else:
             manifest["files"].pop(name)
+
     model_archive(models, change=damage)
     destination = tmp_path / "starter.zip"
     destination.write_bytes(b"previous")
@@ -163,12 +230,16 @@ def test_source_requires_launchers_and_cannot_collide_with_models(archives, tmp_
         package.bundle(source, models, tmp_path / "starter.zip")
 
 
-def test_publication_failure_preserves_archive_and_cleans_partial_file(archives, tmp_path, monkeypatch):
+def test_publication_failure_preserves_archive_and_cleans_partial_file(
+    archives, tmp_path, monkeypatch
+):
     source, models = archives
     destination = tmp_path / "starter.zip"
     destination.write_bytes(b"previous")
+
     def interrupted(*args, **kwargs):
         raise OSError("disk full")
+
     monkeypatch.setattr(package.zipfile.ZipFile, "writestr", interrupted)
     with pytest.raises(OSError, match="disk full"):
         package.bundle(source, models, destination)

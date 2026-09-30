@@ -1,11 +1,14 @@
 """The rules of section 1 of docs/DESIGN.md as checkable functions and constants."""
+
 from __future__ import annotations
 
 from collections import Counter
-from typing import Iterable
+from collections.abc import Iterable
 
 SEATS = "ESWN"
-KINDS = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + [f"{n}z" for n in range(1, 8)]   # 34
+KINDS = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + [
+    f"{n}z" for n in range(1, 8)
+]  # 34
 REDS = {"0m": "5m", "0p": "5p", "0s": "5s"}
 
 
@@ -46,7 +49,7 @@ def next_seat(seat: str) -> str:
 
 
 def relative(me: str, other: str) -> str:
-    """kamicha (the player before me), toimen, shimocha (after me)."""
+    """Kamicha (the player before me), toimen, shimocha (after me)."""
     d = (SEATS.index(other) - SEATS.index(me)) % 4
     return {0: "self", 1: "shimocha", 2: "toimen", 3: "kamicha"}[d]
 
@@ -74,7 +77,9 @@ def kan_tiles(kind: str) -> list[str]:
     return [k] * 3 + [red] if red else [k] * 4
 
 
-DEALER = "E"        # seats are the winds of the hand being decoded, so the dealer is always East
+DEALER = (
+    "E"  # seats are the winds of the hand being decoded, so the dealer is always East
+)
 
 
-LIVE_WALL = 136 - 13 * 4 - 14   # 70 draws in a hand without kans
+LIVE_WALL = 136 - 13 * 4 - 14  # 70 draws in a hand without kans

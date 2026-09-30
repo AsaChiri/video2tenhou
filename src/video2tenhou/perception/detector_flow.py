@@ -1,10 +1,11 @@
-"""Bounded CPU input preparation for the pinned LibreYOLO9 graph adapter.
+"""Bounded CPU input preparation for the LibreYOLO9 graph adapter.
 
 No changes to forward math, postprocessing, padding, output order or thresholds.
 The original visualization image is omitted because this adapter never saves it.
 """
-from concurrent.futures import ThreadPoolExecutor
+
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 
 def input_shape(image, image_size):
@@ -21,9 +22,10 @@ def prepare_input(image, image_size):
     reference normalization order and noncontiguous CHW strides; do not replace
     them with a GPU preprocessing recipe or change rectangular padding.
     """
-    import torch
     import cv2
+    import torch
     from libreyolo.preprocess.yolo9 import preprocess_numpy
+
     height, width = image.shape[:2]
     shape = input_shape(image, image_size)
     # These bytes match ImageLoader._from_numpy's BGR→RGB conversion. Keep
@@ -39,12 +41,21 @@ def infer_prepared(model, prepared, confidence, iou, cuda_graph):
     its results; graph inputs/outputs and head grids are mutable instance state.
     """
     import torch
+
     tensor, original_size, shape = prepared
     tensor = tensor.to(model.device)
     with torch.no_grad(), model.cuda_graph_scope(cuda_graph):
         output = model._forward_graphed(tensor)
-    return model._postprocess(output, confidence, iou, original_size,
-                              max_det=300, ratio=1.0, classes=None, input_size=shape)
+    return model._postprocess(
+        output,
+        confidence,
+        iou,
+        original_size,
+        max_det=300,
+        ratio=1.0,
+        classes=None,
+        input_size=shape,
+    )
 
 
 def one_ahead(items, prepare, consume):
@@ -56,9 +67,11 @@ def one_ahead(items, prepare, consume):
     iterator = iter(items)
     sentinel = object()
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="detector-input")
+
     def advance():
         item = next(iterator, sentinel)
         return sentinel if item is sentinel else prepare(item)
+
     future = pool.submit(advance)
     result = []
     try:

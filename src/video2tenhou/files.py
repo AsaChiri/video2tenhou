@@ -1,11 +1,12 @@
 """Shared file operations for provenance and complete, atomic publications."""
-from contextlib import contextmanager
+
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 
 def sha256_file(path: str | Path) -> str:
@@ -20,18 +21,29 @@ def _atomic_text_file(path: Path, *, retry_windows: bool):
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as stream:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
             pending = Path(stream.name)
             yield stream
             stream.flush()
             os.fsync(stream.fileno())
-        for attempt, delay in enumerate((.05, .1, .2, .4, 0)):
+        for attempt, delay in enumerate((0.05, 0.1, 0.2, 0.4, 0)):
             try:
                 pending.replace(path)
                 break
             except OSError as exc:
-                if not retry_windows or os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 4:
+                if (
+                    not retry_windows
+                    or os.name != "nt"
+                    or getattr(exc, "winerror", None) not in (5, 32, 33)
+                    or attempt == 4
+                ):
                     raise
                 time.sleep(delay)
     finally:
@@ -53,7 +65,9 @@ def atomic_write_text(path: Path, content: str, *, retry_windows: bool = False) 
         stream.write(content)
 
 
-def atomic_write_json(path: Path, value, *, retry_windows: bool = False, **options) -> None:
+def atomic_write_json(
+    path: Path, value, *, retry_windows: bool = False, **options
+) -> None:
     """Publish JSON with the same failure guarantees as atomic_write_text."""
     with _atomic_text_file(path, retry_windows=retry_windows) as stream:
         json.dump(value, stream, ensure_ascii=False, **options)

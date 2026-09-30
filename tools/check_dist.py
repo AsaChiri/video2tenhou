@@ -1,10 +1,11 @@
 """Smoke-test wheel resources outside the checkout, using installed dependencies."""
+
 import argparse
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import zipfile
+from pathlib import Path
 
 
 def check(wheel: Path) -> None:
@@ -13,26 +14,32 @@ def check(wheel: Path) -> None:
         root = Path(directory)
         with zipfile.ZipFile(wheel) as archive:
             names = archive.namelist()
-            assert not any(name.startswith(("labels/", "work/", "models/", "out/")) for name in names)
+            assert not any(
+                name.startswith(("labels/", "work/", "models/", "out/"))
+                for name in names
+            )
             archive.extractall(root)
-        script = '''
+        script = """
 import os, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 os.environ["VIDEO2TENHOU_HOME"] = str(Path.cwd() / "local-data")
-from video2tenhou import layout, overlay, paths
+from video2tenhou import layout, paths
 from video2tenhou.tool import server
 assert Path(layout.__file__).is_relative_to(Path(sys.argv[1]))
 assert layout.Calibration.load("pml").name == "pml"
-assert overlay._DIGITS.ready and overlay._WIND.ready
 assert paths.LABEL_DIR == (Path.cwd() / "local-data" / "labels").resolve()
 static = Path(server.__file__).parent / "static"
 assert (static / "index.html").is_file()
-assert (static / "studio.html").is_file()
+assert not (static / "studio.html").exists()
+assert list((static / "assets").glob("*.js")), "Frontend JavaScript missing from wheel"
+assert list((static / "assets").glob("*.css")), "Frontend styles missing from wheel"
 assert list(static.rglob("*.svg")), "Tile art missing from wheel"
 print("Installed wheel resources and workspace isolation verified")
-'''
-        subprocess.run([sys.executable, "-I", "-c", script, str(root)], cwd=root, check=True)
+"""
+        subprocess.run(
+            [sys.executable, "-I", "-c", script, str(root)], cwd=root, check=True
+        )
 
 
 def main() -> None:

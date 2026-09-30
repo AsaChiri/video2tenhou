@@ -1,0 +1,209 @@
+.review-workspace {
+  --accent: #28645b;
+  --bad: #c62828;
+  --muted: #627078;
+  color: #26343a;
+}
+.review-workspace .card {
+  background: #fff;
+  border: 1px solid #dce3e2;
+  border-radius: 6px;
+  padding: 16px;
+  margin: 14px 0;
+}
+.review-workspace h2 {
+  font-size: 19px;
+  margin-bottom: 12px;
+}
+.review-workspace h3 {
+  margin: 16px 0 8px;
+}
+.review-workspace .tile {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 3px;
+  margin: 2px;
+  min-width: 34px;
+  border: 1px solid #999;
+  border-radius: 4px;
+  background: white;
+  font:
+    12px ui-monospace,
+    monospace;
+}
+.review-workspace .tile.sel {
+  background: #ffe082;
+  border-color: #ff8f00;
+}
+.review-workspace .tile.guess {
+  border-color: #1565c0;
+  box-shadow: 0 0 0 2px #90caf9;
+}
+.review-workspace .g {
+  display: block;
+  line-height: 1;
+}
+.review-workspace .g img {
+  width: 30px;
+  height: 40px;
+  object-fit: contain;
+}
+.review-workspace .palette {
+  margin: 8px 0;
+  max-width: 760px;
+}
+.review-workspace .palette-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-bottom: 5px;
+}
+.review-workspace .palette .tile {
+  width: 44px;
+  min-height: 54px;
+  margin: 0;
+}
+.review-workspace .slots {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+}
+.review-workspace .warn {
+  color: #b71c1c;
+  font-weight: 600;
+}
+.review-workspace .banner {
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: #ffebee;
+  color: var(--bad);
+}
+.review-workspace .update-notice {
+  background: #edf3f1;
+  color: var(--accent);
+}
+.review-workspace .review-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  padding: 12px 0;
+  margin-bottom: 18px;
+  border-bottom: 1px solid #dce3e2;
+}
+.review-workspace .review-heading p {
+  max-width: 70ch;
+  color: var(--muted);
+}
+.review-workspace .question-count {
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.review-workspace .question-context {
+  color: var(--muted);
+  margin: 0 0 16px;
+}
+.review-workspace .question-content {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.review-workspace .review-progress {
+  padding: 24px 0;
+  max-width: 65ch;
+}
+.review-workspace .update-progress {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  font-variant-numeric: tabular-nums;
+}
+.review-workspace .review-progress progress {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.review-workspace .workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(330px, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+.review-workspace .watch {
+  position: sticky;
+  top: 16px;
+}
+.review-workspace .watch video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16/9;
+  background: #142025;
+  border-radius: 4px;
+}
+.review-workspace .watch .actions {
+  justify-content: space-between;
+}
+.review-workspace .answer-panel {
+  min-width: 0;
+}
+.review-workspace input[type="checkbox"] {
+  width: auto;
+}
+.review-workspace .review-details {
+  margin-top: 24px;
+  padding-top: 14px;
+  border-top: 1px solid #dce3e2;
+}
+.review-workspace details {
+  margin: 12px 0;
+}
+.review-workspace summary {
+  cursor: pointer;
+  color: #405e58;
+}
+.review-workspace table {
+  border-collapse: collapse;
+  max-width: 100%;
+}
+.review-workspace td,
+.review-workspace th {
+  padding: 5px 8px;
+  border-bottom: 1px solid #e5e5e5;
+  text-align: left;
+}
+.review-workspace .calibration-preview {
+  max-width: 1100px;
+}
+.review-workspace .calibration-preview canvas {
+  display: block;
+  width: 100%;
+  border: 1px solid #dce3e2;
+  border-radius: 4px;
+  cursor: crosshair;
+}
+.review-workspace .calibration-details .lay {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 16px;
+  margin-top: 16px;
+}
+@media (max-width: 900px) {
+  .review-workspace .workbench {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .review-workspace .watch {
+    position: static;
+  }
+}
+@media (max-width: 600px) {
+  .review-workspace .calibration-details .lay {
+    display: block;
+  }
+  .review-workspace {
+    overflow-x: auto;
+  }
+}

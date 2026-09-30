@@ -1,4 +1,5 @@
 """File publication preserves the old artifact on any incomplete write."""
+
 import hashlib
 import json
 from pathlib import Path
@@ -17,7 +18,9 @@ def test_streaming_hash_and_nested_unicode_json(tmp_path):
 
 
 @pytest.mark.parametrize("failure", ["serialization", "sync", "replacement"])
-def test_failed_publication_preserves_existing_contents_and_cleans_up(tmp_path, monkeypatch, failure):
+def test_failed_publication_preserves_existing_contents_and_cleans_up(
+    tmp_path, monkeypatch, failure
+):
     path = tmp_path / "evidence.json"
     path.write_text('{"complete":true}', encoding="utf-8")
     before = path.read_bytes()
@@ -26,9 +29,11 @@ def test_failed_publication_preserves_existing_contents_and_cleans_up(tmp_path, 
         raise OSError("interrupted write")
 
     if failure == "serialization":
+
         def partial(value, stream, **kwargs):
             stream.write('{"partial":')
             fail()
+
         monkeypatch.setattr(files.json, "dump", partial)
     elif failure == "sync":
         monkeypatch.setattr(files.os, "fsync", fail)

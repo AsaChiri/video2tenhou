@@ -24,7 +24,7 @@ than silently changing their meaning.
 | `files` | Streaming file digests and atomic UTF-8/JSON publication using standard-library primitives. |
 | `video` | Download, probe, normalized BGR frames; external decoder errors propagate. |
 | `layout`, `calibfit` | Frame/region transforms and per-video fitting; failing borders block analysis. |
-| `overlay`, `record`, `timeline` | Read header pixels, normalize authoritative results, align hand windows. |
+| `record`, `timeline` | Normalize authoritative results and align pond-clearing windows to hands. |
 | `calm`, `read`, `observe` | Find still intervals, retain tile posteriors, combine repeated evidence. |
 | `perception.detector`, `classifier`, `reader` | Local model inference, geometry and tile-row structure. |
 | `engine.ponds`, `melds`, `indicators`, `calls`, `turns` | Persistent visible objects and chronological events. |
@@ -33,7 +33,7 @@ than silently changing their meaning.
 | `engine.decode`, `review` | Stage orchestration, human constraints and unresolved evidence. |
 | `engine.assemble`, `tenhou6` | Encode exports and replay every hand before accepting it. |
 | `cli`, `tool` | Script interface and local browser project workflow. |
-| `tool.processes` | Own child process trees so stopping the server also stops downloads, decoding and analysis. |
+| `tool.processes` | Coordinate subprocess shutdown using pywin32 Job Objects and psutil on Windows, and standard-library process groups on POSIX. |
 | `train`, `eval`, `benchmark` | Annotation datasets, training, held-out metrics and throughput comparisons. |
 
 Seats in engine evidence are wind letters for the current hand; site records
@@ -107,7 +107,7 @@ human-confirmed hand. Unsourced review answers default to confirmed. Source name
 never determine annotation strength, and ambiguous imported annotations are
 rejected without rewriting the saved journal.
 
-Stage data lives under `work/<video>/`: header and hand windows, calm intervals,
+Stage data lives under `work/<video>/`: table timing and hand windows, calm intervals,
 per-hand reads, aggregated observations, dense reads and decoded hands. Results
 live under `out/<video>/`. Stage caches are accelerators, not independently
 versioned interchange formats. When changing evidence semantics, invalidate
@@ -119,17 +119,16 @@ between reading and voting therefore cannot make stale observations reusable
 on resume. Review rebuilds verify sparse and voted evidence before writing a
 hand; after changing recognition models, use **Analyze recording** to refresh
 that evidence before rebuilding with saved answers.
-Decoded results also bind the observation and provenance files by content hash.
+Decoded results also bind the observation and provenance files by content hash,
+along with hand metadata, the authoritative result and that hand's saved facts.
 An interruption after voting cannot make an older reconstructed hand reusable;
 only complete replacement files become visible.
 
 Studio manifests under `work/projects/` bind source paths, ordered game IDs,
 layout selection and an export signature. Exports are only offered when the
 source content, those inputs and the effective calibration match their provenance.
-Existing PML outputs can be adopted when their record IDs and every hand's source and
-crop signatures agree.
 Changing project settings preserves labels but requires analysis; changing
-layout also removes the obsolete overlay cache. A `calibration.changed` or
+layout requires preparation. A `calibration.changed` or
 `inputs.changed` marker blocks direct review rebuilds until full analysis
 refreshes the upstream evidence. Replacing or removing a recording also requires
 preparation again, preserving saved answers. Polling reuses a source digest keyed
@@ -137,7 +136,7 @@ by file identity, size and timestamps; conversion stages verify content afresh.
 Evidence clips include source and geometry identities in their filenames, and
 calibration edits clear remembered border checks.
 
-`tool.app` scopes review APIs by project URL, streams upload bodies and accepts
+`tool.server` scopes review APIs by project URL, streams upload bodies and accepts
 only local, same-origin writes with its application header. `tool.workflow`
 serializes processing jobs and persists interrupted/failed states. Project
 manifests are atomically replaced; brief Windows reader contention has a bounded
@@ -151,15 +150,48 @@ Changing calibration must trigger fresh readings for the affected regions.
 
 ## Tests
 
+### Required code checks
+
+Install the locked development tools with `uv sync --frozen` and
+`npm --prefix frontend ci`. Run these checks before submitting changes:
+
 ```console
+uv run ruff format --check .
+uv run ruff check --ignore-noqa .
+uv run ty check --error-on-warning
+npm --prefix frontend run check
+```
+
+Use `uv run ruff format .` and `npm --prefix frontend run format` to apply
+formatting. Python linting enables Ruff `ALL`; the only approved exceptions
+are `D203`, `D213`, and `COM812` (conflicting docstring/formatter conventions),
+and `S101` in tests (pytest assertions). The checks cover application code,
+training code, tools, tests, and frontend configuration. Do not add exclusions,
+rule suppressions, type-check skips, or failure baselines without maintainer
+approval. Python's existing inline type-ignore comments are not honored.
+
+These commands are mandatory workflow steps, with no warning-only or
+continue-on-error paths. The frontend build also runs its checks first.
+GitHub `main` requires `test (ubuntu-latest)` and `test (windows-latest)` from
+GitHub Actions, with an up-to-date branch, including for administrators. Keep
+those protection settings aligned with the workflow job names; workflow files
+alone cannot set that repository policy.
+
+The initial Ruff ALL and ty rollout exposes existing Python diagnostics.
+Those diagnostics fail CI and must be fixed rather than hidden by a baseline.
+
+### Regression suite
+
+```console
+npm --prefix frontend ci
+npm --prefix frontend run build
 uv run pytest -q --cov --cov-report=term-missing --cov-report=html
 uv build
 uv run python tools/check_dist.py
 uv run python tools/check_source_release.py
 ```
 
-The suite covers synthetic decoder frames, calibration transforms, real overlay
-images, observation/cache behavior, rule/solver cases, replay rejection, review
+The suite covers synthetic decoder frames, calibration transforms, pond-based hand timing, observation/cache behavior, rule/solver cases, replay rejection, review
 answers and HTTP project workflows. Cross-module tests verify that an authoritative
 record becomes a validated export, and illegal reconstructions become explicit
 conflicts. The week_11 fixture protects the observed draw-order failure. Use
@@ -173,6 +205,18 @@ are separate from CI: capture hardware, model hashes, warmup, workload and outpu
 parity. Do not compare cached reruns with cold first runs as a speedup claim.
 The source-release check runs the tests shipped inside the sdist in an empty
 workspace, so accidental dependence on private labels or local caches is visible.
+
+## Frontend
+
+Frontend source is in `frontend/`. Before packaging UI changes, run
+`npm --prefix frontend ci`, `npm --prefix frontend test`, and
+`npm --prefix frontend run build`. Generated static assets are ignored by Git
+and included in release distributions by the package builder. Build them before
+running Python web tests or serving a source checkout.
+See [frontend development](../frontend/README.md) for the component
+and backend module boundaries. The single application is launched with
+`video2tenhou web`; there is no separate review server or browser command.
+
 
 ## Training
 

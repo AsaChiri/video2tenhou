@@ -10,10 +10,10 @@ Ponds: boxes assigned to (row, col) in the owner's reading order; boxes that
        the edge) rejects the whole reading rather than being truncated.
 Melds: boxes grouped into meld rows (top to bottom, left to right).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 import numpy as np
 
@@ -24,25 +24,28 @@ from .detector import Det, Detector
 
 SIDEWAYS_ASPECT = 1.15
 NONE_MAX = 0.5
-WALL_BAND = 0.32          # bottom fraction of the upright pond region where the wall row (dead wall, indicators) can lie;
-                          # a real fourth discard row in the band is kept as a row when it continues the rows
-EDGE = 3                  # px: a box this close to a region edge touches it
-OVERLAP_IOU = 0.3         # two boxes of one row overlapping this much are one tile seen twice
-DUP_IOU = 0.5             # melds: two boxes overlapping this much are one tile boxed twice
-MELD_X_OVERLAP = 0.3      # melds: boxes overlapping along x by more than this share of the narrower are in two rows
+WALL_BAND = 0.32  # bottom fraction of the upright pond region where the wall row (dead wall, indicators) can lie;
+# a real fourth discard row in the band is kept as a row when it continues the rows
+EDGE = 3  # px: a box this close to a region edge touches it
+OVERLAP_IOU = 0.3  # two boxes of one row overlapping this much are one tile seen twice
+DUP_IOU = 0.5  # melds: two boxes overlapping this much are one tile boxed twice
+MELD_X_OVERLAP = 0.3  # melds: boxes overlapping along x by more than this share of the narrower are in two rows
 
 
 @dataclass
 class Box:
     """A detected tile with class probabilities and its physical row/group role."""
+
     xyxy: tuple[float, float, float, float]
     conf: float
     sideways: bool
-    p: np.ndarray                    # posterior over the 39 classes
-    role: str = "tile"               # tile | indicator | extra (a meld beside a hand row) | other (not of this region)
-    row: Optional[int] = None
-    col: Optional[int] = None
-    group: Optional[int] = None      # meld group index; hands: 0 = the row, 1.. = groups beside it
+    p: np.ndarray  # posterior over the 39 classes
+    role: str = "tile"  # tile | indicator | extra (a meld beside a hand row) | other (not of this region)
+    row: int | None = None
+    col: int | None = None
+    group: int | None = (
+        None  # meld group index; hands: 0 = the row, 1.. = groups beside it
+    )
 
     @property
     def cx(self):
@@ -66,8 +69,13 @@ class Box:
 
     def to_dict(self) -> dict:
         """Serialize compact evidence; absent structure fields remain omitted."""
-        d = {"xyxy": [round(v, 1) for v in self.xyxy], "conf": round(self.conf, 3), "sideways": self.sideways,
-             "role": self.role, "p": [round(float(v), 4) for v in self.p]}
+        d = {
+            "xyxy": [round(v, 1) for v in self.xyxy],
+            "conf": round(self.conf, 3),
+            "sideways": self.sideways,
+            "role": self.role,
+            "p": [round(float(v), 4) for v in self.p],
+        }
         for k in ("row", "col", "group"):
             if getattr(self, k) is not None:
                 d[k] = getattr(self, k)
@@ -77,19 +85,25 @@ class Box:
 @dataclass
 class Reading:
     """One sampled region; rejected geometry must not become an observation."""
+
     t: float
     region: str
     size: tuple[int, int]
     boxes: list[Box] = field(default_factory=list)
-    rejected: bool = False           # the boxes cannot be a state of this region (a pond row of seven): observe drops it
+    rejected: bool = False  # the boxes cannot be a state of this region (a pond row of seven): observe drops it
 
     def to_dict(self) -> dict:
         """Return the stage-3 JSON representation used by caches and review."""
-        return {"t": self.t, "region": self.region, "size": list(self.size), "rejected": self.rejected,
-                "boxes": [b.to_dict() for b in self.boxes]}
+        return {
+            "t": self.t,
+            "region": self.region,
+            "size": list(self.size),
+            "rejected": self.rejected,
+            "boxes": [b.to_dict() for b in self.boxes],
+        }
 
 
-def _clipped(b: Box, region_h: Optional[float]) -> bool:
+def _clipped(b: Box, region_h: float | None) -> bool:
     """The box is cut by the far edge of the region (the wall row lies there)."""
     return region_h is not None and b.xyxy[3] >= region_h - EDGE
 
@@ -98,19 +112,22 @@ def _at_left(b: Box) -> bool:
     return b.xyxy[0] <= EDGE
 
 
-def _at_right(b: Box, region_w: Optional[float]) -> bool:
+def _at_right(b: Box, region_w: float | None) -> bool:
     return region_w is not None and b.xyxy[2] >= region_w - EDGE
 
 
-def _at_side(b: Box, region_w: Optional[float]) -> bool:
+def _at_side(b: Box, region_w: float | None) -> bool:
     """The box touches a side edge of the region, where a neighbouring pond can spill in."""
     return _at_left(b) or _at_right(b, region_w)
 
 
-def _tile_size(boxes: list[Box], region_h: Optional[float] = None) -> tuple[float, float]:
+def _tile_size(boxes: list[Box], region_h: float | None = None) -> tuple[float, float]:
     """Median width / height of the upright face-up tiles (sideways ones swapped); tile backs and boxes cut
-    by the region edge (the wall row) do not shape the estimate."""
-    good = [b for b in boxes if b.p[CLASS_INDEX["X"]] < 0.5 and not _clipped(b, region_h)] or boxes
+    by the region edge (the wall row) do not shape the estimate.
+    """
+    good = [
+        b for b in boxes if b.p[CLASS_INDEX["X"]] < 0.5 and not _clipped(b, region_h)
+    ] or boxes
     ws = [b.h if b.sideways else b.w for b in good]
     hs = [b.w if b.sideways else b.h for b in good]
     return (float(np.median(ws)), float(np.median(hs))) if good else (40.0, 60.0)
@@ -127,10 +144,13 @@ def _cluster_rows(boxes: list[Box], th: float) -> list[list[Box]]:
     return clusters
 
 
-def assign_pond(boxes: list[Box], region_h: Optional[float] = None, region_w: Optional[float] = None) -> bool:
+def assign_pond(
+    boxes: list[Box], region_h: float | None = None, region_w: float | None = None
+) -> bool:
     """Rows top-down (row 0 nearest the centre), columns left to right with gaps; leftovers are indicators.
     Returns True when the reading is rejected: a row of more than six positions that no neighbouring pond
-    can explain (its boxes are marked "other"; the caller drops the reading)."""
+    can explain (its boxes are marked "other"; the caller drops the reading).
+    """
     if not boxes:
         return False
     tw, th = _tile_size(boxes, region_h)
@@ -163,7 +183,7 @@ def assign_pond(boxes: list[Box], region_h: Optional[float] = None, region_w: Op
             break
         in_band = region_h is not None and y > region_h * (1.0 - WALL_BAND)
         if in_band and prev_y is None:
-            break                                   # no discard row starts in the wall band
+            break  # no discard row starts in the wall band
         # in the wall band a cluster is a discard row only when it continues the rows without a gap
         # (rows lie 0.99-1.13 tile heights apart, the wall 1.18 or more) and already holds three tiles
         # (one or two face-up tiles there are dora indicators); the wall's face-down tiles are often not
@@ -188,7 +208,11 @@ def assign_pond(boxes: list[Box], region_h: Optional[float] = None, region_w: Op
             # A tile seen twice (two boxes on one tile) pushes the real sixth tile out: the less confident
             # of the overlapping boxes goes; if the row is still too long the reading is wrong as a whole
             # and is rejected, never truncated to six
-            dup = [b for b in cl if any(o is not b and box_iou(b.xyxy, o.xyxy) > OVERLAP_IOU for o in cl)]
+            dup = [
+                b
+                for b in cl
+                if any(o is not b and box_iou(b.xyxy, o.xyxy) > OVERLAP_IOU for o in cl)
+            ]
             if dup:
                 worst = min(dup, key=lambda b: b.conf)
                 worst.role = "other"
@@ -214,15 +238,21 @@ def assign_pond(boxes: list[Box], region_h: Optional[float] = None, region_w: Op
 
 def _x_overlap(a: Box, b: Box) -> float:
     """Overlap along x as a fraction of the narrower box."""
-    return max(0.0, min(a.xyxy[2], b.xyxy[2]) - max(a.xyxy[0], b.xyxy[0])) / max(1.0, min(a.w, b.w))
+    return max(0.0, min(a.xyxy[2], b.xyxy[2]) - max(a.xyxy[0], b.xyxy[0])) / max(
+        1.0, min(a.w, b.w)
+    )
 
 
 def _rows_without_overlap(cl: list[Box]) -> list[list[Box]]:
     """Split a height cluster into rows in which no two boxes overlap along x: tiles of one row lie side by
     side, so two boxes over the same x are in two rows (melds laid one above the other at an angle). The one
-    exception is a kakan: its added tile lies across the pon's turned tile, both sideways, one on the other."""
+    exception is a kakan: its added tile lies across the pon's turned tile, both sideways, one on the other.
+    """
+
     def fits(b: Box, r: list[Box]) -> bool:
-        return all(_x_overlap(b, o) <= MELD_X_OVERLAP or (b.sideways and o.sideways) for o in r)
+        return all(
+            _x_overlap(b, o) <= MELD_X_OVERLAP or (b.sideways and o.sideways) for o in r
+        )
 
     rows: list[list[Box]] = []
     for b in sorted(cl, key=lambda b: b.cy):
@@ -237,13 +267,18 @@ def _rows_without_overlap(cl: list[Box]) -> list[list[Box]]:
 def assign_meld(boxes: list[Box]) -> None:
     """Meld rows by y (top to bottom), boxes left to right; consecutive boxes closer than a tile width share a
     group. The same tile boxed twice keeps its better box (the other becomes "other"), and boxes overlapping
-    along x never share a row. Runs of more than four boxes are split into melds by the engine (call rules)."""
+    along x never share a row. Runs of more than four boxes are split into melds by the engine (call rules).
+    """
     if not boxes:
         return
     for b in sorted(boxes, key=lambda b: -b.conf):
         if b.role != "other":
             for o in boxes:
-                if o is not b and o.role != "other" and box_iou(b.xyxy, o.xyxy) > DUP_IOU:
+                if (
+                    o is not b
+                    and o.role != "other"
+                    and box_iou(b.xyxy, o.xyxy) > DUP_IOU
+                ):
                     o.role = "other"
     live = [b for b in boxes if b.role != "other"]
     if not live:
@@ -267,7 +302,8 @@ def assign_hand(boxes: list[Box]) -> None:
     gap wider than 0.8 tile widths; the longest group is the row (role "tile", group 0). Every other group
     is a meld the player moved beside the row at a reveal (role "extra", groups 1.. left to right): its
     tiles are not in the hand, so they never enter the row's count. Ties go to the leftmost group: melds
-    lie at the player's right, which the hand camera sees on the right."""
+    lie at the player's right, which the hand camera sees on the right.
+    """
     if not boxes:
         return
     tw, th = _tile_size(boxes)
@@ -290,8 +326,16 @@ def assign_hand(boxes: list[Box]) -> None:
             b.role, b.group = "extra", k
 
 
-def read_region(frame: np.ndarray, cal: Calibration, name: str, det: Detector, clf: Classifier, *,
-                t: float = 0.0, img: Optional[np.ndarray] = None) -> Reading:
+def read_region(
+    frame: np.ndarray,
+    cal: Calibration,
+    name: str,
+    det: Detector,
+    clf: Classifier,
+    *,
+    t: float = 0.0,
+    img: np.ndarray | None = None,
+) -> Reading:
     """Read one frame region, optionally reusing an already upright crop."""
     kind, _, corner = name.partition(":")
     if img is None:
@@ -302,7 +346,9 @@ def read_region(frame: np.ndarray, cal: Calibration, name: str, det: Detector, c
     return _finish(img, name, t, boxes)
 
 
-def read_regions(items: list[tuple[float, str, np.ndarray]], det: Detector, clf: Classifier) -> list[Reading]:
+def read_regions(
+    items: list[tuple[float, str, np.ndarray]], det: Detector, clf: Classifier
+) -> list[Reading]:
     """Read ``(time, region name, upright BGR crop)`` items in input order.
 
     Detector batches preserve each crop's shape; classifier crops from all
@@ -313,7 +359,7 @@ def read_regions(items: list[tuple[float, str, np.ndarray]], det: Detector, clf:
         return []
     detections = det.predict_batch([img for _, _, img in items])
     prepared, crops, sideways = [], [], []
-    for (_, name, img), dets in zip(items, detections):
+    for (_, name, img), dets in zip(items, detections, strict=False):
         boxes, cs, ss = _prepare(img, name.partition(":")[0], dets)
         prepared.append((boxes, len(cs)))
         crops.extend(cs)
@@ -322,18 +368,27 @@ def read_regions(items: list[tuple[float, str, np.ndarray]], det: Detector, clf:
         probabilities = clf.classify(crops, sideways)
         start = 0
         for boxes, count in prepared:
-            _set_posteriors(boxes, probabilities[start:start + count])
+            _set_posteriors(boxes, probabilities[start : start + count])
             start += count
-    return [_finish(img, name, t, boxes) for (t, name, img), (boxes, _) in zip(items, prepared)]
+    return [
+        _finish(img, name, t, boxes)
+        for (t, name, img), (boxes, _) in zip(items, prepared, strict=False)
+    ]
 
 
-def _prepare(img: np.ndarray, kind: str, dets: list[Det]) -> tuple[list[Box], list[np.ndarray], list[bool]]:
+def _prepare(
+    img: np.ndarray, kind: str, dets: list[Det]
+) -> tuple[list[Box], list[np.ndarray], list[bool]]:
     boxes: list[Box] = []
     crops, sideways = [], []
     for d in dets:
         x0, y0, x1, y1 = d.xyxy
         # a turned tile in a pond / meld; a box cut by the far edge of the region is wide and short but not turned
-        side = kind != "hand" and (x1 - x0) > SIDEWAYS_ASPECT * (y1 - y0) and not (kind == "pond" and y1 >= img.shape[0] - EDGE)
+        side = (
+            kind != "hand"
+            and (x1 - x0) > SIDEWAYS_ASPECT * (y1 - y0)
+            and not (kind == "pond" and y1 >= img.shape[0] - EDGE)
+        )
         b = Box(d.xyxy, d.conf, side, np.zeros(len(CLASS_INDEX), np.float32))
         if d.back:
             b.p[CLASS_INDEX["X"]] = 1.0
@@ -364,7 +419,14 @@ def _finish(img: np.ndarray, name: str, t: float, boxes: list[Box]) -> Reading:
     rejected = False
     if kind == "pond":
         rejected = assign_pond(boxes, region_h=img.shape[0], region_w=img.shape[1])
-        boxes.sort(key=lambda b: (b.role != "tile", b.row if b.row is not None else 99, b.col if b.col is not None else 99, b.cx))
+        boxes.sort(
+            key=lambda b: (
+                b.role != "tile",
+                b.row if b.row is not None else 99,
+                b.col if b.col is not None else 99,
+                b.cx,
+            )
+        )
     elif kind == "meld":
         assign_meld(boxes)
         boxes.sort(key=lambda b: (b.group if b.group is not None else 99, b.cx))

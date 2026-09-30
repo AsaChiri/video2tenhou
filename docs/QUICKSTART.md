@@ -1,6 +1,6 @@
 # PML quick start
 
-Download **video2tenhou-0.1.3-starter.zip** from the
+Download **video2tenhou-0.2.0-starter.zip** from the
 [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
 The starter includes the application, PML layout and trained models.
 
@@ -8,23 +8,18 @@ The starter includes the application, PML layout and trained models.
 
 ### Windows
 
-Open PowerShell and install the three prerequisites:
+Open PowerShell and install the two prerequisites:
 
 ```powershell
 winget install --id astral-sh.uv --exact
 winget install "FFmpeg (Essentials Build)"
-winget install --id UB-Mannheim.TesseractOCR --exact
 ```
 
-These use [uv's installer](https://docs.astral.sh/uv/getting-started/installation/),
-[Gyan's FFmpeg build](https://www.gyan.dev/ffmpeg/builds/) (including `ffprobe`)
-and the [Tesseract Windows build](https://tesseract-ocr.github.io/tessdoc/Installation.html).
-Keep English language data selected in the Tesseract installer. Close and reopen
-PowerShell after installation so it receives the updated PATH.
+These use [uv's installer](https://docs.astral.sh/uv/getting-started/installation/)
+and [Gyan's FFmpeg build](https://www.gyan.dev/ffmpeg/builds/) (including `ffprobe`).
+Close and reopen PowerShell after installation so it receives the updated PATH.
 
-Extract the starter ZIP, then double-click **Start.cmd** inside the extracted
-folder. The launcher also finds Tesseract in its standard
-`C:\Program Files\Tesseract-OCR` installation folder.
+Extract the starter ZIP, then double-click **Start.cmd** inside the extracted folder.
 
 ### Linux
 
@@ -32,7 +27,7 @@ On Ubuntu or Debian, install the prerequisites:
 
 ```sh
 sudo apt update
-sudo apt install -y curl ffmpeg tesseract-ocr tesseract-ocr-eng
+sudo apt install -y curl ffmpeg
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
@@ -43,9 +38,8 @@ bash start.sh
 ```
 
 On another Linux distribution, install [uv](https://docs.astral.sh/uv/getting-started/installation/),
-[FFmpeg](https://ffmpeg.org/download.html) and
-[Tesseract with English data](https://tesseract-ocr.github.io/tessdoc/Installation.html)
-using that distribution's packages. `uv`, `ffmpeg`, `ffprobe` and `tesseract`
+[FFmpeg](https://ffmpeg.org/download.html)
+using that distribution's packages. `uv`, `ffmpeg` and `ffprobe`
 must be available on PATH.
 
 ### First launch
@@ -87,12 +81,24 @@ and launch normally to finish setup.
 
 ## Convert a recording
 
-1. Choose **Saved video**, **Upload** or **Video URL**. Saved video lists
-   recordings in `samples/` and `videos/`; **Enter a video path → Video path**
-   accepts a local path without copying it. Upload copies a recording into
-   `samples/`. Enter scoremj game IDs in broadcast order; a URL ending in
+The studio opens to **Projects**, where you can search saved recordings by name,
+source or game ID. Select **Open project** to resume, or **Settings** to edit game
+IDs and layout. **Rename** changes the display name without moving files.
+**Delete** asks for confirmation and removes the project from the library while
+keeping videos, saved review data and outputs on disk. Projects with a running
+analysis or review job cannot be deleted. Use **All projects** to return here.
+
+1. Select **New project**, then choose **Video file** to pick a recording from your computer, or **Video URL**
+   to paste its video link. Local files are copied into `samples/` for processing.
+   Enter scoremj game IDs in broadcast order; a URL ending in
    `/games/21938` has ID `21938`. Use the complete recording where possible
    so its hands agree with the site record, then select **Prepare recording**.
+   To use part of a recording, optionally enter **Start time** and **End time**
+   in `HH:MM:SS`, `MM:SS` or seconds (for example, `01:30:00` or `90.5`).
+   A blank start means the beginning; a blank end means the end of the recording.
+   Include complete games and enter the game IDs for that range. Local originals
+   are kept intact; the app creates a separate clip. Review timestamps start at
+   zero in that clip. Add a recording again to use a different range.
 2. Let the tool measure the table and player panels. Inspect
    the preview. Each pond must contain only its owner's discards; borders
    must leave entire tiles visible. Drag incorrect regions, then select
@@ -100,23 +106,33 @@ and launch normally to finish setup.
    **Discard changes** to return to the saved geometry. Overhead position, rotation and crop
    previews are under **Overhead adjustment and crop previews**. The measured
    fit is specific to this video.
+   If preparation fails, open **Settings → Calibration** to correct table,
+   hand, pond or meld positioning even before a fit exists. Select **Save
+   changes**, then return to Settings and click **Prepare recording** again.
+   Saving does not start processing. Calibration checks visible table tiles
+   and does not require scores, names or wind labels from the broadcast.
 3. Select **Analyze recording**. Progress and errors appear in the project.
    Geometry and video/site round alignment are checked before reconstruction.
    Keep the server running while a job runs.
-4. **Review** opens after processing. Inspect the full video frame alongside
-   each question and its answer controls. Questions with the weakest evidence
-   appear first. Answer with the tile, hand or meld
-   shown, or use **Can't tell** where offered when the evidence is not visible.
-   Select **Rebuild changes**
-   after saving answers. It rebuilds only hands with unapplied changes, including
-   answers saved across several hands. Results for an affected hanchan become
-   available again after rebuilding incorporates its saved changes. Crop diagnostics are available in the collapsed advanced
-   controls when needed.
+4. **Review** opens after processing with one question beside its video.
+   Questions run from most uncertain to least uncertain across all hands.
+   Answer with the tile, hand or meld shown, or use **Can't tell** where offered.
+   Answers save immediately and update affected hands in the background. Continue
+   with other hands while the update runs; further questions from an answered hand
+   wait for its new result so inferred answers do not need separate input.
+   Answers collected during an update are applied together in the next batch.
+   Unfinished confidence checks remain in the confidence data and appear as a
+   processing note; they do not block review completion. **Skip for now** leaves
+   a question unresolved; you can return to skipped
+   questions later. Additional camera views are under **Additional evidence**.
+   **Advanced review** is optional: it lets you inspect every action in every
+   hand, edit saved answers and apply those changes. Normal review does not
+   require navigating hands or manually rebuilding them.
 5. Open **Results** and select a hanchan. Use **Open replay** or **Download
    JSON** for the full game, **Copy link** for one hand, or **Copy all hand
    links** for the hanchan. Expand **Reports** for the report and review data.
 
-The header's recording selector switches projects. Processed recordings have
+Use **All projects** to switch recordings. Processed recordings have
 **Review**, **Results** and **Settings** tabs, with Review selected by default.
 To correct game IDs or layout, use **Settings → Recording settings**. Saved
 answers and the recording stay in place; exports are hidden until analysis
@@ -129,15 +145,16 @@ reconstruction has questions to resolve. `conflict` means reconstruction or repl
 failed, and that hand is excluded. Check the report before treating an export
 as a complete hanchan.
 
-**Uncertain tiles** groups draws and starting hands the solver could not certify.
+**Uncertain tiles** groups draws and starting hands with close competing answers.
 Ambiguous discards also appear as individual review questions.
-A close alternative may fit, or the search may have stopped before proving the
-choice. With no saved changes waiting, **Rebuild hand** retries that hand's search.
+A close alternative also fits the available evidence. Review the video and save
+the observed tiles to constrain the next reconstruction.
 **Can't tell** applies only to that particular draw or starting hand. A hand stays
 in review while any of these choices remain unresolved.
 
-**Search incomplete** means a legal result is still provisional because the
-solver ran out of search time; use **Rebuild hand** to retry, with no tile answer required.
+When an automatic check reaches its time limit, the hand carries a processing
+note. This is not a tile question or a confidence proof. A legal reconstruction
+can still be exported; a hand with no legal reconstruction remains excluded.
 
 ## Resume and storage
 
@@ -171,9 +188,9 @@ require network access.
 | Symptom | Action |
 |---|---|
 | Model missing or metadata mismatch | Extract the complete matching bundle into the active data directory; do not mix files from different releases. |
-| FFmpeg/Tesseract missing | Fix PATH, restart the terminal and relaunch. |
+| FFmpeg missing | Fix PATH, restart the terminal and relaunch. |
 | Geometry check fails | Open Calibration, inspect the named region and save corrected borders. |
-| Video/site mismatch | Verify IDs/order, recording completeness and overlay recognition. |
+| Video/site mismatch | Verify IDs/order, recording completeness and pond calibration. |
 | GPU incompatible / no kernel image / CUDA unavailable | Update the NVIDIA driver and uv, then use the repair command above. The launcher chooses and checks a compatible build; CPU mode is available as a slower fallback. |
 | Setup download interrupted or disk full | Free disk space or restore internet access and relaunch. Incomplete setup is retried automatically. |
 | xFormers not available | This optional acceleration message alone is not a setup failure. Read the final error in the log. |
@@ -184,6 +201,16 @@ For scripts, commands remain `download`, `calib fit`, `convert --game ID`,
 and `review`; see `--help` on each command.
 
 ## Source setup
+
+For a Git checkout, install Node 22 and build the frontend before launching:
+
+```console
+npm --prefix frontend ci
+npm --prefix frontend run build
+```
+
+Generated frontend assets are excluded from Git. Published source archives
+already include them and do not require Node to run.
 
 The source archive and Git checkout exclude trained weights. Install the
 prerequisites above and the matching models below, then use **Start.cmd** or
@@ -197,7 +224,7 @@ automatic runtime selection. For advanced runtime choices, see
 
 The starter already contains the required models. Source users can download
 **video2tenhou-pml-models.zip** and **video2tenhou-pml-models.sha256** from the
-[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.1.3),
+[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.2.0),
 or [train their own models](MAINTENANCE.md#training).
 
 With both downloaded files in the application folder, verify and extract them:

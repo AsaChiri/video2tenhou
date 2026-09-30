@@ -3,13 +3,14 @@
 Uses the current environment's dependencies. The wheel smoke check separately
 verifies installed resource lookup. Run after ``uv build``.
 """
+
 import argparse
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tarfile
 import tempfile
+from pathlib import Path
 
 
 def check(archive: Path) -> None:
@@ -18,10 +19,19 @@ def check(archive: Path) -> None:
         root = Path(directory)
         with tarfile.open(archive) as source:
             source.extractall(root, filter="data")
-        checkout, = root.iterdir()
-        env = {**os.environ, "PYTHONPATH": str(checkout / "src"),
-               "VIDEO2TENHOU_HOME": str(checkout / "local-data"), "PYTHONUTF8": "1"}
-        subprocess.run([sys.executable, "-m", "pytest", "-q", "-ra"], cwd=checkout, env=env, check=True)
+        (checkout,) = root.iterdir()
+        env = {
+            **os.environ,
+            "PYTHONPATH": str(checkout / "src"),
+            "VIDEO2TENHOU_HOME": str(checkout / "local-data"),
+            "PYTHONUTF8": "1",
+        }
+        subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-ra"],
+            cwd=checkout,
+            env=env,
+            check=True,
+        )
 
 
 def main() -> None:

@@ -7,7 +7,6 @@ the video or a developer's personal labels. The remaining training annotations
 stay in the ignored local `labels/` directory.
 
 `week_11_calib.json` records the second broadcast's different camera placement.
-The two JPEGs exercise real score/round parsing, including negative scores.
 Fixtures are test inputs, not writable project state or a model training corpus.
 Serialized solver inputs use the current model schema. Removed metadata is
 deleted from fixtures rather than handled by compatibility code; tile evidence,

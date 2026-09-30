@@ -5,7 +5,7 @@ conversion. Commands and timing interpretation are in [Performance](PERFORMANCE.
 
 | Workload | What to retain | Acceptance checks |
 |---|---|---|
-| Header scan | Intervals with score changes, seat changes and unreadable overlays | Identical fields, missing readings and checksums |
+| Table timing | Complete games, table clearings, empty spans and occluded ponds | Hand boundaries, hand count and alignment to site records |
 | Region recognition | Every camera, empty regions, occlusion, sideways tiles and red fives | Box geometry, crop pixels, probabilities, roles and retained observations |
 | Reconstruction | Complete hand evidence, result record and saved answers | Draw/discard order, calls, tile inventory, confidence bounds and legal replay |
 | Complete recording | Video, geometry, model/runtime identities, initial caches and answers | Stage times, exports, scores and independent human annotations |

@@ -1,7 +1,9 @@
 """Shared source provenance for pixel-derived caches."""
+
 from __future__ import annotations
 
 from pathlib import Path
+
 from .files import sha256_file
 
 _SOURCE_CACHE: dict[tuple, str] = {}
