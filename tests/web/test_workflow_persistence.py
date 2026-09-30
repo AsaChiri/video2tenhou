@@ -5,7 +5,7 @@
 
 import ctypes
 import json
-import os
+import sys
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -94,6 +94,12 @@ def test_failed_admission_keeps_manifest_and_allows_retry(
         reopened.close()
 
 
+class WindowsPermissionError(PermissionError):
+    """Simulate a Windows replacement error on every test platform."""
+
+    winerror: int = 5
+
+
 def test_persistent_windows_denial_is_bounded_and_retryable(
     project: "tuple[Workspace, str, Path, list[list[str]]]",
     monkeypatch: "pytest.MonkeyPatch",
@@ -107,9 +113,8 @@ def test_persistent_windows_denial_is_bounded_and_retryable(
     def replace(source: "Path", target: "Path") -> "Path":
         if target == path:
             attempts.append(True)
-            error = PermissionError("persistent replacement denial")
-            error.winerror = 5
-            raise error
+            msg = "persistent replacement denial"
+            raise WindowsPermissionError(msg)
         return original(source, target)
 
     with monkeypatch.context() as patch:
@@ -126,12 +131,13 @@ def test_persistent_windows_denial_is_bounded_and_retryable(
     assert workspace.snapshot(key)["status"] == "ready"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows delete-sharing semantics")
 def test_real_windows_reader_contention_recovers_before_launch(
     project: "tuple[Workspace, str, Path, list[list[str]]]",
     monkeypatch: "pytest.MonkeyPatch",
 ) -> None:
     """Verify real windows reader contention recovers before launch."""
+    if sys.platform != "win32":
+        pytest.skip("Windows delete-sharing semantics")
     workspace, key, path, commands = project
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = [

@@ -3,7 +3,6 @@
 
 """Real process lifecycle coverage without models, videos or external services."""
 
-import os
 import queue
 import subprocess
 import sys
@@ -172,11 +171,12 @@ def test_shutdown_unblocks_another_threads_capture() -> None:
         worker.join(timeout=5)
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows job assignment")
 def test_assignment_failure_stops_suspended_child_before_it_runs(
     tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
 ) -> None:
     """Verify assignment failure stops suspended child before it runs."""
+    if sys.platform != "win32":
+        pytest.skip("Windows job assignment")
     owner = ProcessOwner()
     started = []
     original_popen = subprocess.Popen
