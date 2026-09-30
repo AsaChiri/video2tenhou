@@ -1,13 +1,29 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tile conservation, result constraints and solver confidence proofs."""
+
+from collections.abc import Callable
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
-from video2tenhou.engine import rules
+from tests.engine.factories import hand_decoder
+from video2tenhou.engine import rules, solver
+from video2tenhou.engine.decode import HandDecoder
+from video2tenhou.engine.review import draws_to_reread
 from video2tenhou.engine.solver import (
     TI,
     TILES,
+    DrawEvidence,
+    Facts,
     HandEvidence,
     HandModel,
+    HandRole,
     SeatTurn,
+    Solution,
+    drawn_end,
     hand_evidence,
     state_of,
 )
@@ -15,27 +31,31 @@ from video2tenhou.train.data import CLASS_INDEX, CLASSES
 
 
 @pytest.mark.parametrize(
-    "optimal,bound,expected", [(False, 12.0, 2.0), (False, 8.0, 0.0), (True, 12.0, 5.0)]
+    ("optimal", "bound", "expected"),
+    [(False, 12.0, 2.0), (False, 8.0, 0.0), (True, 12.0, 5.0)],
 )
 def test_timeout_margin_uses_certified_bound_not_candidate_cost(
-    monkeypatch, optimal, bound, expected
-):
+    *, monkeypatch: "pytest.MonkeyPatch", optimal: bool, bound: float, expected: float
+) -> None:
     """A poor candidate at timeout is no proof that the chosen draw is certain."""
-    from types import SimpleNamespace
-
-    from video2tenhou.engine import solver
 
     class TimedSolver:
-        def __init__(self):
+        def __init__(self) -> None:
             self.parameters = SimpleNamespace()
 
-        def Solve(self, model, callback=None):
+        def solve(
+            self,
+            model: "solver.cp_model.CpModel",
+            callback: "solver.cp_model.CpSolverSolutionCallback | None" = None,
+        ) -> "solver.cp_model.CpSolverStatus":
             return solver.cp_model.OPTIMAL if optimal else solver.cp_model.FEASIBLE
 
-        def ObjectiveValue(self):
+        @property
+        def objective_value(self) -> "float":
             return 15.0 * solver.SCALE**2
 
-        def BestObjectiveBound(self):
+        @property
+        def best_objective_bound(self) -> "float":
             return bound * solver.SCALE**2
 
     monkeypatch.setattr(solver.cp_model, "CpSolver", TimedSolver)
@@ -48,23 +68,26 @@ def test_timeout_margin_uses_certified_bound_not_candidate_cost(
 
 
 @pytest.mark.parametrize(
-    "status,expected", [("UNKNOWN", 0.0), ("INFEASIBLE", float("inf"))]
+    ("status", "expected"), [("UNKNOWN", 0.0), ("INFEASIBLE", float("inf"))]
 )
 def test_counterfactual_without_candidate_has_conservative_acquisition_gap(
-    monkeypatch, status, expected
-):
-    from types import SimpleNamespace
-
-    from video2tenhou.engine import solver
+    monkeypatch: "pytest.MonkeyPatch", status: str, expected: "float"
+) -> None:
+    """Verify counterfactual without candidate has conservative acquisition gap."""
 
     class NoCandidate:
-        def __init__(self):
+        def __init__(self) -> None:
             self.parameters = SimpleNamespace()
 
-        def Solve(self, model, callback=None):
+        def solve(
+            self,
+            model: "solver.cp_model.CpModel",
+            callback: "solver.cp_model.CpSolverSolutionCallback | None" = None,
+        ) -> "solver.cp_model.CpSolverStatus":
             return getattr(solver.cp_model, status)
 
-        def BestObjectiveBound(self):
+        @property
+        def best_objective_bound(self) -> float:
             return 0.0
 
     monkeypatch.setattr(solver.cp_model, "CpSolver", NoCandidate)
@@ -77,23 +100,28 @@ def test_counterfactual_without_candidate_has_conservative_acquisition_gap(
     )
 
 
-def test_confidence_search_stops_only_on_certified_bound_above_threshold(monkeypatch):
-    from types import SimpleNamespace
-
-    from video2tenhou.engine import solver
-
+def test_confidence_search_stops_only_on_certified_bound_above_threshold(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """Verify confidence search stops only on certified bound above threshold."""
     instances = []
 
     class ProofSolver:
-        def __init__(self):
+        best_bound_callback: Callable[[float], None]
+
+        def __init__(self) -> None:
             self.parameters = SimpleNamespace()
             self.stopped = False
             instances.append(self)
 
-        def StopSearch(self):
+        def stop_search(self) -> None:
             self.stopped = True
 
-        def Solve(self, model, callback=None):
+        def solve(
+            self,
+            model: "solver.cp_model.CpModel",
+            callback: "solver.cp_model.CpSolverSolutionCallback | None" = None,
+        ) -> "solver.cp_model.CpSolverStatus":
             # A poor incumbent would not justify stopping. A bound on the
             # inclusive review boundary is insufficient as well.
             self.best_bound_callback(10.5 * solver.SCALE**2)
@@ -102,7 +130,8 @@ def test_confidence_search_stops_only_on_certified_bound_above_threshold(monkeyp
             assert self.stopped
             return solver.cp_model.UNKNOWN
 
-        def BestObjectiveBound(self):
+        @property
+        def best_objective_bound(self) -> "float":
             return 10.5001 * solver.SCALE**2
 
     monkeypatch.setattr(solver.cp_model, "CpSolver", ProofSolver)
@@ -110,12 +139,12 @@ def test_confidence_search_stops_only_on_certified_bound_above_threshold(monkeyp
     hint = ({s: [0] * len(TILES) for s in rules.SEATS}, {})
     margin, alternative, gap = model._resolve(hint, 10, workers=1)
     assert margin == pytest.approx(0.5001)
-    assert alternative is None and gap is None
+    assert alternative is None
+    assert gap is None
 
 
-def test_variable_discard_is_certified_even_when_raw_reading_is_kept():
-    from video2tenhou.engine.solver import Facts
-
+def test_variable_discard_is_certified_even_when_raw_reading_is_kept() -> None:
+    """Verify variable discard is certified even when raw reading is kept."""
     turns = {s: [] for s in rules.SEATS}
     p = np.zeros(len(TILES))
     p[TI["1m"]], p[TI["2m"]] = 0.51, 0.49
@@ -138,11 +167,15 @@ def test_variable_discard_is_certified_even_when_raw_reading_is_kept():
         "6z",
     ]
     model.facts.haipai["S"] = tiles
-    after_second = tiles + ["3m"]
+    after_second = [*tiles, "3m"]
     after_second.remove("2m")
     # The hand view almost offsets the penalty for choosing the second pond
     # reading: raw1m remains best, but alternative2m is only .01 more costly.
-    model.hand_ev = [HandEvidence("S", 0, False, counts(after_second), 0.76, 11, 12)]
+    model.hand_ev = [
+        HandEvidence(
+            "S", 0, after_draw=False, e=counts(after_second), weight=0.76, t0=11, t1=12
+        )
+    ]
     first = model.solve(margins=False, workers=1)
     assert first.ok
     model.facts.haipai.update(first.haipai)
@@ -154,7 +187,7 @@ def test_variable_discard_is_certified_even_when_raw_reading_is_kept():
 
 
 @pytest.mark.parametrize(
-    "status,bound,expected",
+    ("status", "bound", "expected"),
     [
         ("UNKNOWN", 12.0, 2.0),
         ("UNKNOWN", 8.0, 0.0),
@@ -163,23 +196,25 @@ def test_variable_discard_is_certified_even_when_raw_reading_is_kept():
     ],
 )
 def test_candidate_free_search_retains_only_certified_bounds(
-    monkeypatch, status, bound, expected
-):
-    from types import SimpleNamespace
-
-    from video2tenhou.engine import solver
-    from video2tenhou.engine.review import draws_to_reread
+    monkeypatch: "pytest.MonkeyPatch", status: str, bound: "float", expected: float
+) -> None:
+    """Verify candidate free search retains only certified bounds."""
 
     class NoCandidate:
         parameters = SimpleNamespace()
 
-        def Solve(self, model, callback=None):
+        def solve(
+            self,
+            model: "solver.cp_model.CpModel",
+            callback: "solver.cp_model.CpSolverSolutionCallback | None" = None,
+        ) -> "solver.cp_model.CpSolverStatus":
             return getattr(solver.cp_model, status)
 
-        def BestObjectiveBound(self):
+        @property
+        def best_objective_bound(self) -> "float":
             return bound * solver.SCALE**2
 
-        def ResponseStats(self):
+        def response_stats(self) -> str:
             return "invalid test model"
 
     monkeypatch.setattr(solver.cp_model, "CpSolver", NoCandidate)
@@ -204,7 +239,7 @@ def test_candidate_free_search_retains_only_certified_bounds(
 
 
 @pytest.mark.parametrize(
-    "status,optimal,needs_review",
+    ("status", "optimal", "needs_review"),
     [
         ("feasible", False, False),
         ("repaired", False, False),
@@ -214,15 +249,10 @@ def test_candidate_free_search_retains_only_certified_bounds(
     ],
 )
 def test_incomplete_legal_reconstruction_stays_provisional(
-    status, optimal, needs_review
-):
+    *, status: str, optimal: bool, needs_review: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Repair must not hide a timed-out search or mislabel a legal log as a conflict."""
-    from types import SimpleNamespace
-
-    from video2tenhou.engine.decode import HandDecoder
-    from video2tenhou.engine.solver import Solution
-
-    decoder = SimpleNamespace(
+    decoder = hand_decoder(
         sol=Solution(status, 1.0, {}, {}, {}, optimal=optimal),
         items=[],
         turns=[],
@@ -231,7 +261,7 @@ def test_incomplete_legal_reconstruction_stays_provisional(
     for stage in (
         "window",
         "discards",
-        "calls",
+        "anchor_calls",
         "indicators",
         "meld_facts",
         "turn_sequence",
@@ -245,7 +275,7 @@ def test_incomplete_legal_reconstruction_stays_provisional(
         "unseen_tiles",
     ):
         setattr(decoder, stage, lambda: None)
-    decoder.output = lambda: decoder.items
+    monkeypatch.setattr(decoder, "output", lambda: decoder.items)
     items = HandDecoder.run(decoder)
     assert [item["kind"] for item in items] == (
         ["solver_incomplete"] if needs_review else []
@@ -254,14 +284,16 @@ def test_incomplete_legal_reconstruction_stays_provisional(
     assert decoder.sol.optimal == optimal
 
 
-def counts(tiles):
+def counts(tiles: "list[str]") -> "np.ndarray":
+    """Count tile tokens in the solver's red-five-aware vocabulary."""
     e = np.zeros(len(TILES))
     for t in tiles:
         e[TI[t]] += 1
     return e
 
 
-def slot_dict(tile):
+def slot_dict(tile: "str") -> "dict":
+    """Create a normalized posterior concentrated on one tile."""
     p = np.full(len(CLASSES), 0.001)
     p[CLASS_INDEX[tile]] = 0.95
     p /= p.sum()
@@ -277,7 +309,8 @@ def slot_dict(tile):
     }
 
 
-def obs(t0, t1, tiles):
+def obs(t0: "float", t1: "float", tiles: "list[str]") -> "dict":
+    """Create a timed observation from the supplied synthetic tile evidence."""
     return {
         "region": "hand:TL",
         "t0": t0,
@@ -291,8 +324,9 @@ def obs(t0, t1, tiles):
     }
 
 
-def test_solver_recovers_draws_from_perfect_states():
+def test_solver_recovers_draws_from_perfect_states() -> None:
     # one non-dealer seat, three turns; the other seats have no turns and no evidence
+    """Verify solver recovers draws from perfect states."""
     haipai = [
         "1m",
         "2m",
@@ -319,10 +353,22 @@ def test_solver_recovers_draws_from_perfect_states():
         hand.remove(di)
         states.append(list(hand))
     model = HandModel("E", turns, ["5z"])
-    model.hand_ev.append(HandEvidence("S", -1, False, counts(haipai), 1.0, 0, 5))
+    model.hand_ev.append(
+        HandEvidence(
+            "S", -1, after_draw=False, e=counts(haipai), weight=1.0, t0=0, t1=5
+        )
+    )
     for j, st in enumerate(states):
         model.hand_ev.append(
-            HandEvidence("S", j, False, counts(st), 1.0, 100 * j + 30, 100 * j + 90)
+            HandEvidence(
+                "S",
+                j,
+                after_draw=False,
+                e=counts(st),
+                weight=1.0,
+                t0=100 * j + 30,
+                t1=100 * j + 90,
+            )
         )
     sol = model.solve(time_limit=10, margins=True)
     assert sol.status in ("optimal", "feasible")
@@ -331,7 +377,8 @@ def test_solver_recovers_draws_from_perfect_states():
     assert all(m > 0 for m in sol.margins.values())
 
 
-def test_state_mapping_and_direct_draw_evidence():
+def test_state_mapping_and_direct_draw_evidence() -> None:
+    """Verify state mapping and direct draw evidence."""
     st = [SeatTurn(0, "draw", "6z", 10, 20), SeatTurn(1, "draw", "9m", 110, 120)]
     assert state_of(st, 0, 5) == -1
     assert state_of(st, 25, 60) == 0
@@ -365,19 +412,19 @@ def test_state_mapping_and_direct_draw_evidence():
             "2z",
         ],
     )
-    hev, dev, habit = hand_evidence("S", st, [o13, o14], {}, dealer=False)
-    assert [(e.j, e.after_draw) for e in hev] == [(0, False), (0, True)]
-    assert (
-        len(dev) == 1
-        and dev[0].j == 1
-        and TILES[int(np.argmax(dev[0].p))] == "2z"
-        and dev[0].weight > 1.0
+    hev, dev, habit = hand_evidence(
+        "S", st, [o13, o14], {}, role=HandRole(dealer=False)
     )
+    assert [(e.j, e.after_draw) for e in hev] == [(0, False), (0, True)]
+    assert len(dev) == 1
+    assert dev[0].j == 1
+    assert TILES[int(np.argmax(dev[0].p))] == "2z"
+    assert dev[0].weight > 1.0
     assert habit == (0, 1)
 
 
-def test_oversized_row_cannot_draw_before_the_preceding_players_discard():
-    """A detector's extra tile before the next legal draw remains resting-state evidence."""
+def test_oversized_row_cannot_draw_before_the_preceding_players_discard() -> None:
+    """Keep extra detections before a legal draw as resting-state evidence."""
     tiles = [
         "1m",
         "2m",
@@ -397,22 +444,26 @@ def test_oversized_row_cannot_draw_before_the_preceding_players_discard():
         SeatTurn(0, "draw", "6z", 10, 20),
         SeatTurn(1, "draw", "9m", 110, 120, t_draw_min=100),
     ]
-    early = obs(80, 85, tiles + ["2z"])
-    oversized = obs(90, 95, tiles + ["2z", "3z"])
-    timely = obs(105, 108, tiles + ["2z"])
+    early = obs(80, 85, [*tiles, "2z"])
+    oversized = obs(90, 95, [*tiles, "2z", "3z"])
+    timely = obs(105, 108, [*tiles, "2z"])
     hev, dev, _ = hand_evidence(
-        "S", turns, [early, oversized, timely], {}, dealer=False
+        "S", turns, [early, oversized, timely], {}, role=HandRole(dealer=False)
     )
     assert len(hev) == 2  # do not admit impossible rows the existing mapper excluded
-    assert hev[0].j == 0 and not hev[0].after_draw and hev[0].subset
-    assert hev[1].j == 0 and hev[1].after_draw and not hev[1].subset
-    assert dev and all(d.j == 1 for d in dev)
+    assert hev[0].j == 0
+    assert not hev[0].after_draw
+    assert hev[0].subset
+    assert hev[1].j == 0
+    assert hev[1].after_draw
+    assert not hev[1].subset
+    assert dev
+    assert all(d.j == 1 for d in dev)
     assert sum(d.weight for d in dev) < 2.0  # only the timely row names an end
 
 
-def test_drawn_end_needs_the_rest_to_match_and_learns_the_habit():
-    from video2tenhou.engine.solver import drawn_end
-
+def test_drawn_end_needs_the_rest_to_match_and_learns_the_habit() -> None:
+    """Verify drawn end needs the rest to match and learns the habit."""
     thirteen = [
         "1m",
         "2m",
@@ -430,17 +481,21 @@ def test_drawn_end_needs_the_rest_to_match_and_learns_the_habit():
     ]
     ref = [obs(0, 1, thirteen)["slots"][i]["p"] for i in range(13)]
     # the player did not sort: the rest matches as a multiset, not by position
-    row = obs(0, 1, ["2z"] + thirteen[::-1])["slots"]
+    row = obs(0, 1, ["2z", *thirteen[::-1]])["slots"]
     assert drawn_end(row, ref, None) == [("L", 2.0)]
-    # a reference row of another state (four tiles differ) names nothing: the habit weighs the ends
-    other = obs(0, 1, ["5z", "6z", "7z", "2p"] + thirteen[4:] + ["2z"])["slots"]
+    # a reference row of another state (four tiles differ) names nothing: the habit
+    # weighs the ends
+    other = obs(0, 1, ["5z", "6z", "7z", "2p", *thirteen[4:], "2z"])["slots"]
     weights = dict(drawn_end(other, ref, (0, 9)))
     assert weights["R"] > 5 * weights["L"]
 
 
-def test_repair_re_reads_a_discard_but_not_one_a_call_took():
-    """A discard the hand cannot hold is re-read by repair, at the cost of its posterior; a discard a call took
-    was read by the meld camera too, so repair leaves it and the hand stays illegal (a contradiction elsewhere).
+def test_repair_re_reads_a_discard_but_not_one_a_call_took() -> None:
+    """Verify repair re reads a discard but not one a call took.
+
+    A discard the hand cannot hold is re-read by repair, at the cost of its posterior; a
+    discard a call took was read by the meld camera too, so repair leaves it and the
+    hand stays illegal (a contradiction elsewhere).
     """
     haipai = [
         "1m",
@@ -472,12 +527,16 @@ def test_repair_re_reads_a_discard_but_not_one_a_call_took():
         if taken:
             assert not sol.ok
         else:
-            assert sol.ok and sol.discards[("S", 0)] in haipai + ["9m"]
+            assert sol.ok
+            assert sol.discards[("S", 0)] in [*haipai, "9m"]
 
 
-def test_a_forbidden_hand_gives_the_next_best_reconstruction():
-    """The second VOD's hand 2: the views split one tile between 5s and 8s; the cheaper reading scored below the
-    site, so the winner's hand is forbidden and the next best, as the reveal read it, is found.
+def test_a_forbidden_hand_gives_the_next_best_reconstruction() -> None:
+    """Verify a forbidden hand gives the next best reconstruction.
+
+    The second VOD's hand 2: the views split one tile between 5s and 8s; the cheaper
+    reading scored below the site, so the winner's hand is forbidden and the next best,
+    as the reveal read it, is found.
     """
     haipai = [
         "1m",
@@ -503,19 +562,23 @@ def test_a_forbidden_hand_gives_the_next_best_reconstruction():
         0.6,
         0.4,
     )  # the draw: 8s read a little better than 5s
-    from video2tenhou.engine.solver import DrawEvidence
 
     model.draw_ev.append(DrawEvidence("S", 0, ambiguous, 1.0))
     best = model.solve(time_limit=10, margins=False)
     assert best.draws[("S", 0)] == "8s"
     model.forbidden_hands.append(("S", 0, sorted(best.hands[("S", 0)])))
     nxt = model.solve(time_limit=10, margins=False)
-    assert nxt.ok and nxt.draws[("S", 0)] == "5s" and nxt.objective >= best.objective
+    assert nxt.ok
+    assert nxt.draws[("S", 0)] == "5s"
+    assert nxt.objective >= best.objective
 
 
-def test_a_bound_hand_holds_through_the_solve():
-    """Week 11 hand 3: the hand the site's score required must survive the solve that follows it (a time-limited
-    solve returned another of equal cost). A bound state fixes the draws that bring it.
+def test_a_bound_hand_holds_through_the_solve() -> None:
+    """Verify a bound hand holds through the solve.
+
+    Week 11 hand 3: the hand the site's score required must survive the solve that
+    follows it (a time-limited solve returned another of equal cost). A bound state
+    fixes the draws that bring it.
     """
     haipai = [
         "1m",
@@ -538,12 +601,11 @@ def test_a_bound_hand_holds_through_the_solve():
     model.facts.haipai["S"] = list(haipai)
     ambiguous = np.zeros(len(TILES))
     ambiguous[TI["8s"]], ambiguous[TI["5s"]] = 0.6, 0.4
-    from video2tenhou.engine.solver import DrawEvidence
 
     model.draw_ev.append(DrawEvidence("S", 0, ambiguous, 1.0))
     want = sorted([t for t in haipai if t != "9m"] + ["5s"])
     model.bound_hands = [("S", 0, want)]
     sol = model.solve(time_limit=10, margins=False)
-    assert (
-        sol.ok and sol.draws[("S", 0)] == "5s" and sorted(sol.hands[("S", 0)]) == want
-    )
+    assert sol.ok
+    assert sol.draws[("S", 0)] == "5s"
+    assert sorted(sol.hands[("S", 0)]) == want

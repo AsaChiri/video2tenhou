@@ -31,9 +31,13 @@ than silently changing their meaning.
 | `engine.hand`, `dense` | Hand/seat alignment and targeted closer readings. |
 | `engine.rules`, `solver`, `scoring` | Tile conservation, legal hand transitions and result checks. |
 | `engine.decode`, `review` | Stage orchestration, human constraints and unresolved evidence. |
+| `engine.confidence` | Shared threshold policy for solver certificates and review questions. |
 | `engine.assemble`, `tenhou6` | Encode exports and replay every hand before accepting it. |
 | `cli`, `tool` | Script interface and local browser project workflow. |
+| `logging_setup` | Command-scoped logging: progress on stderr, JSON results on stdout, and restoration of an embedding application's handlers. Library imports do not configure logging. |
+| `tool.server`, `http`, `review_routes` | Starlette ASGI routes, loopback and origin policy, bounded streaming and Uvicorn lifecycle. Blocking workspace/model operations run in worker threads. |
 | `tool.processes` | Coordinate subprocess shutdown using pywin32 Job Objects and psutil on Windows, and standard-library process groups on POSIX. |
+| `tool.rebuild`, `tool.check_calibration` | Named child-process commands for reconstruction and border checks, replacing inline interpreter scripts. |
 | `train`, `eval`, `benchmark` | Annotation datasets, training, held-out metrics and throughput comparisons. |
 
 Seats in engine evidence are wind letters for the current hand; site records
@@ -70,7 +74,7 @@ reports that a GPU is available.
 | torchvision | `>=0.21,<0.30` | Its dependency selects the matching Torch version. |
 | NumPy | `>=2.5.3,<3` | Starts at the tested numerical baseline; excludes a new major ABI. |
 | OpenCV | `>=5.0.0.93,<6` | Starts at the tested image-processing baseline; excludes a new major API. |
-| LibreYOLO | `>=1.5,<1.6` | Allows patch updates; the adapter accesses YOLO9 internals, so a new minor series needs validation. |
+| LibreYOLO | `>=1.5,<1.6` | Allows patch updates within the validated YOLO9 prediction series; validate inference and graph behavior before widening. |
 
 These ranges express installation compatibility, not a claim that every version
 has identical output or speed. Numerical runtime changes invalidate recognition
@@ -136,13 +140,18 @@ by file identity, size and timestamps; conversion stages verify content afresh.
 Evidence clips include source and geometry identities in their filenames, and
 calibration edits clear remembered border checks.
 
-`tool.server` scopes review APIs by project URL, streams upload bodies and accepts
-only local, same-origin writes with its application header. `tool.workflow`
+`tool.server` mounts `tool.review_routes` under each project URL. Review endpoints
+use individual Starlette routes, typed hand indices and method validation;
+there is no review path dispatcher. Synchronous evidence handlers run in the
+framework's worker pool. Review writes check job exclusion before reading the
+bounded body, then recheck under the workspace lock before applying a change.
+The server streams upload bodies and accepts only local, same-origin writes
+with its application header. `tool.workflow`
 serializes processing jobs and persists interrupted/failed states. Project
 manifests are atomically replaced; brief Windows reader contention has a bounded
 retry. A failed save retains the prior complete manifest and exposes a retryable,
 non-running job rather than claiming durable completion.
-`tool.server` handles calibrated evidence and answers; its revision endpoint
+`tool.review_routes` handles calibrated evidence and answers; its revision endpoint
 lets open review tabs notice externally rebuilt files without discarding
 unsaved edits. Model/encoder commands run through `ProcessOwner` so a server
 shutdown reaps owned descendants instead of leaving an invisible job running.
@@ -157,7 +166,7 @@ Install the locked development tools with `uv sync --frozen` and
 
 ```console
 uv run ruff format --check .
-uv run ruff check --ignore-noqa .
+uv run ruff check .
 uv run ty check --error-on-warning
 npm --prefix frontend run check
 ```
@@ -165,7 +174,35 @@ npm --prefix frontend run check
 Use `uv run ruff format .` and `npm --prefix frontend run format` to apply
 formatting. Python linting enables Ruff `ALL`; the only approved exceptions
 are `D203`, `D213`, and `COM812` (conflicting docstring/formatter conventions),
-and `S101` in tests (pytest assertions). The checks cover application code,
+and `S101`, `PLR2004`, and `SLF001` in tests (pytest assertions, literal numeric
+expectations, and direct checks of internal behavior, approved by the maintainer).
+`ARG001` and `ARG002` are approved in tests because test doubles retain unused
+named parameters to preserve keyword-call and protocol compatibility with the
+components they replace. Remove unnecessary fixtures and unused parameters
+from ordinary helpers instead of copying this pattern into application code.
+`S311` is also approved in `train/data.py` for non-security crop sampling.
+Classifier augmentation uses an owned NumPy generator and needs no RNG exception.
+`S603` is approved in `video.py`, `cli.py`, and `tool/processes.py` for
+application-owned subprocess argument lists with shell execution disabled.
+FFmpeg/FFprobe resolve to absolute executable paths; Python commands use the
+current interpreter. Keep user values as separate arguments and retain the
+process owner's launch-option validation.
+`S603` is also approved in `tools/check_dist.py`, `tools/profile_conversion.py`,
+and the video, reading, dense-prefetch and launcher tests for fixed tool commands
+and repository-owned fixtures. Launcher tests invoke the platform shell with
+the repository launcher and fixed test arguments.
+`S603` and `PLC0415` exceptions use rule-specific inline `noqa` annotations,
+so newly introduced calls and imports remain checked. `PLC0415` is approved
+for lazy runtime/model imports in `benchmark.py`, `cli.py`, `engine/decode.py`,
+`eval.py`, `perception/detector.py`, `tool/review_state.py`, and `tool/workflow.py`;
+runtime diagnosis in `perception/device.py`; training validation before model
+loading in `train/train_libreyolo.py`; and profiling after environment setup in
+`tools/profile_conversion.py`. Ordinary test and packaging imports stay at module
+scope. Ruff also checks for unused `noqa` annotations.
+LibreYOLO inference uses public `predict` and `release_graphs` APIs, with no
+private-library-access exception. Graph lifecycle tests cover shape changes,
+failures and serialized model access.
+The checks cover application code,
 training code, tools, tests, and frontend configuration. Do not add exclusions,
 rule suppressions, type-check skips, or failure baselines without maintainer
 approval. Python's existing inline type-ignore comments are not honored.
@@ -261,6 +298,12 @@ deployment](DETECTOR_BACKENDS.md) to evaluate the complete detector/classifier
 pair, export its inference state and retain matching metadata and provenance.
 Classifier training initializes ResNet18 from ImageNet; inference instead loads
 the complete local checkpoint. Retain classifier `meta.json` with its weights.
+New classifier training uses a dataset-owned NumPy `Generator` seeded with zero;
+metadata records the seed, bit generator and `numpy-generator-pcg64-v1`
+augmentation recipe. This changes the training sample sequence from older
+Python/global-NumPy augmentation. Validation performs no random augmentation,
+and existing checkpoints remain unchanged. Context refinement uses Python and
+PyTorch randomness, so it no longer seeds the unused global NumPy generator.
 Evaluate every view, especially hand cameras, before replacing release models.
 
 ## Release boundaries

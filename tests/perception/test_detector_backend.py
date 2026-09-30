@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Backend adapters preserve BGR/coordinate/class and semantic cache contracts."""
 
 import hashlib
@@ -7,14 +10,21 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
 from video2tenhou.perception import detector
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-def test_face_backend_keeps_one_class_bgr_and_rectangular_inputs(tmp_path, monkeypatch):
+
+def test_face_backend_keeps_one_class_bgr_and_rectangular_inputs(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> None:
+    """Verify face backend keeps one class bgr and rectangular inputs."""
     calls = []
     boxes = SimpleNamespace(
         xyxy=np.array([[1.0, 2.0, 30.0, 40.0]]), conf=np.array([0.8]), cls=np.array([0])
@@ -29,7 +39,7 @@ def test_face_backend_keeps_one_class_bgr_and_rectangular_inputs(tmp_path, monke
     monkeypatch.setitem(
         sys.modules,
         "libreyolo",
-        SimpleNamespace(LibreYOLO=lambda *args, **kwargs: model),
+        SimpleNamespace(LibreYOLO=lambda *_unused_args, **_unused_kwargs: model),
     )
     package_version = detector.metadata.version
     monkeypatch.setattr(
@@ -43,15 +53,21 @@ def test_face_backend_keeps_one_class_bgr_and_rectangular_inputs(tmp_path, monke
     image = np.zeros((100, 400, 3), np.uint8)
     result = current.predict(image)
     assert calls[0][0] is image
-    assert calls[0][1]["color_format"] == "bgr" and calls[0][1]["imgsz"] == (256, 1024)
-    assert result == [detector.Det((1.0, 2.0, 30.0, 40.0), 0.8, False)]
+    assert calls[0][1]["color_format"] == "bgr"
+    assert calls[0][1]["imgsz"] == (256, 1024)
+    assert result == [detector.Det((1.0, 2.0, 30.0, 40.0), 0.8, back=False)]
     first_id = current.id
     stat = weights.stat()
     weights.write_bytes(b"two")
     os.utime(weights, ns=(stat.st_atime_ns, stat.st_mtime_ns))
     assert detector.Detector(weights, backend="libreyolo", device="cpu").id != first_id
     assert (
-        detector.Detector(weights, backend="libreyolo", device="cpu", conf=0.2).id
+        detector.Detector(
+            weights,
+            backend="libreyolo",
+            device="cpu",
+            settings=detector.InferenceOptions(confidence=0.2),
+        ).id
         != current.id
     )
     current_id = detector.Detector(weights, backend="libreyolo", device="cpu").id
@@ -68,12 +84,17 @@ def test_face_backend_keeps_one_class_bgr_and_rectangular_inputs(tmp_path, monke
         current.predict(image)
 
 
-def test_face_backend_rejects_tile_identity_checkpoint(tmp_path, monkeypatch):
+def test_face_backend_rejects_tile_identity_checkpoint(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> None:
+    """Verify face backend rejects tile identity checkpoint."""
     monkeypatch.setitem(
         sys.modules,
         "libreyolo",
         SimpleNamespace(
-            LibreYOLO=lambda *args, **kwargs: SimpleNamespace(names={0: "1m"})
+            LibreYOLO=lambda *_unused_args, **_unused_kwargs: SimpleNamespace(
+                names={0: "1m"}
+            )
         ),
     )
     weights = tmp_path / "face.pt"
@@ -83,70 +104,77 @@ def test_face_backend_rejects_tile_identity_checkpoint(tmp_path, monkeypatch):
 
 
 def test_graph_metadata_override_and_effective_policy_invalidate_cache(
-    tmp_path, monkeypatch
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> None:
+    """Verify graph metadata override and effective policy invalidate cache."""
     monkeypatch.setattr(detector, "select_device", lambda device: device)
     calls = []
     model = SimpleNamespace(
         names={0: "face"},
         family="yolo9",
         size="s",
-        predict=lambda image, **kw: calls.append(kw) or SimpleNamespace(boxes=None),
+        predict=lambda _image, **kw: calls.append(kw) or SimpleNamespace(boxes=None),
     )
     monkeypatch.setitem(
-        sys.modules, "libreyolo", SimpleNamespace(LibreYOLO=lambda *a, **k: model)
+        sys.modules,
+        "libreyolo",
+        SimpleNamespace(LibreYOLO=lambda *_unused_a, **_unused_k: model),
     )
     monkeypatch.setattr(detector.metadata, "version", lambda _: "1.5.0")
     monkeypatch.setattr(
         detector, "runtime_signature", lambda device: {"device": str(device)}
     )
-    monkeypatch.setattr(
-        detector, "enable_owned_graphs", lambda model, **kw: kw["device"] == "cuda:0"
-    )
     weights = tmp_path / "weights.pt"
     weights.write_bytes(b"face")
     (tmp_path / "meta.json").write_text(
         json.dumps(
-            dict(
-                schema_version=1,
-                backend="libreyolo",
-                architecture="yolo9-s",
-                classes={"0": "face"},
-                weights_sha256=hashlib.sha256(b"face").hexdigest(),
-                inference=dict(cuda_graph=True),
-            )
+            {
+                "schema_version": 1,
+                "backend": "libreyolo",
+                "architecture": "yolo9-s",
+                "classes": {"0": "face"},
+                "weights_sha256": hashlib.sha256(b"face").hexdigest(),
+                "inference": {"cuda_graph": True},
+            }
         )
     )
     automatic = detector.Detector(weights, device="cuda:0")
-    eager = detector.Detector(weights, device="cuda:0", cuda_graph=False)
-    assert automatic.cuda_graph and not eager.cuda_graph and automatic.id != eager.id
-    monkeypatch.setattr(
-        automatic,
-        "_consume_prepared",
-        lambda prepared: calls.append({"cuda_graph": True}) or [],
+    eager = detector.Detector(
+        weights, device="cuda:0", settings=detector.InferenceOptions(cuda_graph=False)
     )
+    assert automatic.cuda_graph
+    assert not eager.cuda_graph
+    assert automatic.id != eager.id
     automatic.predict(np.zeros((10, 10, 3), np.uint8))
     eager.predict(np.zeros((10, 10, 3), np.uint8))
     assert [row["cuda_graph"] for row in calls] == [True, False]
     assert not detector.Detector(weights, device="cpu").cuda_graph
     monkeypatch.setattr(detector, "GRAPH_POLICY", "different-bounded-capture-policy")
     assert detector.Detector(weights, device="cuda:0").id != automatic.id
-    assert detector.Detector(weights, device="cuda:0", cuda_graph=False).id == eager.id
+    assert (
+        detector.Detector(
+            weights,
+            device="cuda:0",
+            settings=detector.InferenceOptions(cuda_graph=False),
+        ).id
+        == eager.id
+    )
 
 
 def test_shared_predictions_stay_locked_until_boxes_are_materialized(
-    tmp_path, monkeypatch
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> None:
+    """Verify shared predictions stay locked until boxes are materialized."""
     materializing, release, attempted, second_framework = (Event() for _ in range(4))
     calls = []
 
     class Coordinates:
-        def tolist(self):
+        def tolist(self) -> list:
             materializing.set()
             assert release.wait(2)
             return [[1.0, 2.0, 3.0, 4.0]]
 
-    def predict(image, **kwargs):
+    def predict(image: "np.ndarray", **_unused_kwargs: object) -> "SimpleNamespace":
         calls.append(image)
         if len(calls) > 1:
             second_framework.set()
@@ -157,7 +185,9 @@ def test_shared_predictions_stay_locked_until_boxes_are_materialized(
 
     model = SimpleNamespace(names={0: "face"}, family="yolo9", predict=predict)
     monkeypatch.setitem(
-        sys.modules, "libreyolo", SimpleNamespace(LibreYOLO=lambda *a, **kw: model)
+        sys.modules,
+        "libreyolo",
+        SimpleNamespace(LibreYOLO=lambda *_unused_a, **_unused_kw: model),
     )
     monkeypatch.setattr(detector.metadata, "version", lambda _: "1.5.0")
     monkeypatch.setattr(detector, "runtime_signature", lambda _: {})
@@ -166,7 +196,7 @@ def test_shared_predictions_stay_locked_until_boxes_are_materialized(
     current = detector.Detector(weights, backend="libreyolo", device="cpu")
     image = np.zeros((10, 10, 3), np.uint8)
 
-    def another_request():
+    def another_request() -> "list[detector.Det]":
         attempted.set()
         return current.predict(image)
 
@@ -180,17 +210,19 @@ def test_shared_predictions_stay_locked_until_boxes_are_materialized(
         finally:
             release.set()
         assert first.result(timeout=2) == second.result(timeout=2)
-        assert second_framework.is_set() and len(calls) == 2
+        assert second_framework.is_set()
+        assert len(calls) == 2
 
 
 def test_face_backend_rejects_other_families_with_different_preprocessing(
-    tmp_path, monkeypatch
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> None:
+    """Verify face backend rejects other families with different preprocessing."""
     monkeypatch.setitem(
         sys.modules,
         "libreyolo",
         SimpleNamespace(
-            LibreYOLO=lambda *args, **kwargs: SimpleNamespace(
+            LibreYOLO=lambda *_unused_args, **_unused_kwargs: SimpleNamespace(
                 names={0: "face"}, family="yolox"
             )
         ),
@@ -202,23 +234,26 @@ def test_face_backend_rejects_other_families_with_different_preprocessing(
 
 
 def test_metadata_selects_calibrated_defaults_and_explicit_overrides(
-    tmp_path, monkeypatch
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> None:
+    """Verify metadata selects calibrated defaults and explicit overrides."""
     model = SimpleNamespace(names={0: "face"}, family="yolo9", size="s")
     monkeypatch.setitem(
-        sys.modules, "libreyolo", SimpleNamespace(LibreYOLO=lambda *a, **k: model)
+        sys.modules,
+        "libreyolo",
+        SimpleNamespace(LibreYOLO=lambda *_unused_a, **_unused_k: model),
     )
-    monkeypatch.setattr(detector.metadata, "version", lambda name: "1.5.0")
+    monkeypatch.setattr(detector.metadata, "version", lambda _name: "1.5.0")
     weights = tmp_path / "weights.pt"
     weights.write_bytes(b"face checkpoint")
-    meta = dict(
-        schema_version=1,
-        backend="libreyolo",
-        architecture="yolo9-s",
-        classes={"0": "face"},
-        weights_sha256=hashlib.sha256(weights.read_bytes()).hexdigest(),
-        inference=dict(imgsz=1024, confidence=0.02, iou=0.5),
-    )
+    meta: dict = {
+        "schema_version": 1,
+        "backend": "libreyolo",
+        "architecture": "yolo9-s",
+        "classes": {"0": "face"},
+        "weights_sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
+        "inference": {"imgsz": 1024, "confidence": 0.02, "iou": 0.5},
+    }
     path = tmp_path / "meta.json"
     path.write_text(json.dumps(meta))
     automatic = detector.Detector(weights, device="cpu")
@@ -228,13 +263,23 @@ def test_metadata_selects_calibrated_defaults_and_explicit_overrides(
         1024,
         0.5,
     )
-    explicit = detector.Detector(weights, device="cpu", conf=0.15, imgsz=640)
+    explicit = detector.Detector(
+        weights,
+        device="cpu",
+        settings=detector.InferenceOptions(confidence=0.15, imgsz=640),
+    )
     assert (explicit.conf, explicit.imgsz, explicit.iou) == (0.15, 640, 0.5)
     assert explicit.id != automatic.id
+    meta = json.loads(path.read_text())
     meta["inference"]["confidence"] = "invalid metadata default"
     path.write_text(json.dumps(meta))
     # Explicit settings replace defaults before validation, as for valid metadata.
-    assert detector.Detector(weights, device="cpu", conf=0.15).conf == 0.15
+    assert (
+        detector.Detector(
+            weights, device="cpu", settings=detector.InferenceOptions(confidence=0.15)
+        ).conf
+        == 0.15
+    )
     with pytest.raises(ValueError, match="confidence"):
         detector.Detector(weights, device="cpu")
     meta["inference"]["confidence"] = 0.02
@@ -251,47 +296,59 @@ def test_metadata_selects_calibrated_defaults_and_explicit_overrides(
 
 
 @pytest.mark.parametrize(
-    "settings",
+    ("settings", "error"),
     [
-        {"conf": float("nan")},
-        {"conf": 0},
-        {"iou": 2},
-        {"imgsz": 0},
-        {"cuda_graph": "yes"},
+        ({"confidence": float("nan")}, ValueError),
+        ({"confidence": 0}, ValueError),
+        ({"iou": 2}, ValueError),
+        ({"imgsz": 0}, ValueError),
+        ({"cuda_graph": "yes"}, TypeError),
     ],
 )
-def test_invalid_inference_settings_fail_before_loading_backend(tmp_path, settings):
+def test_invalid_inference_settings_fail_before_loading_backend(
+    tmp_path: "Path", settings: "dict", error: type[Exception]
+) -> None:
+    """Verify invalid inference settings fail before loading backend."""
     weights = tmp_path / "weights.pt"
     weights.write_bytes(b"face checkpoint")
-    with pytest.raises(ValueError, match="Detector"):
-        detector.Detector(weights, backend="libreyolo", device="cpu", **settings)
+    with pytest.raises(error, match="Detector"):
+        detector.Detector(
+            weights,
+            backend="libreyolo",
+            device="cpu",
+            settings=detector.InferenceOptions(**settings),
+        )
 
 
-def test_default_face_backend_preserves_recognition_fingerprint(tmp_path, monkeypatch):
+def test_default_face_backend_preserves_recognition_fingerprint(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> None:
     """Recognition cache identity includes the exact supported inference contract."""
     model = SimpleNamespace(names={0: "face"}, family="yolo9")
     monkeypatch.setitem(
-        sys.modules, "libreyolo", SimpleNamespace(LibreYOLO=lambda *a, **kw: model)
+        sys.modules,
+        "libreyolo",
+        SimpleNamespace(LibreYOLO=lambda *_unused_a, **_unused_kw: model),
     )
     monkeypatch.setattr(detector.metadata, "version", lambda _: "1.5.0")
     monkeypatch.setattr(detector, "runtime_signature", lambda _: {"device": "cpu"})
     weights = tmp_path / "weights.pt"
     weights.write_bytes(b"face")
     current = detector.Detector(weights, device="cpu")
-    identity = dict(
-        weights_sha256=hashlib.sha256(b"face").hexdigest(),
-        backend="libreyolo",
-        version="1.5.0",
-        imgsz=1024,
-        conf=0.15,
-        iou=0.5,
-        color="BGR",
-        classes={0: "face"},
-        cuda_graph=False,
-        graph_policy=None,
-        runtime={"device": "cpu"},
-        preprocessing="libreyolo9-top-left-rect-stride32-v1",
-    )
+    identity = {
+        "weights_sha256": hashlib.sha256(b"face").hexdigest(),
+        "backend": "libreyolo",
+        "version": "1.5.0",
+        "imgsz": 1024,
+        "conf": 0.15,
+        "iou": 0.5,
+        "color": "BGR",
+        "classes": {0: "face"},
+        "cuda_graph": False,
+        "graph_policy": None,
+        "runtime": {"device": "cpu"},
+        "preprocessing": "libreyolo9-top-left-rect-stride32-v1",
+    }
     assert (
         current.id
         == "detector:"
@@ -304,9 +361,11 @@ def test_default_face_backend_preserves_recognition_fingerprint(tmp_path, monkey
     "error", [RuntimeError("weights load failed"), OSError("unreadable checkpoint")]
 )
 def test_backend_loading_error_preserves_original_exception(
-    tmp_path, monkeypatch, error
-):
-    def fail(*args, **kwargs):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", error: "Exception"
+) -> None:
+    """Verify backend loading error preserves original exception."""
+
+    def fail(*_unused_args: object, **_unused_kwargs: object) -> None:
         raise error
 
     monkeypatch.setitem(sys.modules, "libreyolo", SimpleNamespace(LibreYOLO=fail))

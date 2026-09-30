@@ -17,6 +17,10 @@ dependencies = [
     "libreyolo>=1.5,<1.6",
     "psutil>=7.2.2",
     "pywin32>=312; sys_platform == 'win32'",
+    "starlette>=1.7,<2",
+    "uvicorn>=0.54,<1",
+    "anyio>=4.15,<5",
+    "httpx>=0.28,<1",
 ]
 
 [project.scripts]
@@ -32,6 +36,7 @@ dev = [
     "pytest-cov>=6.0",
     "ruff>=0.16.9",
     "ty>=0.0.84",
+    "types-pywin32>=312.0.0.20260928",
 ]
 
 [build-system]
@@ -71,8 +76,11 @@ select = ["ALL"]
 ignore = ["D203", "D213", "COM812"]
 
 [tool.ruff.lint.per-file-ignores]
-# Approved by the maintainer: pytest uses assertions for failure introspection.
-"tests/**/*.py" = ["S101"]
+# Approved: pytest assertions, numeric expectations and checks of internal behavior.
+# Test doubles also retain unused named parameters to match real interfaces.
+"tests/**/*.py" = ["S101", "PLR2004", "SLF001", "ARG001", "ARG002"]
+# Approved by the maintainer: non-security training-image augmentation.
+"src/video2tenhou/train/data.py" = ["S311"]
 
 [tool.ty.terminal]
 error-on-warning = true

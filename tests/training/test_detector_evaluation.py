@@ -1,25 +1,58 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Evaluation must count wrong classes and missing annotations honestly."""
 
 import json
+from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 import pytest
 
-from video2tenhou.eval import eval_perception, evaluate_detector_images
+from tests.recognition import RecognitionStub
+from video2tenhou import eval as evaluation
+from video2tenhou import layout
+from video2tenhou.eval import (
+    PerceptionOptions,
+    eval_perception,
+    evaluate_detector_images,
+)
+from video2tenhou.perception import classifier, detector, reader
 from video2tenhou.perception.detector import Det
 from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
+from video2tenhou.train import data
+
+if TYPE_CHECKING:
+    from video2tenhou.perception.reader import Reading
 
 
-def test_class_mismatch_is_not_a_localization_true_positive(tmp_path):
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+@dataclass
+class FixedDetector(RecognitionStub):
+    """Return controlled detections for evaluator count and label checks."""
+
+    detections: list[Det] = field(default_factory=list)
+
+    def predict(self, _img: np.ndarray, /) -> list[Det]:
+        """Supply the same detections for the test's single image."""
+        return self.detections
+
+
+def test_class_mismatch_is_not_a_localization_true_positive(tmp_path: "Path") -> None:
+    """Verify class mismatch is not a localization true positive."""
     (tmp_path / "images/val").mkdir(parents=True)
     (tmp_path / "labels/val").mkdir(parents=True)
     cv2.imwrite(
         str(tmp_path / "images/val/hand_1.png"), np.zeros((10, 10, 3), np.uint8)
     )
     (tmp_path / "labels/val/hand_1.txt").write_text("0 .5 .5 .4 .4\n")
-    det = SimpleNamespace(predict=lambda image: [Det((3, 3, 7, 7), 0.9, True)])
+    det = FixedDetector("wrong-class", detections=[Det((3, 3, 7, 7), 0.9, back=True)])
     audit = tmp_path / "predictions.jsonl"
     metrics = evaluate_detector_images(det, tmp_path, predictions_path=audit)
     assert metrics["hand"]["precision"] == metrics["hand"]["recall"] == 0
@@ -27,13 +60,14 @@ def test_class_mismatch_is_not_a_localization_true_positive(tmp_path):
     assert json.loads(audit.read_text())["matches"] == []
 
 
-def test_missing_label_is_not_a_negative(tmp_path):
+def test_missing_label_is_not_a_negative(tmp_path: "Path") -> None:
+    """Verify missing label is not a negative."""
     (tmp_path / "images/val").mkdir(parents=True)
     (tmp_path / "labels/val").mkdir(parents=True)
     cv2.imwrite(
         str(tmp_path / "images/val/meld_1.png"), np.zeros((10, 10, 3), np.uint8)
     )
-    det = SimpleNamespace(predict=lambda image: [])
+    det = FixedDetector("empty")
     with pytest.raises(FileNotFoundError):
         evaluate_detector_images(det, tmp_path)
     (tmp_path / "labels/val/meld_1.txt").write_text("")
@@ -42,28 +76,25 @@ def test_missing_label_is_not_a_negative(tmp_path):
 
 @pytest.mark.parametrize("rejected", [False, True])
 def test_perception_counts_misses_and_reviewed_negatives(
-    tmp_path, monkeypatch, rejected
-):
-    from video2tenhou import layout
-    from video2tenhou.perception import classifier, detector, reader
-    from video2tenhou.train import data
-
+    *, tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", rejected: bool
+) -> None:
+    """Verify perception counts misses and reviewed negatives."""
     frame_dir = tmp_path / "recording" / "frames"
     frame_dir.mkdir(parents=True)
     cv2.imwrite(str(frame_dir / "1.000.png"), np.zeros((20, 40, 3), np.uint8))
     boxes = [
-        dict(tile="1m", quad=[[1, 1], [10, 1], [10, 15], [1, 15]]),
-        dict(tile="2m", quad=[[20, 1], [30, 1], [30, 15], [20, 15]]),
+        {"tile": "1m", "quad": [[1, 1], [10, 1], [10, 15], [1, 15]]},
+        {"tile": "2m", "quad": [[20, 1], [30, 1], [30, 15], [20, 15]]},
     ]
     labels = [
-        dict(t=1.0, kind="hand", corner="TL", boxes=boxes),
-        dict(t=1.0, kind="meld", corner="TL", boxes=[], melds=[]),
-        dict(
-            t=1.0,
-            kind="pond",
-            corner="TL",
-            boxes=[dict(boxes[0], role="tile", row=0, col=0)],
-        ),
+        {"t": 1.0, "kind": "hand", "corner": "TL", "boxes": boxes},
+        {"t": 1.0, "kind": "meld", "corner": "TL", "boxes": [], "melds": []},
+        {
+            "t": 1.0,
+            "kind": "pond",
+            "corner": "TL",
+            "boxes": [dict(boxes[0], role="tile", row=0, col=0)],
+        },
     ]
     monkeypatch.setattr(data, "load_labels", lambda _: labels)
     monkeypatch.setattr(data, "hand_table", lambda *_: [])
@@ -90,13 +121,19 @@ def test_perception_counts_misses_and_reviewed_negatives(
     probability = np.zeros(len(data.CLASSES))
     probability[0] = 1
 
-    def reading(_frame, _cal, name, *_models, **_kwargs):
-        found = [reader.Box((1, 1, 10, 15), 0.9, False, probability.copy())]
+    def reading(
+        _image: object, name: "str", *_models: object, **_kwargs: object
+    ) -> "Reading":
+        found = [reader.Box((1, 1, 10, 15), 0.9, sideways=False, p=probability.copy())]
         if name.startswith("hand"):
             # A revealed extra should not count as part of the annotated standing row.
             found.append(
                 reader.Box(
-                    (31, 1, 39, 15), 0.9, False, probability.copy(), role="extra"
+                    (31, 1, 39, 15),
+                    0.9,
+                    sideways=False,
+                    p=probability.copy(),
+                    role="extra",
                 )
             )
         if name.startswith("pond"):
@@ -109,16 +146,20 @@ def test_perception_counts_misses_and_reviewed_negatives(
     result = eval_perception(
         "recording.mp4",
         tmp_path,
-        predictions_path=audit,
-        classifier_dir=tmp_path / "candidate",
+        options=PerceptionOptions(
+            predictions_path=audit, classifier_dir=tmp_path / "candidate"
+        ),
     )
     assert classifier_inputs == [tmp_path / "candidate"]
-    assert detector_inputs == [dict(backend=None, conf=None)]
+    assert detector_inputs == [
+        {"backend": None, "settings": detector.InferenceOptions()}
+    ]
     assert result["hand"]["identity"] == 1
     assert result["hand"]["correct_of_gt"] == 0.5
     assert result["hand"]["usable_correct_of_gt"] == (0 if rejected else 0.5)
     assert result["hand"]["predicted"] == 1
-    assert result["meld"]["gt"] == 0 and result["meld"]["predicted"] == 1
+    assert result["meld"]["gt"] == 0
+    assert result["meld"]["predicted"] == 1
     assert result["pond"]["correct_of_gt"] == 1
     assert (
         result["pond"]["usable_correct_of_gt"]
@@ -132,9 +173,12 @@ def test_perception_counts_misses_and_reviewed_negatives(
     assert hand_audit["raw_reading"]["boxes"][1]["role"] == "extra"
 
 
-def test_observation_command_honors_explicit_workspace(tmp_path, monkeypatch, capsys):
-    from video2tenhou import eval as evaluation
-
+def test_observation_command_honors_explicit_workspace(
+    tmp_path: "Path",
+    monkeypatch: "pytest.MonkeyPatch",
+    capsys: "pytest.CaptureFixture[str]",
+) -> None:
+    """Verify observation command honors explicit workspace."""
     seen = []
     monkeypatch.setattr(
         evaluation,

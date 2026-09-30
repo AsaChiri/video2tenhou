@@ -1,35 +1,70 @@
-"""The dead-wall row: the dora and kan indicators, and the kans they imply (DESIGN.md 4.8 "Kans").
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
 
-The face-up indicators lie side by side in one row of the dead wall. The row can be pushed as a whole, but
-a face-up tile never turns back: the count only grows, by one per kan, and the order along the row does not
-change. So every view of a pond region is aligned with the row it has shown so far — by order and identity,
-never by position — and a view showing as many tiles as the row holds is a re-reading of each, in order,
-whatever it reads. Readings that disagree about one tile are a misrecognition to resolve, not a new tile.
+"""Track dead-wall indicators and reconcile their associated kans.
 
-Every indicator after the first was revealed by a kan. A kan the call anchor established and a new
-indicator explain each other; an indicator no kan explains is a kan the cameras missed, whose maker is the
-player who discards next. A kan with no indicator stands: the dead wall is often cut off by the edge of the
-overhead.
+The dead-wall row: the dora and kan indicators, and the kans they imply (DESIGN.md 4.8
+"Kans").
+
+The face-up indicators lie side by side in one row of the dead wall. The row can be
+pushed as a whole, but a face-up tile never turns back: the count only grows, by one per
+kan, and the order along the row does not change. So every view of a pond region is
+aligned with the row it has shown so far — by order and identity, never by position —
+and a view showing as many tiles as the row holds is a re-reading of each, in order,
+whatever it reads. Readings that disagree about one tile are a misrecognition to
+resolve, not a new tile.
+
+Every indicator after the first was revealed by a kan. A kan the call anchor established
+and a new indicator explain each other; an indicator no kan explains is a kan the
+cameras missed, whose maker is the player who discards next. A kan with no indicator
+stands: the dead wall is often cut off by the edge of the overhead.
 """
 
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..train.data import CLASSES
+from video2tenhou.train.data import CLASSES
+
 from . import rules
 from .hand import corner_of, in_window
 from .melds import POSITION, Call
-from .ponds import PondSlot
+from .turns import call_distance
+
+if TYPE_CHECKING:
+    from .ponds import PondSlot
+
+MIN_SHORT_ROW_VIEWS = 2
+UNREACHABLE_ALIGNMENT_COST = 1e9
+ALIGNMENT_SKIP_TRACK = 2
+MAX_SHORT_INDICATOR_ROW = 4
+ANKAN_FACE_COUNT = 2
+KAN_DISCARD_MATCH_WINDOW = 25
+
 
 MIN_VIEWS = 3  # a real indicator is seen in at least this many full views ...
-PERSIST = 0.5  # ... and in at least this share of the full views of its region after its first sighting
+# ... and in at least this share of the full views of its region after its first
+# sighting
+PERSIST = 0.5
 KAN_MATCH = (
     30.0  # s: a camera kan and a new indicator this close in time explain each other
 )
+
+
+@dataclass(frozen=True, kw_only=True)
+class KanEvidence:
+    """Pond, camera and ending evidence used to place unobserved kans."""
+
+    logs: dict[str, list[PondSlot]]
+    obs: dict
+    entry: dict
+    t0: float
+    problems: list[str]
+    tsumo_winner: str | None = None
 
 
 @dataclass
@@ -74,7 +109,11 @@ def _cos(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _distance(tr: _Track, s: dict) -> float:
-    """A small cost for a reading far from where the tile was last seen (0.3 at a tile width or more)."""
+    """Penalize readings far from the tile's last observed position.
+
+    A small cost for a reading far from where the tile was last seen (0.3 at a tile
+    width or more).
+    """
     box = s.get("xyxy")
     if tr.x is None or not box:
         return 0.0
@@ -82,23 +121,27 @@ def _distance(tr: _Track, s: dict) -> float:
 
 
 def _align(row: list[_Track], seen: list[dict]) -> list[int | None]:
-    """For each reading of a view (left to right), the index of its tile in the row, or None for a new tile.
+    """Match each observed box to its index in the indicator row.
 
-    A view showing as many tiles as the row has established (seen twice or more) re-reads each of them in
-    order; otherwise an order-preserving alignment by identity (a pair costs 2·(1 − cosine), a tile of the
-    row not shown 1.0, a new tile 1.2). Where identity cannot tell (a new tile reading like its neighbour),
-    nearness to where each tile was last seen does: the row is seldom pushed between two views.
+    For each reading of a view (left to right), the index of its tile in the row, or
+    None for a new tile.
+
+    A view showing as many tiles as the row has established (seen twice or more)
+    re-reads each of them in order; otherwise an order-preserving alignment by identity
+    (a pair costs 2·(1 - cosine), a tile of the row not shown 1.0, a new tile 1.2).
+    Where identity cannot tell (a new tile reading like its neighbour), nearness to
+    where each tile was last seen does: the row is seldom pushed between two views.
     """
-    est = [k for k, t in enumerate(row) if t.seen >= 2]
+    est = [k for k, t in enumerate(row) if t.seen >= MIN_SHORT_ROW_VIEWS]
     if est and len(seen) == len(est):
-        return est
+        return list(est)
     n, m = len(row), len(seen)
-    dp = np.full((n + 1, m + 1), 1e9)
+    dp = np.full((n + 1, m + 1), UNREACHABLE_ALIGNMENT_COST)
     back = np.zeros((n + 1, m + 1), np.int8)
     dp[0, 0] = 0.0
     for i in range(n + 1):
         for j in range(m + 1):
-            if dp[i, j] >= 1e9:
+            if dp[i, j] >= UNREACHABLE_ALIGNMENT_COST:
                 continue
             if i < n and j < m:
                 c = (
@@ -109,9 +152,14 @@ def _align(row: list[_Track], seen: list[dict]) -> list[int | None]:
                 if c < dp[i + 1, j + 1]:
                     dp[i + 1, j + 1], back[i + 1, j + 1] = c, 1
             if i < n and dp[i, j] + 1.0 < dp[i + 1, j]:
-                dp[i + 1, j], back[i + 1, j] = dp[i, j] + 1.0, 2
+                dp[i + 1, j], back[i + 1, j] = dp[i, j] + 1.0, ALIGNMENT_SKIP_TRACK
             if j < m and dp[i, j] + 1.2 < dp[i, j + 1]:
                 dp[i, j + 1], back[i, j + 1] = dp[i, j] + 1.2, 3
+    return _alignment_row(back, n, m)
+
+
+def _alignment_row(back: np.ndarray, n: int, m: int) -> list[int | None]:
+    """Trace matched indicator positions through the alignment decisions."""
     out: list[int | None] = [None] * m
     i, j = n, m
     while i > 0 or j > 0:
@@ -119,7 +167,7 @@ def _align(row: list[_Track], seen: list[dict]) -> list[int | None]:
         if b == 1:
             out[j - 1] = i - 1
             i, j = i - 1, j - 1
-        elif b == 2:
+        elif b == ALIGNMENT_SKIP_TRACK:
             i -= 1
         else:
             j -= 1
@@ -127,7 +175,11 @@ def _align(row: list[_Track], seen: list[dict]) -> list[int | None]:
 
 
 def _region_row(obs: list[dict]) -> tuple[list[_Track], list[float]]:
-    """The dead-wall row one pond region shows over the hand, and the start times of its full views."""
+    """Extract a region's dead-wall row and times of complete views.
+
+    The dead-wall row one pond region shows over the hand, and the start times of its
+    full views.
+    """
     row: list[_Track] = []
     views: list[float] = []
     prev_full: float | None = None
@@ -140,12 +192,12 @@ def _region_row(obs: list[dict]) -> tuple[list[_Track], list[float]]:
         )
         if seen:
             where = _align(row, seen)
-            # new tiles go into the row at the place the alignment gives them (after the matched tile before them)
+            # new tiles go into the row at the place the alignment gives them (after the
+            # matched tile before them)
             for j, s in enumerate(seen):
-                if where[j] is None:
-                    before = max(
-                        (where[q] for q in range(j) if where[q] is not None), default=-1
-                    )
+                position = where[j]
+                if position is None:
+                    before = max((w for w in where[:j] if w is not None), default=-1)
                     row.insert(
                         before + 1,
                         _Track(
@@ -160,8 +212,9 @@ def _region_row(obs: list[dict]) -> tuple[list[_Track], list[float]]:
                     where = [
                         w + 1 if (w is not None and w > before) else w for w in where
                     ]
-                    where[j] = before + 1
-                row[where[j]].add(s, o)
+                    position = before + 1
+                    where[j] = position
+                row[position].add(s, o)
         if not o.get("partial"):
             prev_full = o["t1"]
     return row, views
@@ -174,12 +227,15 @@ def indicator_row(
     last_discard: float | None = None,
     t_after: float = 0.0,
 ) -> list[dict]:
-    """The dora indicators of a hand in the order they were revealed: the first is the dora indicator, every
-    later one was revealed by a kan and carries its time. A tile is real when it persists (MIN_VIEWS full
-    views, and PERSIST of the full views of its region after its first sighting). The dead wall lies in one
-    pond region: the one whose row is seen best. A tile first seen after the last discard was not revealed by
-    a kan (nothing follows it), except within `t_after` s of it: a tsumo winner may have kanned after its last
-    discard and won on the rinshan draw.
+    """Track dora indicators in their order of revelation.
+
+    The dora indicators of a hand in the order they were revealed: the first is the dora
+    indicator, every later one was revealed by a kan and carries its time. A tile is
+    real when it persists (MIN_VIEWS full views, and PERSIST of the full views of its
+    region after its first sighting). The dead wall lies in one pond region: the one
+    whose row is seen best. A tile first seen after the last discard was not revealed by
+    a kan (nothing follows it), except within `t_after` s of it: a tsumo winner may have
+    kanned after its last discard and won on the rinshan draw.
     """
     rows = {}
     for region, obs in pond_obs.items():
@@ -191,7 +247,13 @@ def indicator_row(
             if (
                 after
                 and persistence >= PERSIST
-                and (tr.seen >= MIN_VIEWS or (tr.seen >= 2 and len(after) <= 4))
+                and (
+                    tr.seen >= MIN_VIEWS
+                    or (
+                        tr.seen >= MIN_SHORT_ROW_VIEWS
+                        and len(after) <= MAX_SHORT_INDICATOR_ROW
+                    )
+                )
             ):
                 real.append((tr, round(persistence, 2)))
         if real:
@@ -199,14 +261,15 @@ def indicator_row(
     if not rows:
         return []
     region = max(rows, key=lambda r: max(tr.seen for tr, _ in rows[r]))
-    out = []
+    out: list[dict] = []
     for tr, persistence in sorted(rows[region], key=lambda x: x[0].t_first):
         tile = tr.tile()
         p = tr.p.copy()
         for k in ("X", "none"):
             p[CLASSES.index(k)] = 0.0
         p = p / max(p.sum(), 1e-9)
-        # the readings disagree about this tile: a misrecognition, with the other reading as the alternative
+        # the readings disagree about this tile: a misrecognition, with the other
+        # reading as the alternative
         others = [
             (t, n)
             for t, n in tr.tops.most_common()
@@ -234,8 +297,11 @@ def indicator_row(
 
 
 def pair_groups(meld_obs: list[dict], t: float, tol: float = 40.0) -> list[list[str]]:
-    """Two identical face-up tiles alone in a group of a seat's meld camera near t: an ankan shows its two
-    middle tiles face up (the reader does not box the face-down ones). Most frequent first.
+    """Find isolated identical face-up pairs near a possible ankan.
+
+    Two identical face-up tiles alone in a group of a seat's meld camera near t: an
+    ankan shows its two middle tiles face up (the reader does not box the face-down
+    ones). Most frequent first.
     """
     kinds: Counter = Counter()
     tokens: dict[str, list[str]] = {}
@@ -247,7 +313,7 @@ def pair_groups(meld_obs: list[dict], t: float, tol: float = 40.0) -> list[list[
             groups[sl["key"][0]].append(sl)
         for g in groups.values():
             if (
-                len(g) == 2
+                len(g) == ANKAN_FACE_COUNT
                 and rules.plain(g[0]["tile"]) == rules.plain(g[1]["tile"])
                 and g[0]["tile"] not in ("X", "none")
             ):
@@ -258,26 +324,21 @@ def pair_groups(meld_obs: list[dict], t: float, tol: float = 40.0) -> list[list[
 
 
 def _claimed(sl: PondSlot, seat: str, calls: list[Call]) -> bool:
-    from .turns import _call_dist
-
-    return any(_call_dist(c, sl, seat) is not None for c in calls)
+    return any(call_distance(c, sl, seat) is not None for c in calls)
 
 
 def reconcile_kans(
-    inds: list[dict],
-    logs: dict[str, list[PondSlot]],
-    calls: list[Call],
-    obs: dict,
-    entry: dict,
-    t0: float,
-    problems: list[str],
-    tsumo_winner: str | None = None,
+    inds: list[dict], calls: list[Call], *, context: KanEvidence
 ) -> list[Call]:
-    """Every indicator after the first was revealed by a kan. A kan the call anchor established and an indicator
-    within KAN_MATCH s explain each other (the indicator then times the kan more tightly); an indicator no kan
-    explains is a kan the cameras missed, which is added. A kan with no indicator stands: the dead wall is often
-    cut off at the edge of the overhead. Returns the calls with the missed kans added.
+    """Match indicator revelations to anchored or previously unseen kans.
+
+    Every indicator after the first was revealed by a kan. A kan the call anchor
+    established and an indicator within KAN_MATCH s explain each other (the indicator
+    then times the kan more tightly); an indicator no kan explains is a kan the cameras
+    missed, which is added. A kan with no indicator stands: the dead wall is often cut
+    off at the edge of the overhead. Returns the calls with the missed kans added.
     """
+    t0, problems = context.t0, context.problems
     kans = sorted(
         (c for c in calls if c.type in ("kan", "ankan", "kakan")),
         key=lambda c: c.t_window[0],
@@ -289,9 +350,11 @@ def reconcile_kans(
         if t is None:
             continue  # named by the reviewer, never observed: no time to place a kan
         if t <= t0 + 3.0:
-            # visible from the first moment of play: a second reading of the wall, not revealed during the hand
+            # visible from the first moment of play: a second reading of the wall, not
+            # revealed during the hand
             problems.append(
-                f"indicator {ind['tile']} visible from the start of play: not a kan indicator"
+                f"indicator {ind['tile']} visible from the start of play: not a"
+                " kan indicator"
             )
             continue
         kan = next(
@@ -310,7 +373,9 @@ def reconcile_kans(
                 kan.t_window = (max(kan.t_window[0], min(t - 8.0, hi)), hi)
             continue
         c = _kan_the_cameras_missed(
-            ind, logs, calls + inferred, obs, entry, t0, problems, tsumo_winner
+            ind,
+            calls + inferred,
+            context=context,
         )
         if c is not None:
             c.anchor = "indicator"
@@ -319,22 +384,28 @@ def reconcile_kans(
 
 
 def _kan_the_cameras_missed(
-    ind: dict,
-    logs: dict[str, list[PondSlot]],
-    calls: list[Call],
-    obs: dict,
-    entry: dict,
-    t0: float,
-    problems: list[str],
-    tsumo_winner: str | None,
+    ind: dict, calls: list[Call], *, context: KanEvidence
 ) -> Call | None:
-    """The kan a new indicator reveals when no camera read it. The maker discards next: the first discard
-    sighted after the indicator's region was last seen without it (the rinshan draw is kept or discarded,
-    then the maker discards); a reviewer's kan-time fact names the maker outright.
+    """Infer a missing kan from a new indicator and subsequent discard.
+
+    The kan a new indicator reveals when no camera read it. The maker discards next: the
+    first discard sighted after the indicator's region was last seen without it (the
+    rinshan draw is kept or discarded, then the maker discards); a reviewer's kan-time
+    fact names the maker outright.
     """
+    logs, obs, entry, t0, problems, tsumo_winner = (
+        context.logs,
+        context.obs,
+        context.entry,
+        context.t0,
+        context.problems,
+        context.tsumo_winner,
+    )
     t = ind["t_first"]
     maker = ind.get("kan_maker")
-    after = ind.get("t_before") if ind.get("t_before") is not None else t - 12.0
+    after = ind.get("t_before")
+    if after is None:
+        after = t - 12.0
     nxt = min(
         (
             (sl.t_first, seat)
@@ -353,10 +424,12 @@ def _kan_the_cameras_missed(
         )  # no discard follows: the winner drew the rinshan tile and won
     else:
         problems.append(
-            f"indicator {ind['tile']} appeared at {t:.0f}s but no discard follows: kan not placed"
+            f"indicator {ind['tile']} appeared at {t:.0f}s but no discard "
+            "follows: kan not placed"
         )
         return None
-    # the kan happened after the maker's previous discard (a full rotation earlier) and before the indicator appeared
+    # the kan happened after the maker's previous discard (a full rotation earlier) and
+    # before the indicator appeared
     t_prev = max(
         (
             sl.t_first
@@ -373,7 +446,7 @@ def _kan_the_cameras_missed(
         for sl in sls
         if s2 != seat
         and sl.t_removed is not None
-        and abs(sl.t_removed - t) < 25
+        and abs(sl.t_removed - t) < KAN_DISCARD_MATCH_WINDOW
         and not _claimed(sl, s2, calls)
     ]
     if removed:
@@ -381,7 +454,8 @@ def _kan_the_cameras_missed(
         tile = sl.tile
         src = rules.relative(seat, s2)
         problems.append(
-            f"kan by {seat} at {t:.0f}s inferred from the new indicator {ind['tile']} (daiminkan on {s2}'s {tile})"
+            f"kan by {seat} at {t:.0f}s inferred from the new indicator "
+            f"{ind['tile']} (daiminkan on {s2}'s {tile})"
         )
         pos = POSITION["kan"][src]
         return Call(
@@ -390,8 +464,9 @@ def _kan_the_cameras_missed(
     pairs = pair_groups(obs.get(f"meld:{corner_of(entry, seat)}", []), t)
     if pairs:
         problems.append(
-            f"ankan of {rules.plain(pairs[0][0])} by {seat} at {t:.0f}s inferred from the new indicator "
-            f"{ind['tile']} and the pair in its meld camera"
+            f"ankan of {rules.plain(pairs[0][0])} by {seat} at {t:.0f}s "
+            f"inferred from the new indicator {ind['tile']} and the pair in its"
+            " meld camera"
         )
         return Call(
             seat,
@@ -414,14 +489,15 @@ def _kan_the_cameras_missed(
         pon = prior_pon[-1]
         tile = rules.plain(pon.tiles[0])
         problems.append(
-            f"kakan on the pon of {tile} by {seat} at {t:.0f}s inferred from the new indicator {ind['tile']}"
+            f"kakan on the pon of {tile} by {seat} at {t:.0f}s inferred from "
+            f"the new indicator {ind['tile']}"
         )
         return Call(
             seat,
             t,
             window,
             "kakan",
-            pon.tiles + [tile],
+            [*pon.tiles, tile],
             pon.called_pos,
             pon.source,
             pon.called_tile,
@@ -431,7 +507,8 @@ def _kan_the_cameras_missed(
             3,
         )
     problems.append(
-        f"a kan by {seat} at {t:.0f}s inferred from the new indicator {ind['tile']}; its tile is left to the solver"
+        f"a kan by {seat} at {t:.0f}s inferred from the new indicator "
+        f"{ind['tile']}; its tile is left to the solver"
     )
     return Call(
         seat, t, window, "ankan", ["?", "?", "X", "X"], None, None, None, [], 0.3, 0, 3

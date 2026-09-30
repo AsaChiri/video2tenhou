@@ -1,7 +1,10 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Profile the real convert command with bounded wall-time instrumentation.
 
-Usage: uv run python tools/profile_conversion.py --profile-output work/profile \
-    video.mp4 --game 123 --work work/cold --out out/cold
+Usage: uv run python tools/profile_conversion.py --profile-output work/profile
+video.mp4 --game 123 --work work/cold --out out/cold
 
 No caches are removed. The report records whether the recording's work/output
 directories were empty. Timings are inclusive and overlapping: never add nested
@@ -26,12 +29,26 @@ from contextlib import ExitStack, contextmanager
 from functools import wraps
 from importlib import metadata
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch as mock_patch
 
+import psutil
+
+from video2tenhou.commands import executable
 from video2tenhou.files import sha256_file
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator, Iterator
 
-def runtime_threads():
+    from ortools.sat.python.cp_model import (
+        CpModel,
+        CpSolver,
+        CpSolverSolutionCallback,
+        CpSolverStatus,
+    )
+
+
+def runtime_threads() -> dict[str, int]:
     """Read loaded libraries' effective thread counts without importing models.
 
     Libraries can change process-wide settings during model initialization;
@@ -57,7 +74,8 @@ class Recorder:
     A conversion decodes hands serially; its active hand also labels worker calls.
     """
 
-    def __init__(self, output: Path):
+    def __init__(self, output: Path) -> None:
+        """Open the event stream and initialize timing aggregates."""
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.stream = (self.output / "events.jsonl").open("x", encoding="utf-8")
@@ -67,7 +85,7 @@ class Recorder:
         self.active_hand = None
         self.active_stage = None
 
-    def event(self, kind, **data):
+    def event(self, kind: str, **data: object) -> None:
         """Write one atomic JSONL event with elapsed time and current thread ID."""
         with self.lock:
             self.stream.write(
@@ -85,21 +103,28 @@ class Recorder:
             )
             self.stream.flush()
 
-    def add(self, name, elapsed, *, hand=None, failed=False):
+    def add(
+        self,
+        name: str,
+        elapsed: float,
+        *,
+        hand: int | None = None,
+        failed: bool = False,
+    ) -> None:
         """Accumulate a completed call; failed calls retain elapsed time."""
         with self.lock:
             key = (name, hand, self.active_stage)
             row = self.totals.setdefault(
                 key,
-                dict(
-                    name=name,
-                    hand=hand,
-                    stage=self.active_stage,
-                    calls=0,
-                    seconds=0.0,
-                    maximum_seconds=0.0,
-                    failures=0,
-                ),
+                {
+                    "name": name,
+                    "hand": hand,
+                    "stage": self.active_stage,
+                    "calls": 0,
+                    "seconds": 0.0,
+                    "maximum_seconds": 0.0,
+                    "failures": 0,
+                },
             )
             row["calls"] += 1
             row["seconds"] += elapsed
@@ -107,8 +132,15 @@ class Recorder:
             row["failures"] += int(failed)
 
     @contextmanager
-    def span(self, name, *, progress=False, detail=None, record_threads=False):
-        """Measure a synchronous call without swallowing errors or changing its result."""
+    def span(
+        self,
+        name: str,
+        *,
+        progress: bool = False,
+        detail: object = None,
+        record_threads: bool = False,
+    ) -> Iterator[None]:
+        """Time a synchronous call while preserving its errors and result."""
         hand = self.active_hand
         start = time.perf_counter()
         failed = False
@@ -136,19 +168,29 @@ class Recorder:
                     **settings,
                 )
 
-    def wrap(
-        self, function, name, *, progress=False, hand_call=False, stage_call=False
-    ):
-        """Wrap ordinary functions; hand_call labels serial decode_hand and its workers."""
+    def wrap[**Parameters, Result](
+        self,
+        function: Callable[Parameters, Result],
+        name: str,
+        *,
+        progress: bool = False,
+        hand_call: bool = False,
+        stage_call: bool = False,
+    ) -> Callable[Parameters, Result]:
+        """Wrap functions, labeling serial hand calls and their workers."""
 
         @wraps(function)
-        def wrapped(*args, **kwargs):
+        def wrapped(*args: Parameters.args, **kwargs: Parameters.kwargs) -> Result:
             previous = self.active_hand
             previous_stage = self.active_stage
             if stage_call:
                 self.active_stage = name
             if hand_call:
-                self.active_hand = (args[0] if args else kwargs["entry"])["hand"]
+                entry = args[0] if args else kwargs["entry"]
+                if not isinstance(entry, dict):
+                    message = "A profiled hand call requires a hand entry object"
+                    raise TypeError(message)
+                self.active_hand = entry["hand"]
             try:
                 with self.span(name, progress=progress, record_threads=stage_call):
                     return function(*args, **kwargs)
@@ -160,11 +202,16 @@ class Recorder:
 
         return wrapped
 
-    def generator(self, function):
+    def generator[**Parameters, Item](
+        self,
+        function: Callable[Parameters, Generator[Item]],
+    ) -> Callable[Parameters, Generator[Item]]:
         """Time generator creation/next/close, excluding time spent by its consumer."""
 
         @wraps(function)
-        def wrapped(*args, **kwargs):
+        def wrapped(
+            *args: Parameters.args, **kwargs: Parameters.kwargs
+        ) -> Generator[Item]:
             iterator = None
             self.event(
                 "sample_start", hand=self.active_hand, arguments=args, keywords=kwargs
@@ -195,13 +242,13 @@ class Recorder:
                         break
                     yield value
             finally:
-                if iterator is not None and hasattr(iterator, "close"):
+                if iterator is not None:
                     with self.span("video.sample.close"):
                         iterator.close()
 
         return wrapped
 
-    def close(self):
+    def close(self) -> None:
         """Close event output after all workers and resource monitoring have stopped."""
         self.stream.close()
 
@@ -213,7 +260,8 @@ class Resources:
     samples. GPU metrics describe the device, including unrelated processes.
     """
 
-    def __init__(self, recorder):
+    def __init__(self, recorder: Recorder) -> None:
+        """Initialize resource sampling and its stoppable worker thread."""
         self.recorder = recorder
         self.stop = threading.Event()
         self.thread = threading.Thread(
@@ -224,92 +272,93 @@ class Resources:
         self.count = 0
         self.gpu_available = True
 
-    def _run(self):
-        try:
-            import psutil
-
-            parent = psutil.Process()
-        except ImportError:
-            parent = None
-            self.recorder.event(
-                "resource_warning",
-                message="psutil unavailable; process tree samples omitted",
-            )
+    def _run(self) -> None:
+        parent = psutil.Process()
         while not self.stop.is_set():
             row = {}
-            if parent is not None:
-                rss = 0
+            rss = 0
+            try:
+                processes = [parent, *parent.children(recursive=True)]
+            except psutil.Error:
+                processes = [parent]
+            for process in processes:
                 try:
-                    processes = [parent, *parent.children(recursive=True)]
+                    with process.oneshot():
+                        cpu = process.cpu_times()
+                        self.cpu[(process.pid, process.create_time())] = (
+                            cpu.user + cpu.system
+                        )
+                        rss += process.memory_info().rss
                 except psutil.Error:
-                    processes = [parent]
-                for process in processes:
-                    try:
-                        with process.oneshot():
-                            cpu = process.cpu_times()
-                            self.cpu[(process.pid, process.create_time())] = (
-                                cpu.user + cpu.system
-                            )
-                            rss += process.memory_info().rss
-                    except psutil.Error:
-                        continue
-                self.peak_rss = max(self.peak_rss, rss)
-                row.update(
-                    tree_rss_bytes=rss,
-                    observed_tree_cpu_seconds=sum(self.cpu.values()),
-                    processes=len(processes),
-                )
+                    continue
+            self.peak_rss = max(self.peak_rss, rss)
+            row.update(
+                tree_rss_bytes=rss,
+                observed_tree_cpu_seconds=sum(self.cpu.values()),
+                processes=len(processes),
+            )
             if self.gpu_available:
                 try:
-                    result = subprocess.run(
+                    result = subprocess.run(  # noqa: S603
                         [
-                            "nvidia-smi",
+                            executable("nvidia-smi"),
                             "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw",
                             "--format=csv,noheader,nounits",
                         ],
                         capture_output=True,
+                        check=True,
                         text=True,
                         timeout=3,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
-                    if result.returncode:
-                        raise RuntimeError(result.stderr.strip())
                     row["gpu_csv"] = result.stdout.strip().splitlines()
-                except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
+                except (OSError, subprocess.SubprocessError) as error:
                     self.gpu_available = False
-                    row["gpu_unavailable"] = str(error)
+                    row["gpu_unavailable"] = (
+                        error.stderr.strip()
+                        if isinstance(error, subprocess.CalledProcessError)
+                        else str(error)
+                    )
             self.recorder.event("resources", hand=self.recorder.active_hand, **row)
             self.count += 1
             self.stop.wait(5)
 
-    def start(self):
+    def start(self) -> None:
         """Begin background sampling; call finish before closing the recorder."""
         self.thread.start()
 
-    def finish(self):
+    def finish(self) -> dict:
         """Stop sampling with a bounded wait and return observed resource peaks."""
         self.stop.set()
         self.thread.join(4)
-        return dict(
-            samples=self.count,
-            peak_sampled_tree_rss_bytes=self.peak_rss,
-            observed_tree_cpu_seconds_lower_bound=sum(self.cpu.values()),
-        )
+        return {
+            "samples": self.count,
+            "peak_sampled_tree_rss_bytes": self.peak_rss,
+            "observed_tree_cpu_seconds_lower_bound": sum(self.cpu.values()),
+        }
 
 
 @contextmanager
-def instrument(recorder):
+def instrument(recorder: Recorder) -> Iterator[None]:
     """Temporarily instrument actual pipeline methods and their imported aliases."""
-    from ortools.sat.python.cp_model import CpSolver
+    from ortools.sat.python.cp_model import CpSolver  # noqa: PLC0415
 
-    from video2tenhou import calm, cli, observe, read, record, timeline, video
-    from video2tenhou.engine import decode, dense, solver
-    from video2tenhou.perception.classifier import Classifier
-    from video2tenhou.perception.detector import Detector
+    from video2tenhou import (  # noqa: PLC0415
+        calm,
+        cli,
+        observe,
+        read,
+        record,
+        timeline,
+        video,
+    )
+    from video2tenhou.engine import decode, dense, solver  # noqa: PLC0415
+    from video2tenhou.perception.classifier import Classifier  # noqa: PLC0415
+    from video2tenhou.perception.detector import Detector  # noqa: PLC0415
 
     patches = ExitStack()
 
-    def patch(owner, attribute, wrapper):
+    def patch(owner: object, attribute: str, wrapper: object) -> None:
         patches.enter_context(mock_patch.object(owner, attribute, wrapper))
 
     stages = [
@@ -350,23 +399,26 @@ def instrument(recorder):
                     or (owner is solver.HandModel and name == "solve"),
                 ),
             )
-        # CpSolver.Solve delegates to solve; instrument only the implementation.
         cp_solve = CpSolver.solve
 
         @wraps(cp_solve)
-        def measured_solve(instance, *args, **kwargs):
+        def measured_solve(
+            instance: CpSolver,
+            model: CpModel,
+            solution_callback: CpSolverSolutionCallback | None = None,
+        ) -> CpSolverStatus:
             start = time.perf_counter()
             with recorder.span("CpSolver.solve"):
-                result = cp_solve(instance, *args, **kwargs)
+                result = cp_solve(instance, model, solution_callback)
             recorder.event(
                 "cp_search",
                 hand=recorder.active_hand,
-                status=instance.StatusName(result),
+                status=instance.status_name(result),
                 seconds=time.perf_counter() - start,
                 time_budget=instance.parameters.max_time_in_seconds,
                 workers=instance.parameters.num_workers,
-                objective=instance.ObjectiveValue(),
-                bound=instance.BestObjectiveBound(),
+                objective=instance.objective_value,
+                bound=instance.best_objective_bound,
             )
             return result
 
@@ -387,42 +439,47 @@ def instrument(recorder):
         yield
 
 
-def file_identity(path):
+def file_identity(path: str | Path) -> dict:
     """Return complete SHA-256 and stat identity; absent optional files are explicit."""
     path = Path(path).resolve()
     if not path.is_file():
-        return dict(path=str(path), exists=False)
+        return {"path": str(path), "exists": False}
     stat = path.stat()
-    return dict(
-        path=str(path),
-        exists=True,
-        bytes=stat.st_size,
-        mtime_ns=stat.st_mtime_ns,
-        sha256=sha256_file(path),
-    )
+    return {
+        "path": str(path),
+        "exists": True,
+        "bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": sha256_file(path),
+    }
 
 
-def tool_versions():
+def tool_versions() -> dict[str, dict[str, str | int | None]]:
     """Record PATH-resolved tools without importing models or failing conversion.
 
     Each probe has a three-second deadline. Output goes to a temporary file,
     avoiding an unbounded in-memory capture; only its first 4096 bytes are read
     and one 300-character line is retained. Both output streams are inspected.
     """
-    tools = {}
+    tools: dict[str, dict[str, str | int | None]] = {}
     for name, command, flag in (
         ("ffmpeg", "ffmpeg", "-version"),
         ("ffprobe", "ffprobe", "-version"),
         ("uv", "uv", "--version"),
     ):
-        row = tools[name] = dict(path=None, version=None, status="missing")
+        row: dict[str, str | int | None] = {
+            "path": None,
+            "version": None,
+            "status": "missing",
+        }
+        tools[name] = row
         try:
             executable = shutil.which(command)
             if executable is None:
                 continue
             row["path"] = str(Path(executable).resolve())
             with tempfile.TemporaryFile() as output:
-                result = subprocess.run(
+                result = subprocess.run(  # noqa: S603
                     [row["path"], flag],
                     stdout=output,
                     stderr=subprocess.STDOUT,
@@ -448,11 +505,11 @@ def tool_versions():
     return tools
 
 
-def run_metadata(args):
-    """Capture inputs, effective geometry, versions and initial cache state before timing."""
-    from video2tenhou import video
-    from video2tenhou.layout import Calibration, fit_path
-    from video2tenhou.paths import DATA_DIR, LABEL_DIR, MODEL_DIR
+def run_metadata(args: argparse.Namespace) -> dict:
+    """Record inputs, geometry, versions and initial cache state before timing."""
+    from video2tenhou import video  # noqa: PLC0415
+    from video2tenhou.layout import Calibration, fit_path  # noqa: PLC0415
+    from video2tenhou.paths import DATA_DIR, LABEL_DIR, MODEL_DIR  # noqa: PLC0415
 
     cal = Calibration.load(args.calib, args.video)
     versions = {}
@@ -475,11 +532,11 @@ def run_metadata(args):
     for name in ("work", "out"):
         directory = Path(getattr(args, name)).resolve() / Path(args.video).stem
         files = list(directory.rglob("*")) if directory.exists() else []
-        cache[name] = dict(
-            path=str(directory),
-            empty=not any(p.is_file() for p in files),
-            files=sum(p.is_file() for p in files),
-        )
+        cache[name] = {
+            "path": str(directory),
+            "empty": not any(p.is_file() for p in files),
+            "files": sum(p.is_file() for p in files),
+        }
     inputs = [
         Path(__file__),
         Path(args.video),
@@ -497,14 +554,15 @@ def run_metadata(args):
         ("status", ["status", "--porcelain"]),
         ("diff", ["diff", "HEAD", "--", "src", "tools/profile_conversion.py"]),
     ):
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603
             [
-                "git",
+                executable("git"),
                 "-c",
                 "safe.directory=" + str(Path.cwd()).replace("\\", "/"),
                 *command,
             ],
             capture_output=True,
+            check=False,
             timeout=10,
         )
         git[label] = (
@@ -512,27 +570,27 @@ def run_metadata(args):
             if label == "diff"
             else result.stdout.decode(errors="replace").strip()
         )
-    return dict(
-        arguments=vars(args),
-        data_directory=str(DATA_DIR),
-        platform=platform.platform(),
-        python=sys.version,
-        logical_cpus=os.cpu_count(),
-        versions=versions,
-        tools=tool_versions(),
-        git=git,
-        cache=cache,
-        input_files=[file_identity(p) for p in inputs],
-        video=vars(video.probe(args.video)),
-        calibration=cal.data,
-        calibration_sha256=hashlib.sha256(
+    return {
+        "arguments": vars(args),
+        "data_directory": str(DATA_DIR),
+        "platform": platform.platform(),
+        "python": sys.version,
+        "logical_cpus": os.cpu_count(),
+        "versions": versions,
+        "tools": tool_versions(),
+        "git": git,
+        "cache": cache,
+        "input_files": [file_identity(p) for p in inputs],
+        "video": vars(video.probe(args.video)),
+        "calibration": cal.data,
+        "calibration_sha256": hashlib.sha256(
             json.dumps(cal.data, sort_keys=True).encode()
         ).hexdigest(),
-    )
+    }
 
 
-def main(argv=None):
-    """Run unchanged CLI conversion arguments and always persist the final timing summary."""
+def main(argv: list[str] | None = None) -> int | None:
+    """Profile CLI conversion and always persist its final timing summary."""
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
     parser.add_argument("--profile-output", required=True, type=Path)
     options, convert_args = parser.parse_known_args(argv)
@@ -545,12 +603,12 @@ def main(argv=None):
     conversion_cpu = None
     failure = None
     resource_summary = {}
-    from video2tenhou import cli
+    from video2tenhou import cli  # noqa: PLC0415
 
     original = cli.cmd_convert
 
     @wraps(original)
-    def profiled(args):
+    def profiled(args: argparse.Namespace) -> None:
         nonlocal conversion_started, conversion_cpu
         with recorder.span("profile.preparation", progress=True):
             info = run_metadata(args)
@@ -576,7 +634,7 @@ def main(argv=None):
         with mock_patch.object(cli, "cmd_convert", profiled):
             return cli.main(["convert", *convert_args])
     except BaseException as error:
-        failure = dict(type=type(error).__name__, message=str(error))
+        failure = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
         wall = (
@@ -587,15 +645,24 @@ def main(argv=None):
         cpu = None if conversion_cpu is None else time.process_time() - conversion_cpu
         if resources.thread.ident is not None:
             resource_summary = resources.finish()
-        summary = dict(
-            conversion_wall_seconds=wall,
-            conversion_process_cpu_seconds=cpu,
-            entry_wall_seconds=time.perf_counter() - entry_start,
-            failure=failure,
-            resources=resource_summary,
-            timings=list(recorder.totals.values()),
-            interpretation="Inclusive overlapping timings are not additive. sample.next_wait includes startup/exhaustion and excludes consumer work; GPU calls are not forcibly synchronized. GPU utilization is device-wide, not this process alone. Process CPU seconds/wall seconds gives occupied logical cores (divide by logical CPU count for whole-machine fraction). Sampled child CPU misses short-lived children. Preparation hashes/imports are outside conversion wall time.",
-        )
+        summary = {
+            "conversion_wall_seconds": wall,
+            "conversion_process_cpu_seconds": cpu,
+            "entry_wall_seconds": time.perf_counter() - entry_start,
+            "failure": failure,
+            "resources": resource_summary,
+            "timings": list(recorder.totals.values()),
+            "interpretation": (
+                "Inclusive overlapping timings are not additive. sample.next_wait "
+                "includes startup/exhaustion and excludes consumer work; GPU calls "
+                "are not forcibly synchronized. GPU utilization is device-wide, not"
+                " this process alone. Process CPU seconds/wall seconds gives "
+                "occupied logical cores (divide by logical CPU count for "
+                "whole-machine fraction). Sampled child CPU misses short-lived "
+                "children. Preparation hashes/imports are outside conversion wall "
+                "time."
+            ),
+        }
         (recorder.output / "summary.json").write_text(
             json.dumps(summary, indent=2), encoding="utf-8"
         )

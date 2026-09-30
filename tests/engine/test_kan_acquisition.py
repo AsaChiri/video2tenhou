@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Open-kan acquisition fills missing evidence without overriding human answers."""
 
 import numpy as np
@@ -12,7 +15,8 @@ from video2tenhou.engine.solver import (
 )
 
 
-def test_open_kan_replacement_acquisition_is_unique_and_respects_facts_and_evidence():
+def test_open_kan_acquisition_is_unique_and_respects_facts_and_evidence() -> None:
+    """Verify open-kan acquisition is unique and honors existing evidence."""
     turns = [
         SeatTurn(j, "kan", "1s", 10 * j, 10 * j + 5, kan="daiminkan") for j in range(6)
     ]

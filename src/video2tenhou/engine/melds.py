@@ -1,13 +1,21 @@
-"""Meld observations of one seat -> meld events, and the legal melds a call can be (DESIGN.md 4.8 `melds.py`).
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
 
-A meld camera shows the player's melds as rows of three or four tiles; a called tile lies sideways and its
-position (left / middle / right) names the player it came from. A new group in the observations is a meld
-event; its type follows from the tiles (chi: consecutive same suit; pon / kan: identical; ankan: two
-face-down). A group is a meld only as far as its readings support it: four boxes are a kan only when every
-one of them reads as that kind, otherwise the best meld of three of them is taken and the fourth box is
-noise; a run of five or more boxes is several melds laid close together and is split into melds of three or
-four. The camera is the weakest witness of a call: an event becomes a call only when anchored on the
-discard it took (calls.py), and its tiles are then a choice among `meld_options`.
+"""Track meld events and enumerate legal call compositions.
+
+Meld observations of one seat -> meld events, and the legal melds a call can be
+(DESIGN.md 4.8 `melds.py`).
+
+A meld camera shows the player's melds as rows of three or four tiles; a called tile
+lies sideways and its position (left / middle / right) names the player it came from. A
+new group in the observations is a meld event; its type follows from the tiles (chi:
+consecutive same suit; pon / kan: identical; ankan: two face-down). A group is a meld
+only as far as its readings support it: four boxes are a kan only when every one of them
+reads as that kind, otherwise the best meld of three of them is taken and the fourth box
+is noise; a run of five or more boxes is several melds laid close together and is split
+into melds of three or four. The camera is the weakest witness of a call: an event
+becomes a call only when anchored on the discard it took (calls.py), and its tiles are
+then a choice among `meld_options`.
 """
 
 from __future__ import annotations
@@ -18,8 +26,21 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..train.data import CLASS_INDEX, CLASSES
+from video2tenhou.train.data import CLASS_INDEX, CLASSES
+
 from . import rules
+
+MAX_SUIT_RANK = 9
+CONFIRMED_SIDEWAYS_FRACTION = 0.5
+MIN_SIDEWAYS_FRACTION = 0.2
+OPEN_MELD_SIZE = 3
+KAN_SIZE = 4
+ANKAN_BACK_COUNT = 2
+MIN_SHARED_MELD_TILES = 2
+MIN_KAKAN_BASE_VIEWS = 2
+MIN_FRAGMENT_REPEATS = 2
+MIN_FRAGMENT_SIZE = 2
+
 
 FLOOR = 0.15  # a meld hypothesis needs each tile's reading at this posterior on average
 REDS = {"5m": "0m", "5p": "0p", "5s": "0s"}
@@ -53,15 +74,18 @@ class Call:
         0  # later full views of the camera without this meld (melds never leave)
     )
     human: bool = False  # stated by the reviewer (a meld fact)
-    anchor: str = "camera"  # how the call is established: camera (an event, not yet a call) | discard | kan |
+    # how the call is established: camera (an event, not yet a call) | discard | kan |
+    anchor: str = "camera"
     # indicator | hidden | fact
     options: list = field(
         default_factory=list
     )  # MeldOption: the legal compositions the solver chooses among
-    contradicted: bool = False  # later incomplete views outnumbered sightings; requires independent discard evidence
+    # later incomplete views outnumbered sightings; requires independent discard
+    # evidence
+    contradicted: bool = False
 
     def to_dict(self) -> dict:
-        """Serialize the meld with rounded posteriors and all alternative compositions."""
+        """Serialize rounded posteriors and all alternative meld compositions."""
         d = self.__dict__.copy()
         d["p"] = [[round(float(v), 4) for v in p] for p in self.p]
         d["t_window"] = list(self.t_window)
@@ -80,7 +104,7 @@ class MeldOption:
     cost: float  # how much less the camera's readings support it than the best option
 
     def to_dict(self) -> dict:
-        """Serialize one candidate, including the concealed tiles it removes from the hand."""
+        """Serialize a candidate and the concealed tiles it removes."""
         return {
             "type": self.type,
             "tiles": self.tiles,
@@ -103,13 +127,16 @@ def _variants(tiles: list[str]) -> list[list[str]]:
     out: list[list[str]] = [[]]
     for t in tiles:
         red = REDS.get(t)
-        out = [o + [v] for o in out for v in ([t, red] if red else [t])]
+        out = [[*o, v] for o in out for v in ([t, red] if red else [t])]
     return [o for o in out if sum(1 for x in o if x in rules.REDS) <= 1]
 
 
 def _support(tiles: list[str], ps: list[np.ndarray]) -> float:
-    """How well boxes read as these tiles: each tile takes the unused box that reads it best (log posterior);
-    a tile with no box left (the camera showed fewer boxes) is neutral.
+    """Score a meld by assigning each tile its best unused observed box.
+
+    How well boxes read as these tiles: each tile takes the unused box that reads it
+    best (log posterior); a tile with no box left (the camera showed fewer boxes) is
+    neutral.
     """
     free = list(range(len(ps)))
     score = 0.0
@@ -124,11 +151,14 @@ def _support(tiles: list[str], ps: list[np.ndarray]) -> float:
 
 
 def meld_options(
-    called: str, source: str, ps: list[np.ndarray], four: bool
+    called: str, source: str, ps: list[np.ndarray], *, four: bool
 ) -> list[MeldOption]:
-    """The legal melds a seat can have laid with `called` from `source` (DESIGN.md 4.8, call anchor step 3): a
-    daiminkan when the camera shows four boxes, else a pon, and a chi when the tile came from the kamicha.
-    Each is costed by how well the camera's readings `ps` support its tiles; the solver decides with the hand.
+    """Enumerate legal meld compositions taking a particular discard.
+
+    The legal melds a seat can have laid with `called` from `source` (DESIGN.md 4.8,
+    call anchor step 3): a daiminkan when the camera shows four boxes, else a pon, and a
+    chi when the tile came from the kamicha. Each is costed by how well the camera's
+    readings `ps` support its tiles; the solver decides with the hand.
     """
     k = rules.plain(called)
     raw: list[tuple[str, list[str]]] = []
@@ -139,19 +169,19 @@ def meld_options(
         if source == "kamicha" and k[1] != "z":
             n, suit = rules.number(k), k[1]
             for a, b in ((n - 2, n - 1), (n - 1, n + 1), (n + 1, n + 2)):
-                if 1 <= a <= 9 and 1 <= b <= 9:
+                if 1 <= a <= MAX_SUIT_RANK and 1 <= b <= MAX_SUIT_RANK:
                     raw += [("chi", h) for h in _variants([f"{a}{suit}", f"{b}{suit}"])]
     raw = [
         (typ, h)
         for typ, h in raw
-        if sum(1 for x in h + [called] if x in rules.REDS) <= 1
+        if sum(1 for x in [*h, called] if x in rules.REDS) <= 1
     ]
     options = []
     for typ, hand in raw:
         pos = 0 if typ == "chi" else POSITION[typ][source]
         laid = list(hand)
         laid.insert(pos, called)
-        options.append(MeldOption(typ, laid, pos, hand, _support([called] + hand, ps)))
+        options.append(MeldOption(typ, laid, pos, hand, _support([called, *hand], ps)))
     best = max((o.cost for o in options), default=0.0)
     for o in options:
         o.cost = min(OPTION_CAP, OPTION_WEIGHT * (best - o.cost))
@@ -174,18 +204,24 @@ def _lp(p: np.ndarray, tile: str) -> float:
 
 
 def _best_five(p: np.ndarray, tile: str) -> str:
-    """The plain or the red five, whichever the reading prefers (any other tile unchanged)."""
+    """Choose the plain or red five preferred by the reading.
+
+    The plain or the red five, whichever the reading prefers (any other tile unchanged).
+    """
     red = REDS.get(tile)
     return red if red and _lp(p, red) > _lp(p, tile) else tile
 
 
 def _sideways(slots: list[dict]) -> int | None:
-    side = [i for i, s in enumerate(slots) if s["sideways"] >= 0.5]
+    side = [
+        i for i, s in enumerate(slots) if s["sideways"] >= CONFIRMED_SIDEWAYS_FRACTION
+    ]
     if side:
         return side[0]
-    # a weaker vote still names the turned tile: the reader's aspect test misses oblique views
+    # a weaker vote still names the turned tile: the reader's aspect test misses oblique
+    # views
     best = max(range(len(slots)), key=lambda i: slots[i]["sideways"])
-    return best if slots[best]["sideways"] >= 0.2 else None
+    return best if slots[best]["sideways"] >= MIN_SIDEWAYS_FRACTION else None
 
 
 def _decode3(slots: list[dict]) -> Meld | None:
@@ -210,9 +246,9 @@ def _decode3(slots: list[dict]) -> Meld | None:
             ):
                 tiles = [_best_five(p, run[perm[i]]) for i, p in enumerate(ps)]
                 sc = sum(_lp(p, t) for p, t in zip(ps, tiles, strict=False)) - floor
-                if sc > best.score:
+                if best is None or sc > best.score:
                     best = Meld("chi", tiles, None, ps, sc)
-    if best.score < 0:
+    if best is None or best.score < 0:
         return None
     side = _sideways(slots)
     best.called_pos = side if side is not None else (0 if best.type == "chi" else None)
@@ -220,16 +256,20 @@ def _decode3(slots: list[dict]) -> Meld | None:
 
 
 def decode_group(slots: list[dict]) -> Meld | None:
-    """The meld one group of three or four boxes is, or None when its readings support no legal meld.
+    """Decode three or four boxes as a legal meld, or return None.
 
-    Four boxes are an ankan when two are face down, a kan when every box reads as one kind (the majority
-    never overwrites a box that reads otherwise), else the best meld of three of them (a stray box: the
-    same tile boxed twice, or a tile of the next meld).
+    The meld one group of three or four boxes is, or None when its readings support no
+    legal meld.
+
+    Four boxes are an ankan when two are face down, a kan when every box reads as one
+    kind (the majority never overwrites a box that reads otherwise), else the best meld
+    of three of them (a stray box: the same tile boxed twice, or a tile of the next
+    meld).
     """
     n = len(slots)
-    if n == 3:
+    if n == OPEN_MELD_SIZE:
         return _decode3(slots)
-    if n != 4:
+    if n != KAN_SIZE:
         return None
     ps = [np.asarray(s["p"], np.float64) for s in slots]
     down = [i for i, p in enumerate(ps) if CLASSES[int(np.argmax(p))] == "X"]
@@ -250,7 +290,7 @@ def decode_group(slots: list[dict]) -> Meld | None:
         if all(s >= FLOOR for s in support):
             tiles = ["X" if i in down else _best_five(ps[i], kind) for i in range(4)]
             sc = sum(math.log(s / FLOOR) for s in support)
-            if len(down) >= 2:
+            if len(down) >= ANKAN_BACK_COUNT:
                 return Meld("ankan", tiles, None, ps, sc)
             return Meld("kan", tiles, _sideways(slots), ps, sc)
     best = None
@@ -262,32 +302,43 @@ def decode_group(slots: list[dict]) -> Meld | None:
 
 
 def split_group(slots: list[dict]) -> list[Meld]:
-    """Melds laid close together read as one run of boxes: the split into consecutive melds of three or four
-    (a single stray box may be skipped) whose readings support them best. Empty when none is legal.
+    """Split a run of boxes into consecutive legal melds.
+
+    Melds laid close together read as one run of boxes: the split into consecutive melds
+    of three or four (a single stray box may be skipped) whose readings support them
+    best. Empty when none is legal.
     """
     n = len(slots)
     best: list[tuple[float, list[Meld]] | None] = [None] * (n + 1)
     best[0] = (0.0, [])
     for i in range(n):
-        if best[i] is None:
+        current = best[i]
+        if current is None:
             continue
-        score, melds = best[i]
-        if best[i + 1] is None or score > best[i + 1][0]:
+        score, melds = current
+        skipped = best[i + 1]
+        if skipped is None or score > skipped[0]:
             best[i + 1] = (score, melds)  # skip one stray box
         for size in (3, 4):
             if i + size > n:
                 continue
             m = decode_group(slots[i : i + size])
-            if m is None or (size == 4 and m.type not in ("kan", "ankan")):
+            if m is None or (size == KAN_SIZE and m.type not in ("kan", "ankan")):
                 continue  # four boxes that are not a kan: a 3 + stray split covers it
-            cand = (score + m.score, melds + [m])
-            if best[i + size] is None or cand[0] > best[i + size][0]:
+            cand = (score + m.score, [*melds, m])
+            previous = best[i + size]
+            if previous is None or cand[0] > previous[0]:
                 best[i + size] = cand
-    return best[n][1] if best[n] else []
+    final = best[n]
+    return final[1] if final is not None else []
 
 
 def source_of(type_: str, called_pos: int | None, n: int) -> str | None:
-    """Infer the relative discarder from meld orientation; ambiguous/concealed forms return None."""
+    """Infer a meld's discarder from the sideways tile's orientation.
+
+    Infer the relative discarder from meld orientation; ambiguous/concealed forms return
+    None.
+    """
     if type_ == "ankan" or called_pos is None:
         return None
     if type_ == "chi":
@@ -310,7 +361,7 @@ def read_melds(obs: dict) -> list[Meld]:
     """Every meld one observation of a meld camera shows."""
     out: list[Meld] = []
     for g in _groups(obs):
-        if len(g) <= 4:
+        if len(g) <= KAN_SIZE:
             m = decode_group(g)
             if m is not None:
                 out.append(m)
@@ -324,8 +375,10 @@ def _same(a: list[str], b: list[str]) -> bool:
 
 
 def _is_known(c: Call, m: Meld) -> bool:
-    """Is meld `m` a view of call `c`? A pon or kan of a kind is the only one of its kind a seat can have;
-    a chi is matched by its tiles in the order laid.
+    """Check whether a meld is another view of an existing call.
+
+    Is meld `m` a view of call `c`? A pon or kan of a kind is the only one of its kind a
+    seat can have; a chi is matched by its tiles in the order laid.
     """
     if c.type in ("pon", "kan", "ankan") and m.type in ("pon", "kan", "ankan"):
         return rules.plain(c.tiles[0]) == rules.plain(
@@ -339,35 +392,41 @@ def _tops(g: list[dict]) -> list[str]:
 
 
 def _shows_part(c: Call, groups: list[list[dict]]) -> bool:
-    """Does some group show at least two tiles of the call (a meld one of whose tiles the camera missed)?"""
-    have = Counter(rules.plain(t) for t in c.tiles if t not in ("X", "?"))
-    return any(sum((Counter(_tops(g)) & have).values()) >= 2 for g in groups)
+    """Check whether a group shows at least two tiles of a known call.
 
-
-def track_melds(
-    seat: str, observations: list[dict], *, include_contradicted: bool = False
-) -> list[Call]:
-    """Track one seat's camera hypotheses, retaining established sightings by default.
-
-    Call anchoring may request external-call hypotheses contradicted by later
-    views. Those carry ``contradicted=True`` and require independent evidence
-    of a compatible taken discard; they must not establish a self-kan.
+    Does some group show at least two tiles of the call (a meld one of whose tiles the
+    camera missed)?
     """
-    calls: list[Call] = []
+    have = Counter(rules.plain(t) for t in c.tiles if t not in ("X", "?"))
+    return any(
+        sum((Counter(_tops(g)) & have).values()) >= MIN_SHARED_MELD_TILES
+        for g in groups
+    )
+
+
+@dataclass
+class MeldTracker:
+    """Track persistent camera hypotheses for one seat."""
+
+    seat: str
+    calls: list[Call] = field(default_factory=list)
     prev_end: float | None = None
-    for obs in sorted(observations, key=lambda o: o["t0"]):
+
+    def update(self, obs: dict) -> None:
+        """Consume a view without treating hidden tiles as absent."""
         if obs["n_used"] == 0:
-            continue  # no reading at all: says nothing about the melds, narrows no window
+            # no reading at all: says nothing about the melds, narrows no window
+            return
         partial = bool(obs.get("partial"))
         melds = read_melds(obs)
-        window = (prev_end if prev_end is not None else obs["t0"], obs["t0"])
+        window = (self.prev_end if self.prev_end is not None else obs["t0"], obs["t0"])
         taken: set[int] = set()
         new: list[tuple[int, Meld]] = []
         for g, m in enumerate(melds):
             known = next(
                 (
                     c
-                    for c in calls
+                    for c in self.calls
                     if c.type != "kakan"
                     and _is_known(c, m)
                     and (c.type != "chi" or id(c) not in taken)
@@ -380,64 +439,16 @@ def track_melds(
             if id(known) in taken:
                 continue  # a second group read as the same pon: one meld, read twice
             taken.add(id(known))
-            known.seen += 1
-            if m.type == "pon" and known.type == "pon" and not partial:
-                # a full view of the pon with three tiles: evidence against a kakan read on it
-                for k in calls:
-                    if (
-                        k.type == "kakan"
-                        and k.t_first <= obs["t0"]
-                        and _same(k.tiles, m.tiles)
-                    ):
-                        k.unseen += 1
-            if m.type == "kan" and known.type == "pon":
-                if known.partial_only:
-                    known.type, known.tiles, known.p = (
-                        "kan",
-                        m.tiles,
-                        m.ps,
-                    )  # the "pon" was part of this kan
-                else:
-                    # a pon grew into a kan: the pon stays (its called tile fixes a turn) and the kakan is a
-                    # second event of this seat, timed by the first view of the fourth tile
-                    kk = next(
-                        (
-                            k
-                            for k in calls
-                            if k.type == "kakan" and _same(k.tiles, m.tiles)
-                        ),
-                        None,
-                    )
-                    if kk is None:
-                        calls.append(
-                            Call(
-                                seat,
-                                obs["t0"],
-                                window,
-                                "kakan",
-                                m.tiles,
-                                known.called_pos,
-                                known.source,
-                                known.called_tile,
-                                m.ps,
-                                float(np.mean([p.max() for p in m.ps])),
-                                g,
-                                1,
-                                partial_only=partial,
-                            )
-                        )
-                    else:
-                        kk.seen += 1
-                        kk.partial_only = kk.partial_only and partial
-            if not partial:
-                known.partial_only = False
+            self._see_known(known, m, g, obs)
         if new:
-            # a seat calls at most once between two views of its camera (a call is followed by its discard and
-            # the others' turns): of several new melds in one view, the one the readings support best
+            # a seat calls at most once between two views of its camera (a call is
+            # followed by its discard and
+            # the others' turns): of several new melds in one view, the one the readings
+            # support best
             g, m = max(new, key=lambda x: x[1].score)
-            calls.append(
+            self.calls.append(
                 Call(
-                    seat,
+                    self.seat,
                     obs["t0"],
                     window,
                     m.type,
@@ -452,15 +463,17 @@ def track_melds(
                     partial_only=partial,
                 )
             )
-            taken.add(id(calls[-1]))
+            taken.add(id(self.calls[-1]))
         if not partial:
-            prev_end = obs[
+            self.prev_end = obs[
                 "t1"
             ]  # a partial view may hide a meld: it never narrows the call window
             groups = _groups(obs)
-            for c in calls:
-                # a full view showing tiles but not a meld seen earlier (not even two of its tiles: a tile of a
-                # meld is often missed) counts against it; an empty view (the table cleared) says nothing
+            for c in self.calls:
+                # a full view showing tiles but not a meld seen earlier (not even two of
+                # its tiles: a tile of a
+                # meld is often missed) counts against it; an empty view (the table
+                # cleared) says nothing
                 if (
                     groups
                     and c.type != "kakan"
@@ -470,16 +483,95 @@ def track_melds(
                 ):
                     c.absent += 1
 
+    def _see_known(self, known: Call, m: Meld, g: int, obs: dict) -> None:
+        """Accumulate repeated sightings and distinguish an added kan from a pon."""
+        partial = bool(obs.get("partial"))
+        window = (self.prev_end if self.prev_end is not None else obs["t0"], obs["t0"])
+        known.seen += 1
+        if m.type == "pon" and known.type == "pon" and not partial:
+            # a full view of the pon with three tiles: evidence against a kakan read
+            # on it
+            for k in self.calls:
+                if (
+                    k.type == "kakan"
+                    and k.t_first <= obs["t0"]
+                    and _same(k.tiles, m.tiles)
+                ):
+                    k.unseen += 1
+        if m.type == "kan" and known.type == "pon":
+            if known.partial_only:
+                known.type, known.tiles, known.p = (
+                    "kan",
+                    m.tiles,
+                    m.ps,
+                )  # the "pon" was part of this kan
+            else:
+                # a pon grew into a kan: the pon stays (its called tile fixes a
+                # turn) and the kakan is a
+                # second event of this seat, timed by the first view of the fourth
+                # tile
+                kk = next(
+                    (
+                        k
+                        for k in self.calls
+                        if k.type == "kakan" and _same(k.tiles, m.tiles)
+                    ),
+                    None,
+                )
+                if kk is None:
+                    self.calls.append(
+                        Call(
+                            self.seat,
+                            obs["t0"],
+                            window,
+                            "kakan",
+                            m.tiles,
+                            known.called_pos,
+                            known.source,
+                            known.called_tile,
+                            m.ps,
+                            float(np.mean([p.max() for p in m.ps])),
+                            g,
+                            1,
+                            partial_only=partial,
+                        )
+                    )
+                else:
+                    kk.seen += 1
+                    kk.partial_only = kk.partial_only and partial
+        if not partial:
+            known.partial_only = False
+
+
+def track_melds(
+    seat: str, observations: list[dict], *, include_contradicted: bool = False
+) -> list[Call]:
+    """Track one seat's camera hypotheses, retaining established sightings by default.
+
+    Call anchoring may request external-call hypotheses contradicted by later
+    views. Those carry ``contradicted=True`` and require independent evidence
+    of a compatible taken discard; they must not establish a self-kan.
+    """
+    tracker = MeldTracker(seat)
+    for obs in sorted(observations, key=lambda o: o["t0"]):
+        tracker.update(obs)
+    calls = tracker.calls
+
     def solid(c: Call) -> bool:
         if c.type == "kakan":
-            # melds never revert: a kakan seen in fewer views than the plain pon afterwards was a misread; it
+            # melds never revert: a kakan seen in fewer views than the plain pon
+            # afterwards was a misread; it
             # stands on the evidence of its pon
             return c.unseen <= c.seen and any(
-                k.type == "pon" and k.seen >= 2 and _same(k.tiles, c.tiles)
+                k.type == "pon"
+                and k.seen >= MIN_KAKAN_BASE_VIEWS
+                and _same(k.tiles, c.tiles)
                 for k in calls
             )
-        # a meld never leaves the table: one that later full views lack as often as they show it was never a
-        # meld; one seen in a single partial frame is returned as `weak`, for the pond to confirm or not
+        # a meld never leaves the table: one that later full views lack as often as they
+        # show it was never a
+        # meld; one seen in a single partial frame is returned as `weak`, for the pond
+        # to confirm or not
         return c.absent == 0 or c.seen > c.absent
 
     out = []
@@ -496,8 +588,11 @@ def track_melds(
 
 @dataclass
 class Fragment:
-    """Two tiles of a meld the camera keeps showing without a legal third: a meld one of whose tiles is not boxed
-    (often the turned one) or is misread. Only the discard it took says which meld it is (calls.py).
+    """Persistent partial evidence of a meld without a legal third tile.
+
+    Two tiles of a meld the camera keeps showing without a legal third: a meld one of
+    whose tiles is not boxed (often the turned one) or is misread. Only the discard it
+    took says which meld it is (calls.py).
     """
 
     seat: str
@@ -511,12 +606,15 @@ class Fragment:
 
 
 def _pair(g: list[dict]) -> list[str] | None:
-    """The two tiles of a group that belong to one meld: two identical tiles, else the two surest boxes that are two
-    of a run (same suit, numbers one or two apart) — in a group of three or four read as no legal meld, the
-    third tile is the misread one (a 4p read 2p beside 3p 0p leaves 3p 0p, of the run 3p 4p 5p).
+    """Select the two boxes most likely to belong to a single meld.
+
+    The two tiles of a group that belong to one meld: two identical tiles, else the two
+    surest boxes that are two of a run (same suit, numbers one or two apart) — in a
+    group of three or four read as no legal meld, the third tile is the misread one (a
+    4p read 2p beside 3p 0p leaves 3p 0p, of the run 3p 4p 5p).
     """
     tops = [t for t in _tops(g) if t not in ("X", "none")]
-    same = [t for t, n in Counter(tops).items() if n >= 2]
+    same = [t for t, n in Counter(tops).items() if n >= MIN_FRAGMENT_REPEATS]
     if same:
         return [same[0]] * 2
     conf = [
@@ -537,8 +635,11 @@ def _pair(g: list[dict]) -> list[str] | None:
 def fragments(
     seat: str, observations: list[dict], calls: list[Call], min_seen: int = 2
 ) -> list[Fragment]:
-    """Pairs of a meld seen in at least `min_seen` full views — a group of two, or a group of three or four that
-    is no legal meld as read — that are not part of a meld the seat is known to have.
+    """Collect incomplete meld pairs repeated across full views.
+
+    Pairs of a meld seen in at least `min_seen` full views — a group of two, or a group
+    of three or four that is no legal meld as read — that are not part of a meld the
+    seat is known to have.
     """
     found: dict[tuple, Fragment] = {}
     prev_end: float | None = None
@@ -547,7 +648,9 @@ def fragments(
             continue
         before, prev_end = prev_end, obs["t1"]
         for g in _groups(obs):
-            if len(g) not in (2, 3, 4) or (len(g) > 2 and decode_group(g) is not None):
+            if len(g) not in (2, 3, 4) or (
+                len(g) > MIN_FRAGMENT_SIZE and decode_group(g) is not None
+            ):
                 continue
             pair = _pair(g)
             if pair is None:

@@ -1,24 +1,37 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Correction freshness across hand rebuilds, exported games and server restarts."""
 
 import json
 import os
 import threading
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
+from video2tenhou import layout
 from video2tenhou.tool import review_state
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
-def review(tmp_path, monkeypatch):
-    from video2tenhou import layout
-
+def review(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> "Iterator[tuple[review_state.ReviewState, list[float]]]":
+    """Create an isolated review workspace with controlled saved hand data."""
     monkeypatch.setattr(review_state, "ROOT", tmp_path)
     monkeypatch.setattr(layout, "LABEL_DIR", tmp_path / "labels")
     work = tmp_path / "work" / "recording"
     work.mkdir(parents=True)
-    hands = [
+    hands: list[dict] = [
         {
             "hand": i,
             "game": i // 2,
@@ -40,19 +53,24 @@ def review(tmp_path, monkeypatch):
     state.close()
 
 
-def write_at(path, timestamp):
+def write_at(path: "Path", timestamp: "float") -> None:
+    """Write an artifact with a controlled modification timestamp."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{}")
     os.utime(path, ns=(int(timestamp * 1e9), int(timestamp * 1e9)))
 
 
-def outputs(state, hand, timestamp):
+def outputs(state: "review_state.ReviewState", hand: "int", timestamp: "float") -> None:
+    """Create hand and game outputs at a controlled rebuild timestamp."""
     write_at(state.decode_path(hand), timestamp)
     write_at(state.out / f"g{state.hands[hand]['game']}.json", timestamp)
 
 
-def test_additions_require_both_decode_and_game_export(review):
-    state, clock = review
+def test_additions_require_both_decode_and_game_export(
+    review: "tuple[review_state.ReviewState, list[float]]",
+) -> None:
+    """Verify additions require both decode and game export."""
+    state, _clock = review
     assert state.pending_rebuilds() == []
     state.add_fact({"hand": 0, "kind": "draw", "seat": "E", "tile": "2p"})
     assert state.pending_rebuilds() == [0]
@@ -62,7 +80,10 @@ def test_additions_require_both_decode_and_game_export(review):
     assert state.pending_rebuilds() == []
 
 
-def test_deletion_survives_restart_even_when_no_facts_remain(review):
+def test_deletion_survives_restart_even_when_no_facts_remain(
+    review: "tuple[review_state.ReviewState, list[float]]",
+) -> None:
+    """Verify deletion survives restart even when no facts remain."""
     state, clock = review
     fact = state.add_fact({"hand": 1, "kind": "draw", "tile": "1z"})
     outputs(state, 1, 210)
@@ -81,14 +102,16 @@ def test_deletion_survives_restart_even_when_no_facts_remain(review):
 
 
 def test_rebuilding_one_hand_does_not_clear_other_hand_in_same_game(
-    review, monkeypatch
-):
+    review: "tuple[review_state.ReviewState, list[float]]",
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """Verify rebuilding one hand does not clear other hand in same game."""
     state, clock = review
     for i in (0, 1):
         state.add_fact({"hand": i, "kind": "draw", "tile": "2p"})
     clock[0] = 210
 
-    def child(*args, **kwargs):
+    def child(*_unused_args: object, **_unused_kwargs: object) -> "SimpleNamespace":
         outputs(state, 0, 220)
         return SimpleNamespace(returncode=0)
 
@@ -99,14 +122,18 @@ def test_rebuilding_one_hand_does_not_clear_other_hand_in_same_game(
 
 @pytest.mark.parametrize("remove", [False, True])
 def test_edit_during_rebuild_stays_pending_after_completion_and_restart(
-    review, monkeypatch, remove
-):
+    *,
+    review: "tuple[review_state.ReviewState, list[float]]",
+    monkeypatch: "pytest.MonkeyPatch",
+    remove: bool,
+) -> None:
+    """Verify edit during rebuild stays pending after completion and restart."""
     state, clock = review
     fact = state.add_fact({"hand": 0, "kind": "draw", "tile": "2p"})
     clock[0] = 210
     state.jobs["decode_all"] = {"running": True, "started": 205}
 
-    def child(*args, **kwargs):
+    def child(*_unused_args: object, **_unused_kwargs: object) -> "SimpleNamespace":
         clock[0] = 215
         if remove:
             state.delete_fact(fact["ts"])
@@ -139,13 +166,15 @@ def test_edit_during_rebuild_stays_pending_after_completion_and_restart(
 
 
 def test_failed_rebuild_cannot_acknowledge_partially_written_outputs(
-    review, monkeypatch
-):
+    review: "tuple[review_state.ReviewState, list[float]]",
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """Verify failed rebuild cannot acknowledge partially written outputs."""
     state, clock = review
     state.add_fact({"hand": 0, "kind": "draw", "tile": "2p"})
     clock[0] = 210
 
-    def child(*args, **kwargs):
+    def child(*_unused_args: object, **_unused_kwargs: object) -> "SimpleNamespace":
         outputs(state, 0, 220)
         return SimpleNamespace(returncode=1, stderr="export interrupted")
 
@@ -157,8 +186,11 @@ def test_failed_rebuild_cannot_acknowledge_partially_written_outputs(
     assert state.pending_rebuilds() == []
 
 
-def test_existing_dated_facts_are_detected_without_ledger(review):
-    state, clock = review
+def test_existing_dated_facts_are_detected_without_ledger(
+    review: "tuple[review_state.ReviewState, list[float]]",
+) -> None:
+    """Verify existing dated facts are detected without ledger."""
+    state, _clock = review
     (state.labels / "facts.jsonl").write_text(
         json.dumps(
             {"hand": 99, "game": 1, "kyoku": 0, "honba": 0, "ts": 200, "kind": "note"}
@@ -172,15 +204,20 @@ def test_existing_dated_facts_are_detected_without_ledger(review):
 
 @pytest.mark.parametrize("single_hand", [True, False])
 def test_review_jobs_share_exclusion_failure_and_shutdown(
-    review, monkeypatch, single_hand
-):
+    *,
+    review: "tuple[review_state.ReviewState, list[float]]",
+    monkeypatch: "pytest.MonkeyPatch",
+    single_hand: bool,
+) -> None:
+    """Verify review jobs share exclusion failure and shutdown."""
     state, clock = review
     started, release = threading.Event(), threading.Event()
 
-    def fail(*args):
+    def fail(*_unused_args: object) -> None:
         started.set()
         assert release.wait(5)
-        raise RuntimeError("rebuild interrupted")
+        msg = "rebuild interrupted"
+        raise RuntimeError(msg)
 
     monkeypatch.setattr(state, "_run_decode", fail)
     launch = (

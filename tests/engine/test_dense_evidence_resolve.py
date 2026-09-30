@@ -1,17 +1,23 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Accepted dense partial views reach reconstruction without requiring a pinned draw."""
 
-from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from tests.engine.factories import hand_decoder
+from tests.recognition import models_stub
+from tests.spies import record_results
 from video2tenhou.engine import decode, dense
 from video2tenhou.engine.solver import SeatTurn, Solution
 from video2tenhou.engine.turns import Turn
 from video2tenhou.train.data import CLASS_INDEX, CLASSES
 
 
-def _frame(t, count):
+def _frame(t: "float", count: "int") -> "dict":
     tiles = [
         "1m",
         "2m",
@@ -33,18 +39,18 @@ def _frame(t, count):
         posterior = np.full(len(CLASSES), 0.001)
         posterior[CLASS_INDEX[tile]] = 0.95
         boxes.append(
-            dict(
-                role="tile",
-                xyxy=[index * 40, 0, index * 40 + 38, 58],
-                p=(posterior / posterior.sum()).tolist(),
-                conf=0.95,
-            )
+            {
+                "role": "tile",
+                "xyxy": [index * 40, 0, index * 40 + 38, 58],
+                "p": (posterior / posterior.sum()).tolist(),
+                "conf": 0.95,
+            }
         )
-    return dict(t=t, boxes=boxes)
+    return {"t": t, "boxes": boxes}
 
 
 @pytest.mark.parametrize(
-    "case,expected_solves,pinned",
+    ("case", "expected_solves", "pinned"),
     [
         ("subset", 2, 0),
         ("hidden", 2, 0),
@@ -60,30 +66,25 @@ def _frame(t, count):
     ],
 )
 def test_real_dense_evidence_changes_objective_before_resolve(
-    monkeypatch, case, expected_solves, pinned
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: Path,
+    case: str,
+    expected_solves: int,
+    pinned: int | None,
+) -> None:
     """Exercise still-run aggregation and evidence mapping; stub only I/O and search."""
-    counts = {
-        "subset": 8,
-        "hidden": 11,
-        "full": 13,
-        "draw": 14,
-        "kan": 13,
-        "kan_after": 10,
-    }
-    start = 52 if case == "kan_after" else 42 if case == "draw" else 22
-    frames = [_frame(start + 0.2 * k, counts.get(case, 8)) for k in range(6)]
-    if case in ("empty", "kan_empty"):
-        frames = []
-    elif case == "moving":
-        frames = [_frame(22 + 0.2 * k, 8 + k % 3) for k in range(6)]
+    frames = _dense_frames(case)
     reads = []
 
-    def read_window(*args, **kwargs):
-        reads.append((args[5], args[6], args[7]))
-        return {
-            "hand:TL": [frame for frame in frames if args[5] <= frame["t"] <= args[6]]
-        }
+    def read_window(
+        _context: object,
+        lo: float,
+        hi: float,
+        regions: list[str],
+        **_unused_kwargs: object,
+    ) -> dict:
+        reads.append((lo, hi, regions))
+        return {"hand:TL": [frame for frame in frames if lo <= frame["t"] <= hi]}
 
     monkeypatch.setattr(dense, "dense_reads", read_window)
     seat_turns = [SeatTurn(0, "draw", "6z", 10, 20), SeatTurn(1, "draw", "9m", 40, 50)]
@@ -93,7 +94,7 @@ def test_real_dense_evidence_changes_objective_before_resolve(
     monkeypatch.setattr(
         decode,
         "seat_turns_of",
-        lambda turns, seat, dealer: (
+        lambda _turns, seat, _dealer: (
             seat_turns if seat == "S" else [],
             {1: 1} if case.startswith("kan") and seat == "S" else {},
         ),
@@ -110,7 +111,7 @@ def test_real_dense_evidence_changes_objective_before_resolve(
     if case.startswith("kan"):
         first.margins[("S", 1)] = first.alternative_gaps[("S", 1)] = 10.0
     second = Solution("optimal", 1.0, {}, {}, {})
-    decoder = SimpleNamespace(
+    decoder = hand_decoder(
         dealer="E",
         dora=[],
         ura=[],
@@ -121,8 +122,8 @@ def test_real_dense_evidence_changes_objective_before_resolve(
         t0=0.0,
         t1=65.0,
         problems=[],
-        work_dir=None,
-        models=None if case == "offline" else (None, None, None, None),
+        work_dir=tmp_path,
+        models=None if case == "offline" else models_stub(),
         turns=[
             Turn(0, "S", "draw", None, 20.0),
             Turn(1, "W", "draw", None, 30.0),
@@ -130,28 +131,23 @@ def test_real_dense_evidence_changes_objective_before_resolve(
             Turn(3, "W", "draw", None, 60.0),
         ],
         riichi_alternatives=[],
-        _apply_hand_facts=lambda model: None,
-        _result_constraint=lambda model: None,
+        _apply_hand_facts=lambda _model: None,
+        _result_constraint=lambda _model: None,
     )
     searched = []
 
-    def search(prior=None):
+    def search(prior: "Solution | None" = None) -> "Solution":
         # Confirm the accepted observations really enter the CP objective;
         # do not rely on a list-length assertion alone to establish usefulness.
         program = decoder.model.build()[0]
-        searched.append(dict(prior=prior, terms=len(program.proto.objective.vars)))
+        searched.append({"prior": prior, "terms": len(program.proto.objective.vars)})
         return first if len(searched) == 1 else second
 
-    decoder._solve = search
+    monkeypatch.setattr(decoder, "_solve", search)
     real_draws = dense.draws
     pin_counts = []
 
-    def acquire(*args, **kwargs):
-        result = real_draws(*args, **kwargs)
-        pin_counts.append(result)
-        return result
-
-    monkeypatch.setattr(dense, "draws", acquire)
+    monkeypatch.setattr(dense, "draws", record_results(real_draws, pin_counts))
     decode.HandDecoder._fit_evidence(decoder)
     assert len(searched) == expected_solves
     assert pin_counts == ([] if pinned is None else [pinned])
@@ -160,14 +156,33 @@ def test_real_dense_evidence_changes_objective_before_resolve(
         assert searched[1]["prior"] is first
         assert searched[1]["terms"] > searched[0]["terms"]
         if case == "subset":
-            assert decoder.model.hand_ev and all(
-                e.subset for e in decoder.model.hand_ev
-            )
+            assert decoder.model.hand_ev
+            assert all(e.subset for e in decoder.model.hand_ev)
         elif case == "hidden":
             assert all(e.hidden == 2 for e in decoder.model.hand_ev)
         elif case == "draw":
             assert decoder.model.draw_ev
     else:
-        assert not decoder.model.hand_ev and not decoder.model.draw_ev
+        assert not decoder.model.hand_ev
+        assert not decoder.model.draw_ev
     if case in ("not_selected", "offline"):
         assert reads == []
+
+
+def _dense_frames(case: str) -> list[dict]:
+    """Provide the acquisition sequence for each evidence scenario."""
+    counts = {
+        "subset": 8,
+        "hidden": 11,
+        "full": 13,
+        "draw": 14,
+        "kan": 13,
+        "kan_after": 10,
+    }
+    start = 52 if case == "kan_after" else 42 if case == "draw" else 22
+    frames = [_frame(start + 0.2 * k, counts.get(case, 8)) for k in range(6)]
+    if case in ("empty", "kan_empty"):
+        frames = []
+    elif case == "moving":
+        frames = [_frame(22 + 0.2 * k, 8 + k % 3) for k in range(6)]
+    return frames

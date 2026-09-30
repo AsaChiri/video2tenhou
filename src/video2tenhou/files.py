@@ -1,12 +1,46 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared file operations for provenance and complete, atomic publications."""
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
+from typing import TYPE_CHECKING, overload
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from typing import IO
+
+WINDOWS_REPLACE_BUSY_ERRORS = (5, 32, 33)
+
+
+@overload
+def sanitize(value: dict) -> dict: ...
+
+
+@overload
+def sanitize(value: object) -> object: ...
+
+
+def sanitize(value: object) -> object:
+    """Replace nonfinite floats recursively before writing JSON for browsers."""
+    if isinstance(value, float):
+        if math.isnan(value):
+            return None
+        if math.isinf(value):
+            return 1e9 if value > 0 else -1e9
+        return value
+    if isinstance(value, dict):
+        return {key: sanitize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize(item) for item in value]
+    return value
 
 
 def sha256_file(path: str | Path) -> str:
@@ -16,7 +50,7 @@ def sha256_file(path: str | Path) -> str:
 
 
 @contextmanager
-def _atomic_text_file(path: Path, *, retry_windows: bool):
+def _atomic_text_file(path: Path, *, retry_windows: bool) -> "Iterator[IO[str]]":
     """Sync a sibling temporary file before replacing the destination."""
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = None
@@ -33,7 +67,7 @@ def _atomic_text_file(path: Path, *, retry_windows: bool):
             yield stream
             stream.flush()
             os.fsync(stream.fileno())
-        for attempt, delay in enumerate((0.05, 0.1, 0.2, 0.4, 0)):
+        for delay in (0.05, 0.1, 0.2, 0.4, 0):
             try:
                 pending.replace(path)
                 break
@@ -41,17 +75,16 @@ def _atomic_text_file(path: Path, *, retry_windows: bool):
                 if (
                     not retry_windows
                     or os.name != "nt"
-                    or getattr(exc, "winerror", None) not in (5, 32, 33)
-                    or attempt == 4
+                    or getattr(exc, "winerror", None) not in WINDOWS_REPLACE_BUSY_ERRORS
+                    or not delay
                 ):
                     raise
                 time.sleep(delay)
     finally:
         if pending is not None:
-            try:
+            # Cleanup must retain the original write/replacement failure.
+            with suppress(OSError):
                 pending.unlink(missing_ok=True)
-            except OSError:
-                pass  # Retain the original write/replacement failure.
 
 
 def atomic_write_text(path: Path, content: str, *, retry_windows: bool = False) -> None:
@@ -66,8 +99,13 @@ def atomic_write_text(path: Path, content: str, *, retry_windows: bool = False) 
 
 
 def atomic_write_json(
-    path: Path, value, *, retry_windows: bool = False, **options
+    path: Path,
+    value: object,
+    *,
+    retry_windows: bool = False,
+    indent: int | None = None,
+    sort_keys: bool = False,
 ) -> None:
     """Publish JSON with the same failure guarantees as atomic_write_text."""
     with _atomic_text_file(path, retry_windows=retry_windows) as stream:
-        json.dump(value, stream, ensure_ascii=False, **options)
+        json.dump(value, stream, ensure_ascii=False, indent=indent, sort_keys=sort_keys)

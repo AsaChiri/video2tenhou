@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Run the shipped tests from an sdist without private workspace data.
 
 Uses the current environment's dependencies. The wheel smoke check separately
@@ -39,7 +42,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", nargs="?", type=Path)
     args = parser.parse_args()
-    archive = args.archive or sorted(Path("dist").glob("*.tar.gz"))[-1]
+    archive = args.archive or max(Path("dist").glob("*.tar.gz"))
     check(archive.resolve())
 
 

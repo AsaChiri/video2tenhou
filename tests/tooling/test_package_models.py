@@ -1,23 +1,24 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Release bundles retain provenance, exclude local data and authenticate weights."""
 
 import hashlib
-import importlib.util
 import json
 import zipfile
+from typing import TYPE_CHECKING
 
 import pytest
 
-from tests.paths import ROOT
+from tools import package_models as package
 
-spec = importlib.util.spec_from_file_location(
-    "package_models", ROOT / "tools/package_models.py"
-)
-package = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(package)
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
-def models(tmp_path):
+def models(tmp_path: "Path") -> "Path":
+    """Create the model files required by the release bundle contract."""
     root = tmp_path / "models"
     for name in package.FILES:
         path = root / name
@@ -40,8 +41,9 @@ def models(tmp_path):
 
 
 def test_bundle_is_reproducible_and_every_runtime_member_is_authenticated(
-    models, tmp_path
-):
+    models: "Path", tmp_path: "Path"
+) -> None:
+    """Verify bundle is reproducible and every runtime member is authenticated."""
     first = package.bundle(models, tmp_path / "first.zip")
     second = package.bundle(models, tmp_path / "second.zip")
     assert first.read_bytes() == second.read_bytes()
@@ -80,8 +82,9 @@ def test_bundle_is_reproducible_and_every_runtime_member_is_authenticated(
     ],
 )
 def test_incomplete_or_mismatched_release_preserves_existing_archive(
-    models, tmp_path, defect
-):
+    models: "Path", tmp_path: "Path", defect: str
+) -> None:
+    """Verify incomplete or mismatched release preserves existing archive."""
     target = tmp_path / "release.zip"
     target.write_bytes(b"previous release")
     if defect == "mismatch":

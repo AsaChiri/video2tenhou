@@ -1,32 +1,67 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Per-recording evidence, human facts, calibration and rebuild jobs."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import math
 import os
 import sys
 import threading
 import time
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 
-from ..files import atomic_write_text
-from ..paths import DATA_DIR as ROOT
+from video2tenhou import calibfit, video
+from video2tenhou.cache import source_identity
+from video2tenhou.engine.review import load_facts
+from video2tenhou.engine.validation import review_artifact
+from video2tenhou.files import atomic_write_json, atomic_write_text
+from video2tenhou.layout import CORNERS, Calibration, box_to_quad, fit_path
+from video2tenhou.observe import load_obs
+from video2tenhou.paths import DATA_DIR as ROOT
+from video2tenhou.perception import detector
+from video2tenhou.perception.reader import read_region
+from video2tenhou.train.data import region_upright
+
 from .processes import ProcessOwner
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+    from video2tenhou.perception.classifier import Classifier
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+FRAME_CACHE_LIMIT = 40
+FACT_TIMESTAMP_TOLERANCE = 1e-6
+MIN_PREVIEW_SCALE = 0.05
+MAX_PREVIEW_SCALE = 4.0
+SCALE_CHANGE_TOLERANCE = 1e-6
+MIN_ROLL_CORRECTION = 0.5
+CONTEXT_TURN_WINDOW = 1.5
+LOGGER = logging.getLogger(__name__)
 
 
 class ReviewState:
     """Per-recording review data, frame cache and serialized background jobs."""
 
-    def __init__(self, video: Path, work: Path, calib: str, out: Path | None = None):
+    def __init__(
+        self, video: Path, work: Path, calib: str, out: Path | None = None
+    ) -> None:
+        """Open saved review inputs and initialize per-recording jobs and locks."""
         self.calib_name = calib
         self.jobs: dict = {}
         self.processes = ProcessOwner()
         self._threads: list[threading.Thread] = []
-        from ..layout import Calibration
 
         self.video = video
         self.name = video.stem
@@ -35,43 +70,50 @@ class ReviewState:
         self.labels = ROOT / "labels" / self.name
         (self.labels / "boxes").mkdir(parents=True, exist_ok=True)
         self.cal = Calibration.load(calib, video)
-        # a video whose geometry has not been measured has not been converted either, so there is no
-        # header and no record yet: the tool still opens, on the Calibrate page, which needs neither
-        self.hands = self._read_json(self.work / "hands.json") or []
+        # a video whose geometry has not been measured has not been converted either, so
+        # there is no
+        # header and no record yet: the tool still opens, on the Calibrate page, which
+        # needs neither
+        self.hands = self._read_json(self.work / "hands.json", list) or []
         self.lock = threading.Lock()
         self._models = None
         self._checks: dict[str, dict] = {}
         self._frame_cache: dict[float, np.ndarray] = {}
         self._review_views: dict[int, tuple[tuple, dict]] = {}
+        self.configuration_signature: str | None = None
 
     def frame(self, t: float) -> np.ndarray:
         """Seek a normalized BGR frame, reusing recent evidence requests."""
-        from .. import video
-
         t = round(float(t), 2)
         with self.lock:
             if t not in self._frame_cache:
-                if len(self._frame_cache) > 40:
+                if len(self._frame_cache) > FRAME_CACHE_LIMIT:
                     self._frame_cache.clear()
                 self._frame_cache[t] = video.frame_at(self.video, t)
             return self._frame_cache[t]
 
-    def models(self):
+    @property
+    def models_loaded(self) -> bool:
+        """Report whether this review state owns inference models."""
+        with self.lock:
+            return self._models is not None
+
+    def models(self) -> tuple[detector.Detector, Classifier]:
         """Load detector/classifier lazily for calibration and label prefill."""
         with self.lock:
             if self._models is None:
-                from ..perception.classifier import Classifier
-                from ..perception.detector import Detector
+                from video2tenhou.perception.classifier import (  # noqa: PLC0415
+                    Classifier,
+                )
 
-                self._models = (Detector(), Classifier())
+                self._models = (detector.Detector(), Classifier())
             return self._models
 
-    # -- calibration (stage 0) ------------------------------------------------------------
+    # -- calibration (stage 0)
+    # ------------------------------------------------------------
 
-    def reload_calib(self):
+    def reload_calib(self) -> Calibration:
         """Invalidate rendered evidence after geometry changes."""
-        from ..layout import Calibration
-
         previous = self.cal.data
         self.cal = Calibration.load(self.calib_name, self.video)
         self._frame_cache.clear()
@@ -80,13 +122,16 @@ class ReviewState:
             if self.hands:
                 self.work.mkdir(parents=True, exist_ok=True)
                 (self.work / "calibration.changed").write_text(
-                    "Run full analysis to refresh observations after changing geometry.\n",
+                    (
+                        "Run full analysis to refresh observations after changing "
+                        "geometry.\n"
+                    ),
                     encoding="utf-8",
                 )
         return self.cal
 
     def revision(self) -> list:
-        """Cheap on-disk change token for review refreshes from another tab or process."""
+        """Return a disk change token for review refreshes across tabs/processes."""
         paths = [
             self.work / "hands.json",
             self.labels / "facts.jsonl",
@@ -100,16 +145,16 @@ class ReviewState:
             if p.exists()
         ]
 
-    def plate(self):
+    def plate(self) -> np.ndarray:
         """Return the cached median table image used to adjust calibration."""
-        from .. import calibfit
-
         return calibfit.table_plate(self.video, self.work)
 
     def calib(self) -> dict:
-        """Every region as a quad in frame coordinates, so the page can draw and drag them on the plate."""
-        from ..layout import CORNERS, box_to_quad
+        """Return region quadrilaterals for the calibration editor.
 
+        Every region as a quad in frame coordinates, so the page can draw and drag them
+        on the plate.
+        """
         cal = self.cal
         out = {
             "video": self.name,
@@ -158,12 +203,9 @@ class ReviewState:
         return out
 
     def save_calib(self, body: dict) -> dict:
-        """Save changed table regions into the current fit, preserving the other regions."""
-        from ..files import atomic_write_json
-        from ..layout import fit_path
-
+        """Save changed table regions, preserving the rest of the fit."""
         p = fit_path(self.video)
-        fit = (
+        fit: dict = (
             json.loads(p.read_text(encoding="utf-8"))
             if p.exists()
             else {"video": self.name, "layout": self.calib_name}
@@ -191,18 +233,24 @@ class ReviewState:
             "fit": self.cal.fit,
         }
 
-    def start_job(self, key: str | int, fn, *, hands: list[int] | None = None) -> dict:
+    def start_job(
+        self,
+        key: str | int,
+        fn: Callable[[], object],
+        *,
+        hands: list[int] | None = None,
+    ) -> dict:
         """Run one review operation in the background and expose its failure."""
         with self.lock:
             if self.processes.closing:
-                raise ValueError("The app is closing. Restart it to continue.")
+                msg = "The app is closing. Restart it to continue."
+                raise ValueError(msg)
             st = self.jobs.get(key)
             if st and st.get("running"):
                 return st
             if any(j.get("running") for j in self.jobs.values()):
-                raise ValueError(
-                    "Another review job is running. Wait for it to finish."
-                )
+                msg = "Another review job is running. Wait for it to finish."
+                raise ValueError(msg)
             st = {
                 "key": key,
                 "running": True,
@@ -215,10 +263,11 @@ class ReviewState:
                 st["hands"] = list(hands)
             self.jobs[key] = st
 
-        def run():
+        def run() -> None:
             try:
                 st["result"] = fn()
             except Exception as e:
+                LOGGER.exception("Review job %s failed", key)
                 st["error"] = str(e)
             st["running"] = False
             st["done"] = time.time()
@@ -229,7 +278,11 @@ class ReviewState:
         return st
 
     def run_calib_fit(self) -> dict:
-        """Re-measure this video's geometry. Rectangles a person drew here are marked `human` and kept."""
+        """Refit measured geometry while preserving manual rectangles.
+
+        Re-measure this video's geometry. Rectangles a person drew here are marked
+        `human` and kept.
+        """
         result = self.processes.run(
             [
                 sys.executable,
@@ -255,21 +308,18 @@ class ReviewState:
         self.reload_calib()
         if result.returncode:
             raise RuntimeError((result.stdout + result.stderr)[-2000:])
+        if self.cal.fit is None:
+            msg = "Calibration fitting completed without producing a fit"
+            raise RuntimeError(msg)
         return self.cal.fit
 
     def run_calib_check(self) -> dict[str, dict]:
-        """Check that region borders do not cut visible tiles; keep results for the UI."""
-        code = (
-            "import json,sys; from pathlib import Path; from video2tenhou.layout import Calibration; "
-            "from video2tenhou.calibfit import check_all; from video2tenhou.perception.detector import Detector; "
-            "checks=check_all(Path(sys.argv[1]), Calibration.load(sys.argv[2],sys.argv[1]), Detector(), Path(sys.argv[3])); "
-            "print(json.dumps({c.region:{'level':c.level,'held':c.held,'cut':c.cut,'note':c.note} for c in checks}))"
-        )
+        """Check border cuts and retain the results for the UI."""
         result = self.processes.run(
             [
                 sys.executable,
-                "-c",
-                code,
+                "-m",
+                "video2tenhou.tool.check_calibration",
                 str(self.video),
                 self.calib_name,
                 str(self.work),
@@ -282,7 +332,7 @@ class ReviewState:
         )
         if result.returncode:
             raise RuntimeError((result.stdout + result.stderr)[-2000:])
-        self._checks = json.loads(result.stdout.strip().splitlines()[-1])
+        self._checks = json.loads(result.stdout)
         return self._checks
 
     def decode_path(self, i: int) -> Path:
@@ -307,7 +357,8 @@ class ReviewState:
                     else ("review" if d["items"] else "complete")
                 )
             decoded_at = p.stat().st_mtime if p.exists() else None
-            # facts newer than what the last decode used: a job loads the facts when it starts, not when it ends
+            # facts newer than what the last decode used: a job loads the facts when it
+            # starts, not when it ends
             job = self.jobs.get(h["hand"])
             cutoff = decoded_at
             if (
@@ -346,8 +397,6 @@ class ReviewState:
 
     def review_decode(self, hand: int) -> dict | None:
         """Expose current export failures and notes alongside decoded evidence."""
-        from ..engine.validation import review_artifact
-
         path = self.decode_path(hand)
         if not path.exists():
             return None
@@ -356,7 +405,7 @@ class ReviewState:
         cached = self._review_views.get(hand)
         if cached and cached[0] == key:
             return cached[1]
-        decoded = self._read_json(path)
+        decoded = self._read_json(path, dict)
         if not decoded:
             return decoded
         entry = next(h for h in self.hands if h["hand"] == hand)
@@ -377,6 +426,8 @@ class ReviewState:
             if not p.exists():
                 continue
             d = self.review_decode(h["hand"])
+            if d is None:
+                continue
             for k, it in enumerate(d["items"]):
                 row = dict(it)
                 field = row.get("kind")
@@ -424,28 +475,30 @@ class ReviewState:
         ]
 
     @staticmethod
-    def _read_json(p: Path):
+    def _read_json[Container: (dict, list)](
+        p: Path, kind: type[Container]
+    ) -> Container | None:
         """Read atomically published review data; absent outputs are not ready yet."""
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            value = json.loads(p.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
+        if not isinstance(value, kind):
+            message = f"Expected a JSON {kind.__name__} in {p}"
+            raise TypeError(message)
+        return value
 
     def all_facts(self) -> list[dict]:
         """Read the append-only human evidence file for this recording."""
-        from ..engine.review import load_facts
-
         return load_facts(self.labels)
 
     def _review_changes(self) -> dict:
-        return self._read_json(self.work / "review-changes.json") or {
+        return self._read_json(self.work / "review-changes.json", dict) or {
             "changes": {},
             "rebuilds": {},
         }
 
     def _save_review_changes(self, data: dict) -> None:
-        from ..files import atomic_write_json
-
         path = self.work / "review-changes.json"
         atomic_write_json(path, data, sort_keys=True)
 
@@ -463,7 +516,7 @@ class ReviewState:
             (h["hand"] for h in self.hands if h["hand"] == fact.get("hand")), None
         )
 
-    def _mark_review_changes(self, hands, changed_at: float) -> None:
+    def _mark_review_changes(self, hands: Iterable[int], changed_at: float) -> None:
         # Caller holds self.lock: additions and deletions share one atomic ledger.
         data = self._review_changes()
         for hand in hands:
@@ -538,7 +591,8 @@ class ReviewState:
                 (c for c, s in e["corner_wind"].items() if s == row["seat"]), None
             )
             if corner is None:
-                raise ValueError(f"seat {row['seat']} is not at this table")
+                msg = f"seat {row['seat']} is not at this table"
+                raise ValueError(msg)
             row["corner"] = corner
         with self.lock:
             row["ts"] = time.time()
@@ -562,15 +616,18 @@ class ReviewState:
         with self.lock:
             rows = (
                 [
-                    l
-                    for l in p.read_text(encoding="utf-8").splitlines(keepends=True)
-                    if l.strip()
+                    line
+                    for line in p.read_text(encoding="utf-8").splitlines(keepends=True)
+                    if line.strip()
                 ]
                 if p.exists()
                 else []
             )
             keep = [
-                l for l in rows if abs(float(json.loads(l).get("ts") or -1) - ts) > 1e-6
+                line
+                for line in rows
+                if abs(float(json.loads(line).get("ts") or -1) - ts)
+                > FACT_TIMESTAMP_TOLERANCE
             ]
             removed = [
                 self._fact_hand(json.loads(line)) for line in rows if line not in keep
@@ -588,14 +645,11 @@ class ReviewState:
 
     def save_label(self, lab: dict) -> Path:
         """Store region-space tile boxes as frame-coordinate training labels."""
-        from ..layout import box_to_quad
-        from ..train.data import region_upright
-
         kind, corner, t = lab["kind"], lab["corner"], float(lab["t"])
-        _, M = region_upright(self.frame(t), self.cal, kind, corner)
+        _, transform = region_upright(self.frame(t), self.cal, kind, corner)
         boxes = [
             {
-                "quad": box_to_quad(M, b["xyxy"]),
+                "quad": box_to_quad(transform, b["xyxy"]),
                 "tile": b.get("tile", "?"),
                 "sideways": bool(b.get("sideways")),
                 "role": b.get("role", "tile"),
@@ -613,22 +667,25 @@ class ReviewState:
         for k in ("tiles", "rows", "melds"):
             if k in lab:
                 out[k] = lab[k]
-        p = self.labels / "boxes" / f"{kind}_{corner}_{int(round(t))}.json"
+        p = self.labels / "boxes" / f"{kind}_{corner}_{round(t)}.json"
         if p.exists():
-            old = json.load(open(p, encoding="utf-8"))
+            old = json.loads(p.read_text(encoding="utf-8"))
             bak = p.with_suffix(".orig.json")
             if old.get("source") != "tool" and not bak.exists():
                 bak.write_text(
                     json.dumps(old, ensure_ascii=False, indent=1), encoding="utf-8"
                 )  # keep the human label once
-        json.dump(out, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        atomic_write_json(p, out, indent=1)
         return p
 
     def render(self, t: float, region: str, scale: float = 1.0) -> bytes:
         """Render a frame or calibrated upright region as JPEG evidence."""
-        if region not in ["frame", *self.cal.regions()] or not 0.05 <= scale <= 4.0:
-            raise ValueError("Unknown region or unsupported image scale.")
-        from ..train.data import region_upright
+        if (
+            region not in ["frame", *self.cal.regions()]
+            or not MIN_PREVIEW_SCALE <= scale <= MAX_PREVIEW_SCALE
+        ):
+            msg = "Unknown region or unsupported image scale."
+            raise ValueError(msg)
 
         frame = self.frame(t)
         if region == "frame":
@@ -641,18 +698,18 @@ class ReviewState:
                 img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
             )
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if not ok:
+            msg = "Could not encode the evidence image"
+            raise OSError(msg)
         return buf.tobytes()
 
     def read(self, t: float, region: str) -> dict:
         """Prefill editable boxes with model predictions and region coordinates."""
-        from ..perception.reader import read_region
-        from ..train.data import region_upright
-
         det, clf = self.models()
         kind, _, corner = region.partition(":")
         frame = self.frame(t)
         img, _ = region_upright(frame, self.cal, kind, corner)
-        rd = read_region(frame, self.cal, region, det, clf, t=t, img=img)
+        rd = read_region(img, region, det, clf, t=t)
         return {
             "size": list(rd.size),
             "boxes": [
@@ -672,15 +729,18 @@ class ReviewState:
         }
 
     def clip(self, t0: float, t1: float, region: str) -> Path:
-        """An mp4 of one camera (or the whole frame) between t0 and t1, cached under work/<video>/clips."""
+        """Cache an MP4 of a camera region over the requested time interval.
+
+        An mp4 of one camera (or the whole frame) between t0 and t1, cached under
+        work/<video>/clips.
+        """
         if region not in ["frame", *self.cal.regions()]:
-            raise ValueError("Unknown video region.")
-        import hashlib
+            msg = "Unknown video region."
+            raise ValueError(msg)
 
         d = self.work / "clips"
         d.mkdir(parents=True, exist_ok=True)
         t0, t1 = max(0.0, t0), max(t0 + 1.0, t1)
-        from ..cache import source_identity
 
         geometry = hashlib.sha256(
             json.dumps(
@@ -691,8 +751,10 @@ class ReviewState:
         if p.exists():
             return p
         kind, _, corner = region.partition(":")
-        # the same geometry as the still images (layout.Calibration.transform): de-rotate the table, cut the
-        # region, turn it upright, scale. ffmpeg's rotate turns clockwise, OpenCV's counter-clockwise.
+        # the same geometry as the still images (layout.Calibration.transform):
+        # de-rotate the table, cut the
+        # region, turn it upright, scale. ffmpeg's rotate turns clockwise, OpenCV's
+        # counter-clockwise.
 
         if kind in ("hand", "meld", "cam"):
             rect, scale = (
@@ -703,11 +765,15 @@ class ReviewState:
                 else (self.cal.cam[corner], 1.0)
             )
             vf = f"crop={rect.w}:{rect.h}:{rect.x}:{rect.y}"
-            if scale and abs(scale - 1.0) > 1e-6:
+            if scale and abs(scale - 1.0) > SCALE_CHANGE_TOLERANCE:
                 vf += f",scale=iw*{scale:g}:ih*{scale:g}"
             roll = self.cal.roll(corner) if kind == "hand" else 0.0
-            if abs(roll) > 0.5:
-                vf += f",rotate={-roll * math.pi / 180:.5f}:ow=rotw({-roll * math.pi / 180:.5f}):oh=roth({-roll * math.pi / 180:.5f}):c=black"
+            if abs(roll) > MIN_ROLL_CORRECTION:
+                vf += (
+                    f",rotate={-roll * math.pi / 180:.5f}:ow=rotw("
+                    f"{-roll * math.pi / 180:.5f}):oh=roth("
+                    f"{-roll * math.pi / 180:.5f}):c=black"
+                )
         elif kind in ("pond", "overhead"):
             cx, cy, side = self.cal.center[0], self.cal.center[1], self.cal.side
             vf = (
@@ -719,7 +785,7 @@ class ReviewState:
                 vf += f",crop={rect.w}:{rect.h}:{rect.x}:{rect.y}" + ",transpose=1" * (
                     k % 4
                 )
-                if scale and abs(scale - 1.0) > 1e-6:
+                if scale and abs(scale - 1.0) > SCALE_CHANGE_TOLERANCE:
                     vf += f",scale=iw*{scale:g}:ih*{scale:g}"
         else:
             vf = "scale=960:-2"
@@ -756,16 +822,16 @@ class ReviewState:
         return p
 
     def context(self, hand: int, seat: str, t: float) -> dict:
-        """What the camera read around time t (the seat's hand observations before and after) and what the
-        reconstruction assumes (hand before / after the turn at t).
-        """
-        from ..observe import load_obs
+        """Collect nearby hand observations and reconstruction evidence.
 
+        What the camera read around time t (the seat's hand observations before and
+        after) and what the reconstruction assumes (hand before / after the turn at t).
+        """
         e = self.hands[hand]
         corner = next(c for c, s in e["corner_wind"].items() if s == seat)
         obs = load_obs(self.work, hand).get(f"hand:{corner}", [])
 
-        def brief(o):
+        def brief(o: dict) -> dict:
             return {
                 "t0": o["t0"],
                 "t1": o["t1"],
@@ -783,9 +849,13 @@ class ReviewState:
         p = self.decode_path(hand)
         turn = None
         if p.exists():
-            d = json.load(open(p, encoding="utf-8"))
+            d = json.loads(p.read_text(encoding="utf-8"))
             turn = next(
-                (x for x in d["turns"] if x["seat"] == seat and abs(x["t"] - t) < 1.5),
+                (
+                    x
+                    for x in d["turns"]
+                    if x["seat"] == seat and abs(x["t"] - t) < CONTEXT_TURN_WINDOW
+                ),
                 None,
             )
         return {
@@ -796,7 +866,11 @@ class ReviewState:
         }
 
     def start_redecode(self, i: int) -> dict:
-        """Start the re-decode of hand i in a background thread (fresh process); returns its status."""
+        """Start a hand rebuild in a fresh background process.
+
+        Start the re-decode of hand i in a background thread (fresh process); returns
+        its status.
+        """
         return self.start_job(i, lambda: self._run_decode(str(i)))
 
     def redecode_status(self, i: int) -> dict:
@@ -811,15 +885,22 @@ class ReviewState:
         }
 
     def start_redecode_all(self) -> dict:
-        """Re-decode every hand with the facts saved so far, in the background (one fresh process)."""
+        """Rebuild every hand with saved facts in a background process.
+
+        Re-decode every hand with the facts saved so far, in the background (one fresh
+        process).
+        """
         return self.start_job("decode_all", lambda: self._run_decode("all"))
 
     def start_redecode_pending(self) -> dict:
-        """Rebuild the server's pending corrections in one child, without client-selected IDs.
+        """Rebuild the server's pending corrections in one child process.
 
-        The job retains its selected hands for progress and freshness receipts.
-        A no-change request is a no-op; completed hands are never forced merely
-        because another hand has a new or deleted answer.
+        Rebuild the server's pending corrections in one child, without client-selected
+        IDs.
+
+        The job retains its selected hands for progress and freshness receipts. A
+        no-change request is a no-op; completed hands are never forced merely because
+        another hand has a new or deleted answer.
         """
         selected = self.pending_rebuilds()
         if not selected:
@@ -835,7 +916,7 @@ class ReviewState:
 
     def redecode_pending_status(self) -> dict:
         """Report the pending-only job and corrections still absent from exports."""
-        st = dict(
+        st: dict = dict(
             self.jobs.get("decode_pending")
             or {
                 "key": "decode_pending",
@@ -862,8 +943,12 @@ class ReviewState:
         }
 
     def redecode_all_status(self) -> dict:
-        """The job's status, with how many hands were decoded since it started (the decode files it rewrote)."""
-        st = dict(
+        """Report decode-job status and the count of rewritten hands.
+
+        The job's status, with how many hands were decoded since it started (the decode
+        files it rewrote).
+        """
+        st: dict = dict(
             self.jobs.get("decode_all")
             or {
                 "key": "decode_all",
@@ -883,34 +968,28 @@ class ReviewState:
             )
         return {**st, "hands_done": done, "hands_total": len(self.hands)}
 
-    def _run_decode(self, which: str, *, job_key=None) -> None:
-        """Decode selected comma-separated hand IDs or "all" in a fresh process, so engine code on disk runs
-        (the server may have been up for hours).
+    def _run_decode(self, which: str, *, job_key: str | int | None = None) -> None:
+        """Decode selected hands in a fresh process using the current engine.
+
+        Decode selected comma-separated hand IDs or "all" in a fresh process, so engine
+        code on disk runs (the server may have been up for hours).
         """
         selected = (
             None if which == "all" else {int(value) for value in which.split(",")}
         )
         if selected is not None and not selected <= {h["hand"] for h in self.hands}:
-            raise ValueError("Unknown hand selected for rebuilding.")
+            msg = "Unknown hand selected for rebuilding."
+            raise ValueError(msg)
         if any(
             (self.work / marker).exists()
             for marker in ("calibration.changed", "inputs.changed")
         ):
-            raise ValueError(
-                "The table geometry or project settings changed. Close this view and choose Analyze recording to refresh readings and alignment before rebuilding logs."
+            msg = (
+                "The table geometry or project settings changed. Close this view "
+                "and choose Analyze recording to refresh readings and alignment "
+                "before rebuilding logs."
             )
-        code = (
-            "import json, sys; from pathlib import Path; from video2tenhou.record import from_dict; "
-            "from video2tenhou.layout import Calibration; from video2tenhou.engine.decode import run_decode; "
-            "work = Path(sys.argv[1]); hands = json.load(open(work / 'hands.json', encoding='utf-8')); "
-            "games = [from_dict(d) for d in json.load(open(work / 'record.json', encoding='utf-8'))]; "
-            "only = None if sys.argv[2] == 'all' else {int(value) for value in sys.argv[2].split(',')}; "
-            "run_decode(work, hands, games, force=True, only=only, log=lambda *a: None, "
-            "video_path=Path(sys.argv[3]), cal=Calibration.load(sys.argv[4], sys.argv[3])); "
-            "from video2tenhou.cli import write_outputs; "
-            "decodes = [json.loads(p.read_text(encoding='utf-8')) for p in sorted((work / 'decode').glob('*.json'))]; "
-            "write_outputs(Path(sys.argv[5]), games, decodes, hands, Path(sys.argv[3]).stem)"
-        )
+            raise ValueError(msg)
         with self.lock:
             started = time.time()
             key = (
@@ -926,8 +1005,8 @@ class ReviewState:
             r = self.processes.run(
                 [
                     sys.executable,
-                    "-c",
-                    code,
+                    "-m",
+                    "video2tenhou.tool.rebuild",
                     str(self.work),
                     which,
                     str(self.video),
@@ -956,8 +1035,10 @@ class ReviewState:
                 self._save_review_changes(data)
 
     def close(self) -> None:
-        """Stop review/calibration/video child processes before server shutdown."""
+        """Stop child processes and release this state's inference models."""
         self.processes.shutdown()
         for thread in self._threads:
             if thread is not threading.current_thread():
                 thread.join(timeout=5)
+        with self.lock:
+            self._models = None

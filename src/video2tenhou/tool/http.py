@@ -1,113 +1,102 @@
-"""Shared local HTTP transport: origin checks, bounded bodies and responses."""
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""ASGI transport policy for bounded, same-origin local workspace requests."""
+
+from __future__ import annotations
 
 import json
-import time
-from http.server import SimpleHTTPRequestHandler
+from http import HTTPStatus
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.exceptions import HTTPException
+from starlette.responses import JSONResponse
+
+from video2tenhou.files import sanitize
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 STATIC = Path(__file__).resolve().parent / "static"
+PROJECT_BODY_LIMIT = 65536
+REVIEW_BODY_LIMIT = 4 * 1024 * 1024
+UPLOAD_BODY_LIMIT = 100 * 1024**3
+SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "Content-Security-Policy": "frame-ancestors 'self'",
+}
 
 
-class LocalHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *a, **kw):
-        super().__init__(*a, directory=str(STATIC), **kw)
+def json_response(obj: object, code: int = HTTPStatus.OK) -> JSONResponse:
+    """Render finite browser-compatible JSON with the shared response policy."""
+    return JSONResponse(sanitize(obj), status_code=code, headers=SECURITY_HEADERS)
 
-    def end_headers(self):
-        """Avoid stale job responses and evidence after review edits."""
-        self.send_header(
-            "Cache-Control", "no-store"
-        )  # the page and images change between runs
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "same-origin")
-        self.send_header("Content-Security-Policy", "frame-ancestors 'self'")
-        super().end_headers()
 
-    def log_message(self, fmt, *args):  # quieter: no line per API call
-        """Keep periodic API polling out of the terminal access log."""
-        if args and "/api/" in str(args[0]):
-            return
-        super().log_message(fmt, *args)
-
-    def _json(self, obj, code=200):
-        if code >= 400 and self.command == "POST":
-            self._drain_rejected_body()
-        from ..engine.decode import sanitize
-
-        data = json.dumps(sanitize(obj), ensure_ascii=False).encode()
-        self._bytes(data, "application/json; charset=utf-8", code)
-
-    def _bytes(
-        self,
-        data: bytes,
-        content_type: str,
-        code: int = 200,
-        *,
-        headers: dict | None = None,
-    ):
-        """Send a complete response with the shared cache and security headers."""
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        for name, value in (headers or {}).items():
-            self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _read_request_bytes(self, size: int) -> bytes:
-        """Account for consumed bytes so an error never reads the body twice."""
-        data = self.rfile.read(size)
-        self._request_bytes_read = getattr(self, "_request_bytes_read", 0) + len(data)
-        return data
-
-    def _drain_rejected_body(self) -> None:
-        """Finish small rejected POST bodies before closing the TCP connection.
-
-        Closing with unread payload can turn a useful 4xx response into a
-        connection reset on Windows. Never wait indefinitely for a dishonest
-        Content-Length or drain an entire rejected video upload: both bytes
-        and waiting time are bounded, independently of endpoint body limits.
-        """
-        self.close_connection = True
-        try:
-            remaining = int(self.headers.get("Content-Length", "0")) - getattr(
-                self, "_request_bytes_read", 0
-            )
-        except ValueError:
-            return
-        if not 0 < remaining <= 1024 * 1024:
-            return
-        previous_timeout = self.connection.gettimeout()
-        try:
-            deadline = time.monotonic() + 0.5
-            while remaining > 0:
-                wait = deadline - time.monotonic()
-                if wait <= 0:
-                    break
-                self.connection.settimeout(min(previous_timeout or wait, wait))
-                chunk = self.rfile.read1(min(65536, remaining))
-                self._request_bytes_read = getattr(
-                    self, "_request_bytes_read", 0
-                ) + len(chunk)
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-        except (OSError, TimeoutError):
-            pass  # The response is still attempted; this connection is closed.
-        finally:
-            self.connection.settimeout(previous_timeout)
-
-    def _local_request(self):
-        """Reject browser cross-origin writes and DNS-rebinding hosts."""
-        host = self.headers.get("Host", "")
-        if not self._host_ok():
-            return False
-        origin = self.headers.get("Origin")
-        return (origin is None or origin == f"http://{host}") and self.headers.get(
-            "X-Video2Tenhou"
-        ) == "1"
-
-    def _host_ok(self) -> bool:
-        return self.headers.get("Host") in (
-            f"127.0.0.1:{self.server.server_port}",
-            f"localhost:{self.server.server_port}",
+async def read_json_body(request: Request, limit: int) -> dict:
+    """Read one bounded JSON object, checking streamed bytes as well as headers."""
+    size = int(request.headers.get("content-length", "0"))
+    if not 0 <= size <= limit:
+        raise HTTPException(
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request body is too large."
         )
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > limit:
+            raise HTTPException(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request body is too large."
+            )
+        data.extend(chunk)
+    body = json.loads(data or b"{}")
+    if not isinstance(body, dict):
+        message = "Expected a JSON object."
+        raise TypeError(message)
+    return body
+
+
+class LocalAccess:
+    """Enforce loopback host and write-origin policy around the entire ASGI app."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Wrap framework responses, including failures, with security headers."""
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Validate browser access before consuming any request body."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.update(SECURITY_HEADERS)
+            await send(message)
+
+        error = self.access_error(scope)
+        if error is not None:
+            await json_response({"error": error}, HTTPStatus.FORBIDDEN)(
+                scope, receive, send_headers
+            )
+            return
+        await self.app(scope, receive, send_headers)
+
+    @staticmethod
+    def access_error(scope: Scope) -> str | None:
+        """Require the listener's exact local authority and same-origin mutations."""
+        headers = Headers(scope=scope)
+        server = scope.get("server")
+        port = server[1] if server is not None else None
+        host = headers.get("host", "")
+        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            return "Use the localhost address shown when starting the app."
+        if scope["method"] not in ("GET", "HEAD") and (
+            headers.get("origin") not in (None, f"http://{host}")
+            or headers.get("x-video2tenhou") != "1"
+        ):
+            return "Only requests from this local app are accepted."
+        return None

@@ -1,3 +1,8 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Pond tracking, replacement ambiguity and table-clearing evidence."""
+
 import numpy as np
 
 from tests.engine.helpers import obs, row, slot
@@ -12,7 +17,8 @@ from video2tenhou.engine.ponds import (
 from video2tenhou.train.data import CLASS_INDEX, CLASSES
 
 
-def test_tracker_appends_and_a_call_takes_the_last_tile():
+def test_tracker_appends_and_a_call_takes_the_last_tile() -> None:
+    """Verify tracker appends and a call takes the last tile."""
     seq = [
         obs(0, 5, row(["1m"])),
         obs(8, 12, row(["1m", "2p"])),
@@ -32,8 +38,10 @@ def test_tracker_appends_and_a_call_takes_the_last_tile():
     assert log[3].t_window == (33, 36)
 
 
-def test_only_the_last_tile_can_be_called():
-    # 2p hidden twice in the middle of the pond: it is not called away (only the latest discard can be)
+def test_only_the_last_tile_can_be_called() -> None:
+    # 2p hidden twice in the middle of the pond: it is not called away (only the latest
+    # discard can be)
+    """Verify only the last tile can be called."""
     seq = [
         obs(0, 5, row(["1m", "2p", "3s"])),
         obs(8, 12, row(["1m", "3s"], start=0)),
@@ -47,9 +55,12 @@ def test_only_the_last_tile_can_be_called():
     ]
 
 
-def test_a_single_partial_frame_starts_nothing():
-    """Hand 0 of the second VOD: at the reveal a single moving frame showed West's two 1z pushed down a
-    row, plus tiles of the row above. None of it is a discard, and the 1z are the ones already known.
+def test_a_single_partial_frame_starts_nothing() -> None:
+    """Verify a single partial frame starts nothing.
+
+    Hand 0 of the second VOD: at the reveal a single moving frame showed West's two 1z
+    pushed down a row, plus tiles of the row above. None of it is a discard, and the 1z
+    are the ones already known.
     """
     tiles = ["4z", "8p", "7m", "9s", "3s", "3p"]
     seq = [
@@ -66,18 +77,20 @@ def test_a_single_partial_frame_starts_nothing():
         ),
     ]
     log = track_pond(seq)
-    assert [s.tile for s in log] == tiles + ["6s", "3m", "1z", "1z"]
+    assert [s.tile for s in log] == [*tiles, "6s", "3m", "1z", "1z"]
 
 
-def test_moved_tiles_are_the_same_tiles():
-    # a player shifts the second row left (and the reader puts its first tile in the wrong row): same slots
+def test_moved_tiles_are_the_same_tiles() -> None:
+    # a player shifts the second row left (and the reader puts its first tile in the
+    # wrong row): same slots
+    """Verify moved tiles are the same tiles."""
     first = row(["1m", "2m", "3m", "4m", "5m", "6m"])
     seq = [
         obs(0, 5, first + row(["6s", "3m", "1z"], 1)),
         obs(
             10,
             15,
-            first[:5] + [slot("6m", 1, 0)] + row(["6s", "3m", "1z", "1z"], 1, start=1),
+            [*first[:5], slot("6m", 1, 0), *row(["6s", "3m", "1z", "1z"], 1, start=1)],
         ),
     ]
     log = track_pond(seq)
@@ -95,8 +108,12 @@ def test_moved_tiles_are_the_same_tiles():
     ]
 
 
-def test_misread_last_tile_is_not_a_call():
-    """Hand 20 of the second VOD: North's 1s read as 3z for three views while the next discard was laid."""
+def test_misread_last_tile_is_not_a_call() -> None:
+    """Verify misread last tile is not a call.
+
+    Hand 20 of the second VOD: North's 1s read as 3z for three views while the next
+    discard was laid.
+    """
     seq = [
         obs(0, 5, row(["1s"])),
         obs(8, 9, row(["1s"])),
@@ -115,8 +132,10 @@ def test_misread_last_tile_is_not_a_call():
     assert log[0].disagree >= 1
 
 
-def test_refill_after_the_call_is_a_plain_discard():
-    # the last tile already missing in an earlier view: the next new tile is simply the next discard
+def test_refill_after_the_call_is_a_plain_discard() -> None:
+    # the last tile already missing in an earlier view: the next new tile is simply the
+    # next discard
+    """Verify refill after the call is a plain discard."""
     seq = [
         obs(0, 5, row(["1m", "4p"])),
         obs(8, 12, row(["1m"])),
@@ -130,12 +149,13 @@ def test_refill_after_the_call_is_a_plain_discard():
     ]
 
 
-def test_new_row_needs_six_in_the_previous_row():
+def test_new_row_needs_six_in_the_previous_row() -> None:
+    """Verify new row needs six in the previous row."""
     seq = [
         obs(0, 5, row(["1m", "2m"])),
-        obs(8, 12, row(["1m", "2m"]) + [slot("7z", 1, 0)]),  # a stray tile below row 0
-        obs(15, 20, row(["1m", "2m"]) + [slot("7z", 1, 0)]),
-        obs(23, 26, row(["1m", "2m", "3m"]) + [slot("7z", 1, 0)]),
+        obs(8, 12, [*row(["1m", "2m"]), slot("7z", 1, 0)]),  # a stray tile below row 0
+        obs(15, 20, [*row(["1m", "2m"]), slot("7z", 1, 0)]),
+        obs(23, 26, [*row(["1m", "2m", "3m"]), slot("7z", 1, 0)]),
     ]
     log = track_pond(seq)
     assert [(s.row, s.index, s.tile) for s in log] == [
@@ -145,7 +165,8 @@ def test_new_row_needs_six_in_the_previous_row():
     ]
 
 
-def test_partial_observation_never_removes():
+def test_partial_observation_never_removes() -> None:
+    """Verify partial observation never removes."""
     seq = [
         obs(0, 5, row(["1m", "2p"])),
         obs(8, 12, row(["1m", "2p"])),
@@ -162,7 +183,8 @@ def test_partial_observation_never_removes():
     assert log[2].t_window == (12, 25)  # the partial views did not narrow the window
 
 
-def test_the_clearing_stops_the_tracker():
+def test_the_clearing_stops_the_tracker() -> None:
+    """Verify the clearing stops the tracker."""
     tiles = ["1m", "2m", "3m", "4m", "5m"]
     seq = [
         obs(0, 5, row(tiles)),
@@ -172,7 +194,9 @@ def test_the_clearing_stops_the_tracker():
     assert [s.tile for s in track_pond(seq)] == tiles
 
 
-def _pslot(i, tile, t, removed=None, row=0):
+def _pslot(
+    i: "int", tile: "str", t: "float", removed: "float | None" = None, row: int = 0
+) -> "PondSlot":
     p = np.full(len(CLASSES), 0.002)
     p[CLASS_INDEX[tile]] = 0.9
     s = PondSlot(i, row, 0, p, t, (t - 3, t), t + 4, 3)
@@ -180,7 +204,8 @@ def _pslot(i, tile, t, removed=None, row=0):
     return s
 
 
-def test_insert_slot_takes_the_position_the_stack_gives():
+def test_insert_slot_takes_the_position_the_stack_gives() -> None:
+    """Verify insert slot takes the position the stack gives."""
     log = [_pslot(0, "1m", 10), _pslot(1, "2m", 20), _pslot(2, "3m", 30)]
     insert_slot(
         log, _pslot(9, "9p", 15, removed=18)
@@ -194,20 +219,24 @@ def test_insert_slot_takes_the_position_the_stack_gives():
     ]
     full = [_pslot(i, "1m", 10 * i) for i in range(6)]
     insert_slot(full, _pslot(9, "9p", 15, removed=16))
-    assert len(full) == 7 and full[2].index == full[3].index == 2
+    assert len(full) == 7
+    assert full[2].index == full[3].index == 2
 
 
-def test_tail_runs_align_by_reading_order_not_by_grid():
-    """The second VOD's hand 9: E chi'd N's 5s, N's eighth discard. The frame's geometry put the 5s in the third
-    row (tiles are not flush), where a grid lookup found no place for it; aligned with the stack in reading
-    order it is the tile after the last one, and it vanished while the pond stayed in view: a taken discard.
+def test_tail_runs_align_by_reading_order_not_by_grid() -> None:
+    """Verify tail runs align by reading order not by grid.
+
+    The second VOD's hand 9: E chi'd N's 5s, N's eighth discard. The frame's geometry
+    put the 5s in the third row (tiles are not flush), where a grid lookup found no
+    place for it; aligned with the stack in reading order it is the tile after the last
+    one, and it vanished while the pond stayed in view: a taken discard.
     """
     log = [
         _pslot(i, t, 10 * i + 5)
         for i, t in enumerate(["1m", "2m", "3m", "4m", "5m", "6m", "7m"])
     ]
 
-    def box(tile, row, col):
+    def box(tile: "str", row: "int", col: "int") -> dict:
         q = np.full(len(CLASSES), 0.002)
         q[CLASS_INDEX[tile]] = 0.9
         return {
@@ -223,21 +252,22 @@ def test_tail_runs_align_by_reading_order_not_by_grid():
         {"t": 100.0, "boxes": rest},
         {
             "t": 100.2,
-            "boxes": rest + [box("5s", 2, 0)],
+            "boxes": [*rest, box("5s", 2, 0)],
         },  # laid; the geometry says a third row
-        {"t": 100.4, "boxes": rest + [box("5s", 2, 0)]},
+        {"t": 100.4, "boxes": [*rest, box("5s", 2, 0)]},
         {"t": 100.6, "boxes": rest[:3]},  # a hand over the pond: says nothing
-        {"t": 100.8, "boxes": rest + [box("5s", 1, 1)]},
+        {"t": 100.8, "boxes": [*rest, box("5s", 1, 1)]},
         {"t": 101.0, "boxes": rest},
     ]  # gone, the pond in view: called
     runs = tail_runs(log, reads)
     assert [(r["tile"], r["n"], r["gone"]) for r in runs] == [("5s", 3, True)]
     # a slot the calm reads saw later is matched from the start of its window, not new
-    later = log + [_pslot(7, "5s", 103)]
+    later = [*log, _pslot(7, "5s", 103)]
     assert tail_runs(later, reads) == []
 
 
-def test_play_window_ends_at_the_clearing():
+def test_play_window_ends_at_the_clearing() -> None:
+    """Verify play window ends at the clearing."""
     ponds = {
         "pond:TL": [
             obs(0, 2, []),
@@ -247,14 +277,17 @@ def test_play_window_ends_at_the_clearing():
         ],
         "pond:TR": [obs(0, 2, []), obs(40, 42, row(["3p"])), obs(95, 97, [])],
     }
-    # two ponds emptied together: one clearing, after the last calm view that held tiles (TL at 62)
+    # two ponds emptied together: one clearing, after the last calm view that held tiles
+    # (TL at 62)
     assert clearings(ponds, 0, 100) == [62]
     assert play_window(ponds, 0, 100) == (0, 62)
 
 
-def test_play_window_finds_a_clearing_a_stale_count_would_hide():
-    """The second VOD's hand 4/1: three ponds are read empty over the shuffle while the fourth was last
-    read 30 s earlier, holding the previous hand.
+def test_play_window_finds_a_clearing_a_stale_count_would_hide() -> None:
+    """Verify play window finds a clearing a stale count would hide.
+
+    The second VOD's hand 4/1: three ponds are read empty over the shuffle while the
+    fourth was last read 30 s earlier, holding the previous hand.
     """
     prev = row(["1m", "2m"])
     ponds = {
@@ -279,7 +312,8 @@ def test_play_window_finds_a_clearing_a_stale_count_would_hide():
             obs(72, 76, []),
             obs(95, 99, row(["7z"])),
         ],
-        # last seen holding tiles at 46 s, then not read again until 81 s, well after the others are empty
+        # last seen holding tiles at 46 s, then not read again until 81 s, well after
+        # the others are empty
         "pond:BR": [
             obs(0, 4, prev),
             obs(42, 46, prev),
@@ -290,9 +324,12 @@ def test_play_window_finds_a_clearing_a_stale_count_would_hide():
     assert play_window(ponds, 0, 120) == (46, 120)
 
 
-def test_play_window_ignores_the_push_and_a_one_pond_dip():
-    """Hand 2 of the second VOD: one pond was seen only in partial frames over the clearing, and the next
-    hand's first discard lands in it; the others empty together. A single dip that comes back is not one.
+def test_play_window_ignores_the_push_and_a_one_pond_dip() -> None:
+    """Verify play window ignores the push and a one pond dip.
+
+    Hand 2 of the second VOD: one pond was seen only in partial frames over the
+    clearing, and the next hand's first discard lands in it; the others empty together.
+    A single dip that comes back is not one.
     """
     full = row(["1m", "2m", "3m", "4m", "5m", "6m"]) + row(["7m", "8m"], 1)
     ponds = {

@@ -1,4 +1,11 @@
-"""Tile face classifier: resnet18 on upright 64x96 crops, calibrated posteriors over 39 classes."""
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Calibrated tile posteriors from upright 64x96 ResNet18 crops.
+
+Tile face classifier: resnet18 on upright 64x96 crops, calibrated posteriors over 39
+classes.
+"""
 
 from __future__ import annotations
 
@@ -10,10 +17,11 @@ import cv2
 import numpy as np
 import torch
 
-from ..files import sha256_file
-from ..paths import MODEL_DIR
-from ..train.data import CLASSES, to_crop
-from ..train.train_classifier import make_model, to_tensor
+from video2tenhou.files import sha256_file
+from video2tenhou.paths import MODEL_DIR
+from video2tenhou.train.data import CLASSES, to_crop
+from video2tenhou.train.train_classifier import make_model, to_tensor
+
 from .device import select_device
 from .runtime import runtime_signature
 
@@ -24,12 +32,16 @@ PREPROCESSING = "resnet18-bgr-upright64x96-to_tensor-v1"
 class Classifier:
     """Calibrated local tile recognition; probabilities retain all 39 classes."""
 
-    def __init__(self, model_dir: str | Path = DEFAULT_DIR, device: str | None = None):
+    def __init__(
+        self, model_dir: str | Path = DEFAULT_DIR, device: str | None = None
+    ) -> None:
         """Load the trained checkpoint and temperature; prefer CUDA when present."""
         model_dir = Path(model_dir)
-        self.meta = json.load(open(model_dir / "meta.json"))
+        self.meta = json.loads((model_dir / "meta.json").read_text(encoding="utf-8"))
         self.classes: list[str] = self.meta["classes"]
-        assert self.classes == CLASSES
+        if self.classes != CLASSES:
+            msg = "Classifier classes must match the ordered tile vocabulary"
+            raise ValueError(msg)
         self.T = float(self.meta["temperature"])
         self.device = select_device(device)
         self.model = make_model(len(self.classes))
@@ -66,7 +78,11 @@ class Classifier:
     def classify(
         self, crops: list[np.ndarray], sideways: list[bool] | None = None
     ) -> np.ndarray:
-        """Posteriors; a sideways crop is classified in both 90-degree turns and the turns are averaged."""
+        """Average upright tile posteriors across both turns of sideways crops.
+
+        Posteriors; a sideways crop is classified in both 90-degree turns and the turns
+        are averaged.
+        """
         if not sideways or not any(sideways):
             return self.posteriors(crops)
         batch, idx = [], []

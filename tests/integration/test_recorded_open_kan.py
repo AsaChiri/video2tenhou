@@ -1,21 +1,39 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Real omitted kan-window evidence corrects a draw without a human constraint."""
 
 import copy
 import gzip
 import json
-from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from tests.integration.helpers import restore_model
 from tests.paths import DATA
+from tests.recognition import models_stub
 from video2tenhou.engine import dense
 from video2tenhou.engine.assemble import kyoku_from_decode
+from video2tenhou.engine.dense import DenseContext
 from video2tenhou.engine.review import draws_to_reread
 from video2tenhou.engine.solver import Solution
+from video2tenhou.engine.turns import Turn
 from video2tenhou.record import HandResult
 from video2tenhou.tenhou6 import replay_kyoku
 
+if TYPE_CHECKING:
+    from video2tenhou.read import ReadContext
 
-def test_recorded_open_kan_window_corrects_confident_inference(monkeypatch, tmp_path):
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pytest
+
+
+def test_recorded_open_kan_window_corrects_confident_inference(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path"
+) -> None:
+    """Verify recorded open kan window corrects confident inference."""
     with gzip.open(DATA / "week11_open_kan.json.gz", "rt", encoding="utf-8") as stream:
         case = json.load(stream)
     model = restore_model(case["model"])
@@ -31,12 +49,19 @@ def test_recorded_open_kan_window_corrects_confident_inference(monkeypatch, tmp_
         {},
     )
     assert prior.draws[("N", 6)] == "5s"  # Recorded error, not a constraint.
-    assert ("N", 6) not in model.facts.draws and "N" not in model.facts.haipai
+    assert ("N", 6) not in model.facts.draws
+    assert "N" not in model.facts.haipai
     selected = draws_to_reread(prior, model)
     assert selected == [("N", 6)]
     requests = []
 
-    def recorded(video, cal, work, det, clf, lo, hi, regions, **kwargs):
+    def recorded(
+        context: "ReadContext",
+        lo: "float",
+        hi: "float",
+        regions: "list[str]",
+        **_unused_kwargs: object,
+    ) -> "dict":
         requests.append((lo, hi, regions))
         assert (lo, hi, regions) == (
             case["request"]["lo"],
@@ -54,18 +79,21 @@ def test_recorded_open_kan_window_corrects_confident_inference(monkeypatch, tmp_
     dense.draws(
         selected,
         model,
-        [SimpleNamespace(**t) for t in reference["turns"]],
+        [Turn(t["i"], t["seat"], t["kind"], None, t["t"]) for t in reference["turns"]],
         melds_before,
-        case["entry"],
-        {},
-        (None, None, None, None),
-        tmp_path,
-        case["t0"],
-        [],
+        context=DenseContext(
+            entry=case["entry"],
+            models=models_stub(),
+            work_dir=tmp_path,
+            t0=case["t0"],
+            problems=[],
+        ),
     )
-    assert len(requests) == 1 and len(model.hand_ev) == before + 9
+    assert len(requests) == 1
+    assert len(model.hand_ev) == before + 9
     solution = model.solve(margins=False, time_limit=60, workers=2, prior=prior)
-    assert solution.ok and solution.optimal
+    assert solution.ok
+    assert solution.optimal
     assert [solution.draws[("N", j)] for j in (4, 5, 6)] == ["2p", "1z", "1s"]
     assert ("N", 6) not in model.facts.draws  # The answer remains external.
     decoded = copy.deepcopy(reference)

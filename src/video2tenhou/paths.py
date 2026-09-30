@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Separate immutable package resources from the user's writable workspace.
 
 Set VIDEO2TENHOU_HOME before starting the process to keep models, labels and

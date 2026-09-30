@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Smoke-test wheel resources outside the checkout, using installed dependencies."""
 
 import argparse
@@ -14,10 +17,12 @@ def check(wheel: Path) -> None:
         root = Path(directory)
         with zipfile.ZipFile(wheel) as archive:
             names = archive.namelist()
-            assert not any(
+            if any(
                 name.startswith(("labels/", "work/", "models/", "out/"))
                 for name in names
-            )
+            ):
+                msg = "Wheel contains private workspace data"
+                raise ValueError(msg)
             archive.extractall(root)
         script = """
 import os, sys
@@ -25,7 +30,9 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 os.environ["VIDEO2TENHOU_HOME"] = str(Path.cwd() / "local-data")
 from video2tenhou import layout, paths
+from video2tenhou.logging_setup import command_logging
 from video2tenhou.tool import server
+import logging
 assert Path(layout.__file__).is_relative_to(Path(sys.argv[1]))
 assert layout.Calibration.load("pml").name == "pml"
 assert paths.LABEL_DIR == (Path.cwd() / "local-data" / "labels").resolve()
@@ -35,9 +42,14 @@ assert not (static / "studio.html").exists()
 assert list((static / "assets").glob("*.js")), "Frontend JavaScript missing from wheel"
 assert list((static / "assets").glob("*.css")), "Frontend styles missing from wheel"
 assert list(static.rglob("*.svg")), "Tile art missing from wheel"
-print("Installed wheel resources and workspace isolation verified")
+@command_logging
+def report():
+    logging.getLogger("video2tenhou.check_dist").info(
+        "Installed wheel resources and workspace isolation verified"
+    )
+report()
 """
-        subprocess.run(
+        subprocess.run(  # noqa: S603
             [sys.executable, "-I", "-c", script, str(root)], cwd=root, check=True
         )
 
@@ -47,7 +59,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wheel", nargs="?", type=Path)
     args = parser.parse_args()
-    wheel = args.wheel or sorted(Path("dist").glob("*.whl"))[-1]
+    wheel = args.wheel or max(Path("dist").glob("*.whl"))
     check(wheel.resolve())
 
 

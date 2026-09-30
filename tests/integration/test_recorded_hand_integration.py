@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Replay real recognition through decoding, scoring, export, and legality checks.
 
 The compressed fixture contains no video, models, or player names. Recorded
@@ -7,21 +10,43 @@ game reconstruction run normally on CPU. See data/README.md for provenance.
 
 import gzip
 import json
+from typing import TYPE_CHECKING
 
 from tests.paths import DATA
+from tests.recognition import models_stub
 from video2tenhou.engine import decode, dense
 from video2tenhou.engine.assemble import kyoku_from_decode, player_index
-from video2tenhou.engine.decode import decode_hand
+from video2tenhou.engine.decode import DecodeOptions, decode_hand
+from video2tenhou.perception import detector, evidence_policy
+from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
 from video2tenhou.record import Game, HandResult
 from video2tenhou.tenhou6 import replay_kyoku
 
+if TYPE_CHECKING:
+    from video2tenhou.read import ReadContext
 
-def test_week11_e4_honba1_draw_order_and_export(monkeypatch, tmp_path):
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pytest
+
+
+def test_week11_e4_honba1_draw_order_and_export(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path"
+) -> None:
+    """Verify week11 e4 honba1 draw order and export."""
     with gzip.open(DATA / "week11_e4h1.json.gz", "rt", encoding="utf-8") as f:
         fixture = json.load(f)
     requests = []
 
-    def recorded(video, cal, work, det, clf, lo, hi, regions, **kwargs):
+    def recorded(
+        context: "ReadContext",
+        lo: "float",
+        hi: "float",
+        regions: "list[str]",
+        **_unused_kwargs: object,
+    ) -> "dict":
         requests.append((lo, hi, tuple(regions)))
         matching = [
             r
@@ -31,13 +56,18 @@ def test_week11_e4_honba1_draw_order_and_export(monkeypatch, tmp_path):
             and set(regions) == set(r["regions"])
         ]
         if not matching:
-            raise AssertionError(f"Unrecorded dense request: {lo}-{hi} {regions}")
+            msg = f"Unrecorded dense request: {lo}-{hi} {regions}"
+            raise AssertionError(msg)
         return matching[0]["data"]
 
-    def ponds(video, cal, work, det, clf, lo, hi, corners, **kwargs):
-        data = recorded(
-            video, cal, work, det, clf, lo, hi, [f"pond:{c}" for c in corners], **kwargs
-        )
+    def ponds(
+        context: "ReadContext",
+        lo: "float",
+        hi: "float",
+        corners: "list[str]",
+        **kwargs: "object",
+    ) -> dict:
+        data = recorded(context, lo, hi, [f"pond:{c}" for c in corners], **kwargs)
         return {c: data[f"pond:{c}"] for c in corners}
 
     monkeypatch.setattr(dense, "dense_reads", recorded)
@@ -48,7 +78,7 @@ def test_week11_e4_honba1_draw_order_and_export(monkeypatch, tmp_path):
     # This fixes only acquisition, never tile assignments or confidence proofs.
     acquisition = [("W", 1), ("W", 5), ("N", 0), ("N", 4), ("N", 5)]
     monkeypatch.setattr(
-        decode, "draws_to_reread", lambda solution, model=None: acquisition
+        decode, "draws_to_reread", lambda _solution, _model=None: acquisition
     )
     result = HandResult(**fixture["result"])
     decoded = decode_hand(
@@ -56,8 +86,7 @@ def test_week11_e4_honba1_draw_order_and_export(monkeypatch, tmp_path):
         fixture["observations"],
         result,
         fixture["facts"],
-        models=(None, None, None, None),
-        work_dir=tmp_path,
+        options=DecodeOptions(models=models_stub(), work_dir=tmp_path),
     )
     north = {t["j"]: t for t in decoded["turns"] if t["seat"] == "N"}
     assert [
@@ -113,11 +142,10 @@ def test_week11_e4_honba1_draw_order_and_export(monkeypatch, tmp_path):
     } == {(4, "2p"), (5, "1z")}
 
 
-def test_cached_decode_does_not_load_models(monkeypatch, tmp_path):
+def test_cached_decode_does_not_load_models(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path"
+) -> None:
     """Opening completed work should not initialize the GPU or require model files."""
-    from video2tenhou.engine import decode
-    from video2tenhou.perception import detector, evidence_policy
-
     work = tmp_path / "video"
     (work / "decode").mkdir(parents=True)
     (work / "obs").mkdir()
@@ -139,8 +167,9 @@ def test_cached_decode_does_not_load_models(monkeypatch, tmp_path):
     (work / "decode/00.json").write_text(json.dumps(cached), encoding="utf-8")
     monkeypatch.setattr(decode, "DATA_DIR", tmp_path)
 
-    def unexpected():
-        raise AssertionError("Models must not load for cached output")
+    def unexpected() -> None:
+        msg = "Models must not load for cached output"
+        raise AssertionError(msg)
 
     monkeypatch.setattr(detector, "Detector", unexpected)
     (tmp_path / "video.mp4").write_bytes(
@@ -150,22 +179,30 @@ def test_cached_decode_does_not_load_models(monkeypatch, tmp_path):
         work,
         [entry],
         [Game(1, {}, {}, [result])],
-        video_path=tmp_path / "video.mp4",
-        evidence_policy=evidence_policy.DEFAULT_POLICY,
+        options=decode.DecodeRunOptions(
+            video_path=tmp_path / "video.mp4",
+            evidence_policy=evidence_policy.DEFAULT_POLICY,
+        ),
     ) == [cached]
 
 
-def test_old_decoder_cache_cannot_be_reused_without_observations(monkeypatch, tmp_path):
-    from video2tenhou.engine import decode
-
+def test_old_decoder_cache_cannot_be_reused_without_observations(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path"
+) -> None:
+    """Verify old decoder cache cannot be reused without observations."""
     work = tmp_path / "video"
     (work / "decode").mkdir(parents=True)
     (work / "decode/00.json").write_text('{"hand":0}', encoding="utf-8")
     monkeypatch.setattr(decode, "DATA_DIR", tmp_path)
     # With no observations available, omit the hand rather than returning a
     # reconstruction from a decoder whose evidence semantics are obsolete.
-    from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
 
     assert (
-        decode.run_decode(work, [{"hand": 0}], [], evidence_policy=DEFAULT_POLICY) == []
+        decode.run_decode(
+            work,
+            [{"hand": 0}],
+            [],
+            options=decode.DecodeRunOptions(evidence_policy=DEFAULT_POLICY),
+        )
+        == []
     )

@@ -1,24 +1,28 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Recorded evidence honors narrow human answers without inventing a full hand fact."""
 
 import copy
 import gzip
 import json
-from types import SimpleNamespace
 
 import pytest
 
+from tests.engine.factories import hand_decoder
 from tests.integration.helpers import restore_model
 from tests.paths import DATA
 from video2tenhou.engine.assemble import kyoku_from_decode
 from video2tenhou.engine.decode import HandDecoder
 from video2tenhou.engine.review import facts_for_hand
-from video2tenhou.engine.scoring import score_hand
+from video2tenhou.engine.scoring import WinContext, score_hand
 from video2tenhou.engine.solver import Solution
 from video2tenhou.record import HandResult
 from video2tenhou.tenhou6 import replay_kyoku
 
 
-def recorded_case(index):
+def recorded_case(index: "int") -> "dict":
+    """Load one adjudicated case from the curated recognition fixture."""
     with gzip.open(
         DATA / "week11_adjudicated_models.json.gz", "rt", encoding="utf-8"
     ) as stream:
@@ -26,11 +30,12 @@ def recorded_case(index):
 
 
 @pytest.mark.parametrize("index", [7, 24])
-def test_confirmed_fields_survive_recorded_model_and_legal_export(index):
+def test_confirmed_fields_survive_recorded_model_and_legal_export(index: int) -> None:
+    """Verify confirmed fields survive recorded model and legal export."""
     case = recorded_case(index)
     model = restore_model(case["model"])
     facts = facts_for_hand(case["new_facts"], case["entry"])
-    decoder = SimpleNamespace(facts=facts, problems=[])
+    decoder = hand_decoder(facts=facts, problems=[])
     HandDecoder._apply_hand_facts(decoder, model)
     reference = case["reference"]
     prior = Solution(
@@ -55,6 +60,7 @@ def test_confirmed_fields_survive_recorded_model_and_legal_export(index):
         assert sol.draws[("S", 0)] == "4z"
         assert sol.haipai["S"].count("2p") == sol.haipai["S"].count("4z") == 1
         assert "S" not in model.facts.haipai  # only two counts were reviewed
+        assert model.win is not None
         winner = model.win.seat
         concealed = list(sol.hands[(winner, model.win.j)])
         winning = sol.draws[(winner, model.win.j)]
@@ -64,17 +70,20 @@ def test_confirmed_fields_survive_recorded_model_and_legal_export(index):
             concealed,
             winning,
             reference["score"]["melds"],
-            tsumo=True,
-            riichi=winner in reference["riichi"],
-            seat=winner,
-            round_wind="S",
-            dora=reference["dora"],
-            ura=context.get("ura", reference["ura"]),
-            ippatsu=context["ippatsu"],
-            haitei=context["haitei"],
-            rinshan=context["rinshan"],
+            context=WinContext(
+                tsumo=True,
+                riichi=winner in reference["riichi"],
+                seat=winner,
+                round_wind="S",
+                dora=reference["dora"],
+                ura=context.get("ura", reference["ura"]),
+                ippatsu=context["ippatsu"],
+                haitei=context["haitei"],
+                rinshan=context["rinshan"],
+            ),
         )
-        assert score.ok and (score.han, score.fu) == (6, 20)
+        assert score.ok
+        assert (score.han, score.fu) == (6, 20)
 
     decoded = copy.deepcopy(reference)
     decoded["haipai"] = sol.haipai

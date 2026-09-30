@@ -39,7 +39,7 @@ jobs:
         run: choco install ffmpeg -y --no-progress
       - run: uv sync --frozen
       - run: uv run ruff format --check .
-      - run: uv run ruff check --ignore-noqa .
+      - run: uv run ruff check .
       - run: uv run ty check --error-on-warning
       - run: uv run pytest -q --cov --cov-report=term-missing --cov-report=xml
       - run: uv build

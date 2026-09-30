@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Test the installed inference stack before trusting CUDA availability."""
 
 from __future__ import annotations
@@ -9,8 +12,8 @@ from functools import lru_cache
 
 def smoke_test(device: str) -> None:
     """Exercise kernels used by both models, including torchvision's native ops."""
-    import torch
-    from torchvision.ops import nms
+    import torch  # noqa: PLC0415
+    from torchvision.ops import nms  # noqa: PLC0415
 
     with torch.inference_mode():
         x = torch.ones((1, 3, 16, 16), device=device)
@@ -19,22 +22,24 @@ def smoke_test(device: str) -> None:
         matrix = torch.ones((8, 8), device=device)
         if (
             not torch.isfinite(result).all().item()
-            or (matrix @ matrix)[0, 0].item() != 8
+            or (matrix @ matrix)[0, 0].item() != matrix.shape[1]
         ):
-            raise RuntimeError("Inference kernel check returned invalid values")
+            msg = "Inference kernel check returned invalid values"
+            raise RuntimeError(msg)
         boxes = torch.tensor(
             [[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 2.0, 2.0]], device=device
         )
         scores = torch.tensor([0.9, 0.8], device=device)
         if nms(boxes, scores, 0.5).tolist() != [0]:
-            raise RuntimeError("torchvision detection kernel check failed")
+            msg = "torchvision detection kernel check failed"
+            raise RuntimeError(msg)
         if device.startswith("cuda"):
             torch.cuda.synchronize(device)
 
 
 @lru_cache(maxsize=16)
 def _select(request: str) -> str:
-    import torch
+    import torch  # noqa: PLC0415
 
     if request != "auto":
         selected = f"cuda:{request}" if request.isdigit() else request

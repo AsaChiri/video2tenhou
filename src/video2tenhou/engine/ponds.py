@@ -1,31 +1,52 @@
-"""Pond tracking: observations of one pond -> the discard log of its owner (DESIGN.md 4.8 `ponds.py`).
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
 
-A pond is a stack read in reading order: a discard is laid at the end, and the only tile that can leave
-is the last one, taken by a call. Tiles get nudged (a row straightened, a block pushed by an elbow), so
-their positions move and the reader's rows move with them; their order does not. Each observation is
-therefore flattened into one reading-order sequence and aligned with the stack as a whole:
+"""Track each pond into its owner's chronological discard log.
 
-- a matched tile is a new reading of its slot (a disagreeing reading is a misrecognition, not a tile);
-- tiles after the last slot are new discards; a new slot needs a view at rest (a full view of at least
-  two readings, or a second view), otherwise it stays tentative and the next full view without it drops it;
+Pond tracking: observations of one pond -> the discard log of its owner (DESIGN.md 4.8
+`ponds.py`).
+
+A pond is a stack read in reading order: a discard is laid at the end, and the only tile
+that can leave is the last one, taken by a call. Tiles get nudged (a row straightened, a
+block pushed by an elbow), so their positions move and the reader's rows move with them;
+their order does not. Each observation is therefore flattened into one reading-order
+sequence and aligned with the stack as a whole:
+
+- a matched tile is a new reading of its slot (a disagreeing reading is a
+  misrecognition, not a tile);
+- tiles after the last slot are new discards; a new slot needs a view at rest (a full
+  view of at least
+  two readings, or a second view), otherwise it stays tentative and the next full view
+  without it drops it;
 - an unmatched tile anywhere else is noise: nothing is inserted in the middle of a pond;
-- only the last slot can leave, when two consecutive full views lack it while the slot before it is seen;
-- a full view that lacks at least three slots and more than half of the stack is the table being cleared.
+- only the last slot can leave, when two consecutive full views lack it while the slot
+  before it is seen;
+- a full view that lacks at least three slots and more than half of the stack is the
+  table being cleared.
 
-A slot's (row, index) is its position in the stack when it was laid, six per row: a called-away tile's
-successor takes its position (the refill rule of section 1). The same observations give the hand's
-physical window (`play_window`): the clearings between hands are where a pond's count drops by more than
-a call can explain.
+A slot's (row, index) is its position in the stack when it was laid, six per row: a
+called-away tile's successor takes its position (the refill rule of section 1). The same
+observations give the hand's physical window (`play_window`): the clearings between
+hands are where a pond's count drops by more than a call can explain.
 """
 
 from __future__ import annotations
 
+import itertools
 from copy import deepcopy
 from dataclasses import dataclass
 
 import numpy as np
 
-from ..train.data import CLASSES
+from video2tenhou.train.data import CLASSES
+
+RIICHI_SIDEWAYS_FRACTION = 0.5
+ALIGNMENT_SKIP_TRACK = 2
+MIN_MULTI_TILE_APPEND = 2
+MIN_REST_CONFIRMATIONS = 2
+MIN_TAIL_POSTERIOR_OVERLAP = 0.3
+MIN_PONDS_FOR_CLEARING = 2
+
 
 ROW = 6  # tiles per pond row
 MIN_READINGS = (
@@ -45,7 +66,7 @@ CONFIRM_SPAN = 30.0  # s: how far after a reset a calm view can still deny it
 
 @dataclass
 class PondSlot:
-    """One persistent discard, including sightings before a call removes it from the pond."""
+    """A persistent discard, including sightings before a call removes it."""
 
     id: int
     row: int
@@ -86,17 +107,17 @@ class PondSlot:
 
     @property
     def conf(self) -> float:
-        """Largest normalized posterior mass accumulated across this slot's sightings."""
+        """Return the largest normalized posterior mass across sightings."""
         p = self.p / max(self.p.sum(), 1e-9)
         return float(p.max())
 
     @property
     def is_sideways(self) -> bool:
-        """Whether most sightings show the tile turned, as evidence of riichi declaration."""
-        return self.seen > 0 and self.sideways / self.seen >= 0.5
+        """Report whether most sightings show a turned riichi tile."""
+        return self.seen > 0 and self.sideways / self.seen >= RIICHI_SIDEWAYS_FRACTION
 
     def to_dict(self) -> dict:
-        """Serialize normalized evidence and physical timing for decode/review artifacts."""
+        """Serialize normalized evidence and timing for decode/review artifacts."""
         p = self.p / max(self.p.sum(), 1e-9)
         result = {
             "id": self.id,
@@ -122,7 +143,10 @@ class PondSlot:
 
 
 def flatten(obs: dict) -> list[dict]:
-    """The observation's tiles in reading order: row by row, left to right."""
+    """Flatten observation tiles in row order, left to right.
+
+    The observation's tiles in reading order: row by row, left to right.
+    """
     return sorted(obs["slots"], key=lambda s: (s["key"][0], s["key"][1]))
 
 
@@ -137,9 +161,10 @@ def align(
 ) -> list[tuple[int | None, int | None]]:
     """Order-preserving alignment of the stack's slots with an observation's tiles.
 
-    Costs: a pair 2·(1 − cosine of the posteriors), so two different identities (about 2) cost more than
-    a missing slot plus an appended tile (1.1); a missing slot 1.0; an unmatched tile 0.1 after every
-    slot (a new discard) and 1.2 anywhere else (noise). Returns (slot index | None, tile index | None).
+    Costs: a pair 2·(1 - cosine of the posteriors), so two different identities (about
+    2) cost more than a missing slot plus an appended tile (1.1); a missing slot 1.0; an
+    unmatched tile 0.1 after every slot (a new discard) and 1.2 anywhere else (noise).
+    Returns (slot index | None, tile index | None).
     """
     n, m = len(stack), len(seen)
     inf = 1e9
@@ -157,20 +182,27 @@ def align(
                     back[i + 1, j + 1] = 1
             if i < n and dp[i, j] + 1.0 < dp[i + 1, j]:
                 dp[i + 1, j] = dp[i, j] + 1.0
-                back[i + 1, j] = 2
+                back[i + 1, j] = ALIGNMENT_SKIP_TRACK
             if j < m:
                 c = dp[i, j] + (0.1 if i == n else 1.2)
                 if c < dp[i, j + 1]:
                     dp[i, j + 1] = c
                     back[i, j + 1] = 3
-    out = []
+    return _alignment_pairs(back, n, m)
+
+
+def _alignment_pairs(
+    back: np.ndarray, n: int, m: int
+) -> list[tuple[int | None, int | None]]:
+    """Trace matched, missing and appended pond positions in reading order."""
+    out: list[tuple[int | None, int | None]] = []
     i, j = n, m
     while i > 0 or j > 0:
         b = back[i, j]
         if b == 1:
             out.append((i - 1, j - 1))
             i, j = i - 1, j - 1
-        elif b == 2:
+        elif b == ALIGNMENT_SKIP_TRACK:
             out.append((i - 1, None))
             i -= 1
         else:
@@ -180,18 +212,35 @@ def align(
 
 
 def assign_positions(log: list[PondSlot]) -> None:
-    """(row, index) of every slot of a log in laying order: its position in the stack when it was laid.
-    A slot called away before a later one was laid no longer holds its position.
+    """Assign each discard its original row and column in laying order.
+
+    (row, index) of every slot of a log in laying order: its position in the stack when
+    it was laid. A slot called away before a later one was laid no longer holds its
+    position.
     """
     for k, s in enumerate(log):
         pos = sum(1 for x in log[:k] if x.t_removed is None or x.t_removed > s.t_first)
         s.row, s.index = divmod(pos, ROW)
 
 
-class PondTracker:
-    """Incrementally align one pond while retaining the history of called-away discards."""
+def _appended_positions(
+    pairs: list[tuple[int | None, int | None]], stack_size: int
+) -> list[int]:
+    """Retain unmatched observed positions after the existing pond stack."""
+    appended, consumed = [], 0
+    for i, j in pairs:
+        if i is not None:
+            consumed = i + 1
+        elif consumed == stack_size and j is not None:
+            appended.append(j)
+    return appended
 
-    def __init__(self, region: str):
+
+class PondTracker:
+    """Align a pond incrementally, retaining the history of called-away discards."""
+
+    def __init__(self, region: str) -> None:
+        """Start an empty chronological tracker for one pond region."""
         self.region = region
         self.slots: list[PondSlot] = []  # in laying order, tentative ones included
         self.cleared_at: float | None = None
@@ -200,17 +249,19 @@ class PondTracker:
         self._last_views: dict[int, dict] = {}
 
     def visible(self) -> list[PondSlot]:
-        """Return the current pond stack; removed tiles remain only in the historical log."""
+        """Return the current stack; keep removed tiles only in the history."""
         return [s for s in self.slots if s.t_removed is None]
 
     def update(self, obs: dict) -> None:
-        """Consume the next chronological observation, confirming additions and removals."""
+        """Consume the next observation, confirming additions and removals."""
         if self.cleared_at is not None or obs["n_used"] == 0:
             return
         partial = bool(obs.get("partial"))
         at_rest = not partial and obs["n_used"] >= MIN_READINGS
-        # how much this view counts towards confirming a slot: a full view at rest confirms it, a full view of
-        # one reading or a partial run of still frames counts half, a single partial frame (the stillest
+        # how much this view counts towards confirming a slot: a full view at rest
+        # confirms it, a full view of
+        # one reading or a partial run of still frames counts half, a single partial
+        # frame (the stillest
         # frame of a blind span, the one taken while tiles are being pushed) not at all
         rest = (
             2 if at_rest else (1 if not partial or obs["n_used"] >= MIN_READINGS else 0)
@@ -219,15 +270,12 @@ class PondTracker:
         seen = flatten(obs)
         pairs = align(stack, seen)
         matched = {i: j for i, j in pairs if i is not None and j is not None}
-        # tiles the alignment places after every slot are new discards; unmatched ones before that are noise
-        appended, consumed = [], 0
-        for i, j in pairs:
-            if i is not None:
-                consumed = i + 1
-            elif consumed == len(stack):
-                appended.append(j)
+        # tiles the alignment places after every slot are new discards; unmatched ones
+        # before that are noise
+        appended = _appended_positions(pairs, len(stack))
         absent = [s for k, s in enumerate(stack) if k not in matched]
-        # the clearing is judged on the slots seen at rest: tentative ones (a push seen in passing) are noise
+        # the clearing is judged on the slots seen at rest: tentative ones (a push seen
+        # in passing) are noise
         confirmed = [s for s in stack if s.confirmed]
         gone = [s for s in absent if s.confirmed]
         if (
@@ -244,21 +292,25 @@ class PondTracker:
         if (
             last_absent
             and last is stack[-1]
-            and len(appended) >= 2
+            and len(appended) >= MIN_MULTI_TILE_APPEND
             and self._prev_end is not None
             and obs["t0"] - self._prev_end < TWO_TURNS
         ):
-            # the last tile gone and two new ones since the previous view: a call and two more discards of
-            # this seat cannot fit in that time, so the first "new" tile is the last one misread
+            # the last tile gone and two new ones since the previous view: a call and
+            # two more discards of
+            # this seat cannot fit in that time, so the first "new" tile is the last one
+            # misread
             matched[len(stack) - 1] = appended.pop(0)
             absent.remove(last)
             last_absent = False
         for k, j in matched.items():
             self._see(stack[k], seen[j], obs, rest)
-        # a new tile in the very view that first lacks the last slot is either its refill (a call) or the last
-        # slot misread: it waits for a second view, which decides. After a view without the last slot the
+        # a new tile in the very view that first lacks the last slot is either its
+        # refill (a call) or the last
+        # slot misread: it waits for a second view, which decides. After a view without
+        # the last slot the
         # new tile is simply the next discard.
-        swap = last_absent and last.missing == 0
+        swap = last is not None and last_absent and last.missing == 0
         for j in appended:
             candidate_id = self._next
             self._lay(
@@ -280,6 +332,39 @@ class PondTracker:
                     "prefix_complete": all(k in matched for k in range(len(stack) - 1)),
                     "views": [self._replacement_view(seen[j], obs)],
                 }
+        self._update_replacements(stack, seen, matched, obs)
+        if partial:
+            return  # an absent tile may be hidden; a partial view narrows no window
+        self._mark_absent(absent, obs)
+        if (
+            last is not None
+            and last_absent
+            and last.missing >= REMOVE_AFTER
+            and self._removable(last, stack, matched)
+        ):
+            last.t_removed = last.t_absent
+        self._prev_end = obs["t1"]
+
+    def _mark_absent(self, absent: list[PondSlot], obs: dict) -> None:
+        """Drop tentative noise and count full views missing confirmed tiles."""
+        for s in absent:
+            if not s.confirmed:
+                self.slots.remove(
+                    s
+                )  # tentative, and a full view does not show it: it was noise
+                continue
+            if s.missing == 0:
+                s.t_absent = obs["t0"]
+            s.missing += 1
+
+    def _update_replacements(
+        self,
+        stack: list[PondSlot],
+        seen: list[dict],
+        matched: dict[int, int],
+        obs: dict,
+    ) -> None:
+        """Accumulate persistent replacements and clear transient misreads."""
         for old in self.slots:
             pending = old.pending_replacement
             if pending is None:
@@ -293,28 +378,10 @@ class PondTracker:
                     self._replacement_view(seen[candidate_match], obs)
                 )
                 pending["t1"] = obs["t1"]
-            elif not partial and any(stack[k] is old for k in matched):
+            elif not obs.get("partial") and any(stack[k] is old for k in matched):
                 # The established tile returned and its tentative alternative
                 # did not; this is the existing transient-misread resolution.
                 old.pending_replacement = None
-        if partial:
-            return  # an absent tile may be hidden; a partial view narrows no window
-        for s in absent:
-            if not s.confirmed:
-                self.slots.remove(
-                    s
-                )  # tentative, and a full view does not show it: it was noise
-                continue
-            if s.missing == 0:
-                s.t_absent = obs["t0"]
-            s.missing += 1
-        if (
-            last_absent
-            and last.missing >= REMOVE_AFTER
-            and self._removable(last, stack, matched)
-        ):
-            last.t_removed = last.t_absent
-        self._prev_end = obs["t1"]
 
     @staticmethod
     def _replacement_view(tile: dict, obs: dict) -> dict:
@@ -333,8 +400,11 @@ class PondTracker:
     def _removable(
         self, s: PondSlot, stack: list[PondSlot], matched: dict[int, int]
     ) -> bool:
-        """Only the last discard can be called: no later slot was called away since it was laid, and the
-        confirmed slot before it is seen (so the view is not simply hiding the end of the pond).
+        """Check whether a slot could still be the most recent discard.
+
+        Only the last discard can be called: no later slot was called away since it was
+        laid, and the confirmed slot before it is seen (so the view is not simply hiding
+        the end of the pond).
         """
         later = self.slots[self.slots.index(s) + 1 :]
         if any(x.t_removed is not None for x in later):
@@ -355,12 +425,15 @@ class PondTracker:
         s.missing = 0
         s.t_absent = None
         s.rest_views += rest
-        s.confirmed = s.confirmed or s.rest_views >= 2
+        s.confirmed = s.confirmed or s.rest_views >= MIN_REST_CONFIRMATIONS
         self._last_views[s.id] = self._replacement_view(o, obs)
 
     def _lay(self, o: dict, obs: dict, *, refill: bool, rest: int) -> None:
-        """A new discard at the end of the stack. Its row must be the one the stack puts it in (six per
-        row): a tile seen in a later row before the earlier ones are full is not a discard of this pond.
+        """Append a new discard at the next legal stack position.
+
+        A new discard at the end of the stack. Its row must be the one the stack puts it
+        in (six per row): a tile seen in a later row before the earlier ones are full is
+        not a discard of this pond.
         """
         pos = len(self.visible())
         rows = {pos // ROW} | ({(pos - 1) // ROW} if refill else set())
@@ -382,7 +455,7 @@ class PondTracker:
                 1,
                 o["sideways"],
                 xyxy=tuple(o.get("xyxy") or ()) or None,
-                confirmed=rest >= 2,
+                confirmed=rest >= MIN_REST_CONFIRMATIONS,
                 rest_views=rest,
             )
         )
@@ -390,11 +463,13 @@ class PondTracker:
         self._last_views[self.slots[-1].id] = self._replacement_view(o, obs)
 
     def log(self) -> list[PondSlot]:
-        """The discard log in laying order (confirmed slots only), with stack positions.
+        """Build the confirmed discard log in laying order with stack positions.
 
-        A slot "called away" whose successor was laid in the very view it vanished from, and turned out to
-        be the same tile after readings that disagreed, was never called: it was misread for a while, and
-        the two slots are one tile.
+        The discard log in laying order (confirmed slots only), with stack positions.
+
+        A slot "called away" whose successor was laid in the very view it vanished from,
+        and turned out to be the same tile after readings that disagreed, was never
+        called: it was misread for a while, and the two slots are one tile.
         """
         out = [s for s in self.slots if s.confirmed]
         k = 0
@@ -425,7 +500,7 @@ class PondTracker:
 
 
 def track_pond(observations: list[dict]) -> list[PondSlot]:
-    """Track a hand's observations chronologically and return confirmed discard history."""
+    """Track observations chronologically and return confirmed discard history."""
     tr = PondTracker(observations[0]["region"] if observations else "")
     for o in sorted(observations, key=lambda o: o["t0"]):
         tr.update(o)
@@ -433,8 +508,10 @@ def track_pond(observations: list[dict]) -> list[PondSlot]:
 
 
 def insert_slot(log: list[PondSlot], sl: PondSlot) -> None:
-    """Place a slot found afterwards (a dense read) into a discard log at its time; its position is the one the
-    stack gives it.
+    """Insert a densely observed discard into its chronological pond log.
+
+    Place a slot found afterwards (a dense read) into a discard log at its time; its
+    position is the one the stack gives it.
     """
     k = sum(1 for x in log if x.t_first <= sl.t_first)
     log.insert(k, sl)
@@ -445,16 +522,20 @@ TAIL_MIN = 2  # dense readings a tile beyond the stack must be seen in
 
 
 def tail_runs(log: list[PondSlot], readings: list[dict]) -> list[dict]:
-    """Tiles a dense read (5 fps) sees beyond the end of a pond's stack: laid after every slot the calm reads
-    know. Each reading is aligned with the stack as it stood then, in reading order, the way the tracker aligns
-    a calm view (never by grid position: tiles are not flush). A slot counts from the start of its window, so
-    a tile the calm reads saw later is matched, not new. Returns [{t_first, t_last, n, row, col, xyxy, p, tile,
-    gone}] in time order; `gone`: it vanished while the rest of the pond stayed in view (a called tile).
+    """Find densely observed tiles beyond the calm pond log's last slot.
+
+    Tiles a dense read (5 fps) sees beyond the end of a pond's stack: laid after every
+    slot the calm reads know. Each reading is aligned with the stack as it stood then,
+    in reading order, the way the tracker aligns a calm view (never by grid position:
+    tiles are not flush). A slot counts from the start of its window, so a tile the calm
+    reads saw later is matched, not new. Returns [{t_first, t_last, n, row, col, xyxy,
+    p, tile, gone}] in time order; `gone`: it vanished while the rest of the pond stayed
+    in view (a called tile).
     """
     found: list[dict] = []
     cur: dict | None = None
 
-    def close(gone: bool) -> None:
+    def close(*, gone: bool) -> None:
         if cur is not None and cur["n"] >= TAIL_MIN:
             found.append({**cur, "gone": gone})
 
@@ -475,13 +556,14 @@ def tail_runs(log: list[PondSlot], readings: list[dict]) -> list[dict]:
         tail = [seen[j] for i, j in pairs[last + 1 :] if j is not None]
         if not tail:
             if matched >= len(stack) - 1:  # the pond in view without it: it is gone
-                close(True)
+                close(gone=True)
                 cur = None
             continue  # an occluded view says nothing
         b = tail[0]
         if (
             cur is not None
-            and float(np.dot(cur["p"] / cur["n"], np.asarray(b["p"]))) > 0.3
+            and float(np.dot(cur["p"] / cur["n"], np.asarray(b["p"])))
+            > MIN_TAIL_POSTERIOR_OVERLAP
         ):
             cur["t_last"], cur["n"], cur["p"] = (
                 t,
@@ -489,7 +571,7 @@ def tail_runs(log: list[PondSlot], readings: list[dict]) -> list[dict]:
                 cur["p"] + np.asarray(b["p"]),
             )
             continue
-        close(True)  # another tile at the end: the previous one was taken
+        close(gone=True)  # another tile at the end: the previous one was taken
         cur = {
             "t_first": t,
             "t_last": t,
@@ -499,16 +581,16 @@ def tail_runs(log: list[PondSlot], readings: list[dict]) -> list[dict]:
             "xyxy": b["xyxy"],
             "p": np.asarray(b["p"], float),
         }
-    close(False)
+    close(gone=False)
     for run in found:
         run["p"] = (run["p"] / max(run["p"].sum(), 1e-9)).tolist()
         run["tile"] = CLASSES[int(np.argmax(run["p"]))]
     return found
 
 
-# ---------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # the hand's physical window
-# ---------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
 def _full_views(obs: list[dict], t_start: float, t_end: float) -> list[dict]:
@@ -527,9 +609,12 @@ def _full_views(obs: list[dict], t_start: float, t_end: float) -> list[dict]:
 def resets(
     obs: list[dict], t_start: float, t_end: float
 ) -> list[tuple[float, float, int]]:
-    """Where one pond's count falls by more than a call explains: (end of the last calm view with the old
-    tiles, start of the first without them, the drop). A drop to zero counts whatever its size (a short
-    hand leaves small ponds). A dip that the next calm view undoes was an occlusion or a misread.
+    """Find pond count drops too large to be explained by a call.
+
+    Where one pond's count falls by more than a call explains: (end of the last calm
+    view with the old tiles, start of the first without them, the drop). A drop to zero
+    counts whatever its size (a short hand leaves small ponds). A dip that the next calm
+    view undoes was an occlusion or a misread.
     """
     full = _full_views(obs, t_start, t_end)
     out = []
@@ -550,7 +635,11 @@ def resets(
 
 
 def _denies(obs: list[dict], a: float, b: float) -> bool:
-    """Does this pond, seen at rest just before and just after [a, b], show that nothing was cleared?"""
+    """Check whether resting views rule out a clearing within a window.
+
+    Does this pond, seen at rest just before and just after [a, b], show that nothing
+    was cleared?
+    """
     before = [
         o
         for o in obs
@@ -575,9 +664,12 @@ def _denies(obs: list[dict], a: float, b: float) -> bool:
 def clearings(
     pond_obs: dict[str, list[dict]], t_start: float, t_end: float
 ) -> list[float]:
-    """The table clearings in [t_start, t_end], each as the end of the last calm view that still held the
-    old hand's tiles. Resets of two or more ponds within CLEAR_JOIN s are one clearing; a single pond's
-    reset of RESET_DROP or more stands unless another pond, seen at rest on both sides, denies it.
+    """Find table clearings within the requested time window.
+
+    The table clearings in [t_start, t_end], each as the end of the last calm view that
+    still held the old hand's tiles. Resets of two or more ponds within CLEAR_JOIN s are
+    one clearing; a single pond's reset of RESET_DROP or more stands unless another
+    pond, seen at rest on both sides, denies it.
     """
     events = sorted(
         (a, b, drop, region)
@@ -594,11 +686,11 @@ def clearings(
     for g in groups:
         ponds = {e[3] for e in g}
         a, b = min(e[0] for e in g), max(e[1] for e in g)
-        if len(ponds) < 2:
-            if g[0][2] < RESET_DROP or any(
-                _denies(obs, a, b) for r, obs in pond_obs.items() if r not in ponds
-            ):
-                continue
+        if len(ponds) < MIN_PONDS_FOR_CLEARING and (
+            g[0][2] < RESET_DROP
+            or any(_denies(obs, a, b) for r, obs in pond_obs.items() if r not in ponds)
+        ):
+            continue
         out.append(max(e[0] for e in g))
     return out
 
@@ -614,6 +706,6 @@ def play_window(
     Partial views cannot establish that a table has cleared.
     """
     cuts = clearings(pond_obs, t_start, t_end)
-    bounds = [t_start] + cuts + [t_end]
-    segments = list(zip(bounds, bounds[1:], strict=False))
+    bounds = [t_start, *cuts, t_end]
+    segments = list(itertools.pairwise(bounds))
     return max(segments, key=lambda s: s[1] - s[0])

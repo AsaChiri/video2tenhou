@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Model-bound retention of raw detections before deriving observation structure.
 
 Policies do not rescale scores or change recognition. Sparse reads remain reusable
@@ -13,15 +16,23 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
+from video2tenhou.paths import MODEL_DIR
+
+from .reader import Box, assign_hand, assign_meld, assign_pond
+
+SPARSE_NONE_MAX = 0.5
+
+
 KINDS = ("hand", "pond", "meld")
 PREPARATION_VERSION = 1
 
 
-def _floors(values) -> tuple[float, float, float]:
+def _floors(values: object) -> tuple[float, float, float]:
     if not isinstance(values, dict) or set(values) != set(KINDS):
-        raise ValueError(
-            "Evidence policy must specify exactly hand, pond and meld floors"
-        )
+        msg = "Evidence policy must specify exactly hand, pond and meld floors"
+        raise ValueError(msg)
     result = tuple(values[kind] for kind in KINDS)
     if any(
         isinstance(value, bool)
@@ -30,8 +41,10 @@ def _floors(values) -> tuple[float, float, float]:
         or not 0 <= value <= 1
         for value in result
     ):
-        raise ValueError("Evidence floors must be finite numbers in [0, 1]")
-    return tuple(float(value) for value in result)
+        msg = "Evidence floors must be finite numbers in [0, 1]"
+        raise ValueError(msg)
+    hand, pond, meld = result
+    return float(hand), float(pond), float(meld)
 
 
 def _digest(value: dict) -> str:
@@ -52,13 +65,13 @@ class EvidencePolicy:
     sparse: tuple[float, float, float]
     dense: tuple[float, float, float]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Require complete, finite confidence floors for both reading stages."""
         for stage in ("sparse", "dense"):
             values = getattr(self, stage)
             if not isinstance(values, tuple) or len(values) != len(KINDS):
-                raise ValueError(
-                    "Evidence policy requires three immutable floors per stage"
-                )
+                msg = "Evidence policy requires three immutable floors per stage"
+                raise ValueError(msg)
             object.__setattr__(
                 self, stage, _floors(dict(zip(KINDS, values, strict=False)))
             )
@@ -66,7 +79,8 @@ class EvidencePolicy:
     def minimum(self, stage: str, kind: str) -> float:
         """Return the inclusive detection floor; unknown stages/kinds are errors."""
         if stage not in ("sparse", "dense") or kind not in KINDS:
-            raise ValueError(f"Unknown evidence stage/kind: {stage}/{kind}")
+            msg = f"Unknown evidence stage/kind: {stage}/{kind}"
+            raise ValueError(msg)
         return getattr(self, stage)[KINDS.index(kind)]
 
     def to_dict(self) -> dict:
@@ -101,12 +115,15 @@ class EvidencePolicy:
 DEFAULT_POLICY = EvidencePolicy((0.2, 0.2, 0.35), (0.2, 0.2, 0.2))
 
 
-def resolve_policy(value=None) -> EvidencePolicy:
-    """Validate complete schema-1 metadata, or resolve absent metadata to the default policy.
+def resolve_policy(value: object = None) -> EvidencePolicy:
+    """Validate evidence metadata or use the default retention policy.
 
-    Unknown fields, partial maps, nonfinite values and unsupported schemas fail
-    closed. Explicit metadata does not itself establish that a policy has passed
-    downstream quality evaluation for its detector/classifier pair.
+    Validate complete schema-1 metadata, or resolve absent metadata to the default
+    policy.
+
+    Unknown fields, partial maps, nonfinite values and unsupported schemas fail closed.
+    Explicit metadata does not itself establish that a policy has passed downstream
+    quality evaluation for its detector/classifier pair.
     """
     if value is None:
         return DEFAULT_POLICY
@@ -118,7 +135,8 @@ def resolve_policy(value=None) -> EvidencePolicy:
         or type(value["schema_version"]) is not int
         or value["schema_version"] != 1
     ):
-        raise ValueError("Unsupported or incomplete evidence policy metadata")
+        msg = "Unsupported or incomplete evidence policy metadata"
+        raise ValueError(msg)
     return EvidencePolicy(_floors(value["sparse"]), _floors(value["dense"]))
 
 
@@ -130,8 +148,6 @@ def load_policy(metadata_path: str | Path | None = None) -> EvidencePolicy:
     separately verifies the checkpoint hash before inference.
     """
     if metadata_path is None:
-        from ..paths import MODEL_DIR
-
         metadata_path = MODEL_DIR / "detector" / "meta.json"
     path = Path(metadata_path)
     try:
@@ -143,7 +159,8 @@ def load_policy(metadata_path: str | Path | None = None) -> EvidencePolicy:
         or type(metadata.get("schema_version")) is not int
         or metadata["schema_version"] != 1
     ):
-        raise ValueError("Unsupported detector metadata schema for evidence policy")
+        msg = "Unsupported detector metadata schema for evidence policy"
+        raise ValueError(msg)
     return resolve_policy(metadata.get("evidence_policy"))
 
 
@@ -153,17 +170,13 @@ def restructure(kind: str, reading: dict) -> None:
     Raw probabilities and confidence are unchanged. Invalid pond layouts are
     rejected after filtering, using the same geometry rules as live readings.
     """
-    import numpy as np
-
-    from .reader import Box, assign_hand, assign_meld, assign_pond
-
     if kind not in ("pond", "meld", "hand"):
         return
     reading["rejected"] = False
     if not reading["boxes"]:
         return
     boxes = [
-        Box(tuple(b["xyxy"]), b["conf"], b["sideways"], np.asarray(b["p"]))
+        Box(tuple(b["xyxy"]), b["conf"], sideways=b["sideways"], p=np.asarray(b["p"]))
         for b in reading["boxes"]
     ]
     if kind == "pond":
@@ -213,21 +226,23 @@ def prepare_reading(
 ) -> dict:
     """Return a filtered/restructured copy without changing cached raw readings.
 
-    Sparse voting excludes classifier background predictions. Dense event
-    searches apply their separate detector-confidence floors. Comparisons use serialized scores
-    as stored; this function never rounds, rescales, reclassifies or votes.
-    Probability arrays/lists are shared without mutation; callers should treat
-    them as read-only rather than editing the retained output's probabilities.
+    Sparse voting excludes classifier background predictions. Dense event searches apply
+    their separate detector-confidence floors. Comparisons use serialized scores as
+    stored; this function never rounds, rescales, reclassifies or votes. Probability
+    arrays/lists are shared without mutation; callers should treat them as read-only
+    rather than editing the retained output's probabilities.
     """
     policy = resolve_policy(policy)
     floor = policy.minimum(stage, kind)
     if stage == "sparse" and (type(none_index) is not int or none_index < 0):
-        raise ValueError("Sparse evidence preparation requires the none class index")
+        msg = "Sparse evidence preparation requires the none class index"
+        raise ValueError(msg)
     prepared = dict(reading)
     prepared["boxes"] = [
         dict(box)
         for box in reading["boxes"]
-        if box["conf"] >= floor and (stage != "sparse" or box["p"][none_index] < 0.5)
+        if box["conf"] >= floor
+        and (stage != "sparse" or box["p"][none_index] < SPARSE_NONE_MAX)
     ]
     restructure(kind, prepared)
     return prepared

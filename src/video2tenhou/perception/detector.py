@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Tile localization with an explicit backend and region-coordinate box contract.
 
 Backend selection comes from hash-verified local metadata or an explicit argument
@@ -9,22 +12,26 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import asdict, dataclass
 from importlib import metadata
 from pathlib import Path
 from threading import Lock
+from typing import TYPE_CHECKING
 
-import numpy as np
+from video2tenhou.files import sha256_file
+from video2tenhou.paths import MODEL_DIR
 
-from ..files import sha256_file
-from ..paths import MODEL_DIR
-from .detector_flow import infer_prepared, input_shape, one_ahead, prepare_input
-from .detector_metadata import inference_settings
+from .detector_metadata import InferenceOptions, checkpoint_metadata, inference_settings
 from .device import select_device
 from .evidence_policy import resolve_policy
-from .graphs import GRAPH_POLICY, enable_owned_graphs
 from .runtime import runtime_signature
 
+if TYPE_CHECKING:
+    import numpy as np
+
+MODEL_STRIDE = 32
+GRAPH_POLICY = "libreyolo-public-single-shape-v1"
 DEFAULT_WEIGHTS = MODEL_DIR / "detector" / "weights.pt"
 
 
@@ -46,13 +53,10 @@ class Detector:
         self,
         weights: str | Path = DEFAULT_WEIGHTS,
         *,
-        imgsz: int | None = None,
-        conf: float | None = None,
-        iou: float | None = None,
+        settings: InferenceOptions | None = None,
         device: str | int | None = None,
         backend: str | None = None,
-        cuda_graph: bool | None = None,
-    ):
+    ) -> None:
         """Load local weights and optional adjacent ``meta.json`` inference defaults.
 
         Metadata must identify these exact checkpoint bytes. Explicit inference
@@ -65,91 +69,68 @@ class Detector:
         inferred from unknown tile classes.
         ``evidence_policy`` controls later retention and has its own stage identities;
         it is excluded from ``id`` so changing it can reuse raw sparse readings.
-        ``cuda_graph`` opts into bounded, grid-owning CUDA graphs for LibreYOLO
-        1.5.x YOLO9. Invalid graph state fails explicitly; default is false
-        unless qualified checkpoint metadata requests it.
-        Supported graph models prepare uint8 BGR inputs directly from arrays;
-        batches overlap one next CPU preparation with serial inference. This
-        input path has its own cache identity. Eager inference uses the public
-        prediction API and its existing identity.
+        All inference uses LibreYOLO's public ``predict`` API. ``cuda_graph``
+        enables capture on CUDA; default is false unless checkpoint metadata
+        requests it. Public ``release_graphs`` drops captures before the padded
+        input shape changes, keeping their decode-grid storage valid. Repeated
+        shapes can replay; a shape change requires a new capture. This graph
+        policy has its own recognition identity.
         """
         weights = Path(weights)
         weights_hash = sha256_file(weights)
-        model_meta = {}
-        meta_path = weights.with_name("meta.json")
-        if meta_path.exists():
-            model_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(model_meta, dict)
-                or model_meta.get("schema_version") != 1
-            ):
-                raise ValueError("Unsupported detector metadata schema")
-            if model_meta.get("weights_sha256") != weights_hash:
-                raise ValueError("Detector metadata does not match checkpoint SHA-256")
-            if model_meta.get("backend") != "libreyolo":
-                raise ValueError("Unsupported detector metadata backend")
-            if backend is not None and backend != model_meta["backend"]:
-                raise ValueError(
-                    "Explicit detector backend conflicts with checkpoint metadata"
-                )
+        model_meta = checkpoint_metadata(weights, weights_hash, backend)
         self.evidence_policy = resolve_policy(model_meta.get("evidence_policy"))
         backend = backend or model_meta.get("backend", "libreyolo")
         if backend != "libreyolo":
-            raise ValueError(f"Unsupported detector backend: {backend}")
+            msg = f"Unsupported detector backend: {backend}"
+            raise ValueError(msg)
         inference = inference_settings(
             model_meta.get("inference", {}),
-            imgsz=imgsz,
-            confidence=conf,
-            iou=iou,
-            cuda_graph=cuda_graph,
+            **asdict(settings or InferenceOptions()),
         )
         imgsz, conf, iou, cuda_graph = (
             inference[key] for key in ("imgsz", "confidence", "iou", "cuda_graph")
         )
         device = select_device(device)
         self.backend = backend
-        from libreyolo import LibreYOLO
+        from libreyolo import LibreYOLO  # noqa: PLC0415
 
         device = f"cuda:{device}" if str(device).isdigit() else str(device)
         self.model = LibreYOLO(str(weights), device=device)
         if self.model.names != {0: "face"}:
-            raise ValueError("LibreYOLO detector must declare exactly one class: face")
+            msg = "LibreYOLO detector must declare exactly one class: face"
+            raise ValueError(msg)
         if self.model.family != "yolo9":
-            raise ValueError(
-                "LibreYOLO detector requires the standard yolo9 model family"
-            )
+            msg = "LibreYOLO detector requires the standard yolo9 model family"
+            raise ValueError(msg)
         if model_meta:
             classes = model_meta.get("classes")
             expected = {str(key): value for key, value in self.model.names.items()}
             if classes != expected:
-                raise ValueError(
-                    "Detector metadata classes differ from checkpoint classes"
-                )
+                msg = "Detector metadata classes differ from checkpoint classes"
+                raise ValueError(msg)
             if model_meta.get("architecture") != f"yolo9-{self.model.size}":
-                raise ValueError(
-                    "LibreYOLO metadata architecture differs from checkpoint"
-                )
+                msg = "LibreYOLO metadata architecture differs from checkpoint"
+                raise ValueError(msg)
         self.imgsz, self.conf, self.iou, self.device = imgsz, conf, iou, device
         self._prediction_lock = Lock()
         version = metadata.version(backend)
-        self.cuda_graph = cuda_graph and enable_owned_graphs(self.model, device=device)
-        self._direct_preprocessing = self.cuda_graph
-        identity = dict(
-            weights_sha256=weights_hash,
-            backend=backend,
-            version=version,
-            imgsz=imgsz,
-            conf=conf,
-            iou=iou,
-            color="BGR",
-            classes=self.model.names,
-            cuda_graph=self.cuda_graph,
-            graph_policy=GRAPH_POLICY if self.cuda_graph else None,
-            runtime=runtime_signature(device),
-            preprocessing="libreyolo9-top-left-rect-stride32-v1",
-        )
-        if self._direct_preprocessing:
-            identity["input_path"] = "ndarray-one-ahead-v1"
+        self.cuda_graph = cuda_graph and device.startswith("cuda")
+        self._graph_shape: tuple[int, int] | None = None
+        identity = {
+            "weights_sha256": weights_hash,
+            "backend": backend,
+            "version": version,
+            "imgsz": imgsz,
+            "conf": conf,
+            "iou": iou,
+            "color": "BGR",
+            "classes": self.model.names,
+            "cuda_graph": self.cuda_graph,
+            "graph_policy": GRAPH_POLICY if self.cuda_graph else None,
+            "runtime": runtime_signature(device),
+            "preprocessing": "libreyolo9-top-left-rect-stride32-v1",
+        }
         self.id = (
             "detector:"
             + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -165,33 +146,18 @@ class Detector:
             return self._predict(img)
 
     def _predict(self, img: np.ndarray) -> list[Det]:
-        if self._direct_preprocessing and self._supported_input(img):
-            return self._consume_prepared(prepare_input(img, self.imgsz))
-        return self._public_predict(img)
-
-    @staticmethod
-    def _supported_input(img):
-        return (
-            isinstance(img, np.ndarray)
-            and img.dtype == np.uint8
-            and img.ndim == 3
-            and img.shape[2] == 3
-            and min(img.shape[:2]) > 4
+        height, width = img.shape[:2]
+        ratio = self.imgsz / max(height, width)
+        shape = (
+            math.ceil(height * ratio / MODEL_STRIDE) * MODEL_STRIDE,
+            math.ceil(width * ratio / MODEL_STRIDE) * MODEL_STRIDE,
         )
-
-    def _consume_prepared(self, prepared):
-        data = infer_prepared(
-            self.model, prepared, self.conf, self.iou, self.cuda_graph
-        )
-        if any(int(value) != 0 for value in data["classes"]):
-            raise ValueError("Face-only checkpoint returned an unexpected class ID")
-        return [
-            Det(tuple(float(v) for v in box), float(conf), False)
-            for box, conf in zip(data["boxes"], data["scores"], strict=False)
-        ]
-
-    def _public_predict(self, img: np.ndarray) -> list[Det]:
-        shape = input_shape(img, self.imgsz)
+        if self.cuda_graph:
+            # YOLO9 replaces its decode grids on a shape change. Release captures
+            # before that happens, including after a previous prediction failed.
+            if self._graph_shape is not None and self._graph_shape != shape:
+                self.model.release_graphs()
+            self._graph_shape = shape
         r = self.model.predict(
             img,
             imgsz=shape,
@@ -204,10 +170,11 @@ class Detector:
         if r.boxes is None:
             return []
         if any(int(value) != 0 for value in r.boxes.cls.tolist()):
-            raise ValueError("Face-only checkpoint returned an unexpected class ID")
+            msg = "Face-only checkpoint returned an unexpected class ID"
+            raise ValueError(msg)
         return [
-            Det(tuple(float(v) for v in xyxy), float(c), False)
-            for xyxy, c in zip(
+            Det((float(x0), float(y0), float(x1), float(y1)), float(c), back=False)
+            for (x0, y0, x1, y1), c in zip(
                 r.boxes.xyxy.tolist(), r.boxes.conf.tolist(), strict=False
             )
         ]
@@ -219,19 +186,10 @@ class Detector:
         padding. Even matching shapes can use different CUDA kernels when
         batched, changing box coordinates and therefore classifier crop pixels.
         Classifier inference is batched separately by the region reader.
-        On supported graph models, one CPU input is prepared ahead of the
-        current inference. The instance lock spans the whole batch and worker
-        cleanup, including when preparation or inference raises an exception.
+        The instance lock spans the whole batch, including graph release and
+        result materialization, so concurrent previews cannot interleave calls.
         """
         if not imgs:
             return []
         with self._prediction_lock:
-            if not self._direct_preprocessing or not all(
-                self._supported_input(img) for img in imgs
-            ):
-                return [self._public_predict(img) for img in imgs]
-            # CPU-only preparation owns one next item; all GPU work and output
-            # materialization remain serial under this instance's lock.
-            return one_ahead(
-                imgs, lambda img: prepare_input(img, self.imgsz), self._consume_prepared
-            )
+            return [self._predict(img) for img in imgs]

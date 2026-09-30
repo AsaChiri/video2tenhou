@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """PacificML score site (scoremj.com) as an authoritative result source.
 
 The site is a public GraphQL API (`/api/graphql`, no login needed for reads).
@@ -16,36 +19,54 @@ the games of an event / week when the id is not known.
 
 from __future__ import annotations
 
-import json
-import urllib.request
+import argparse
+import logging
 from dataclasses import asdict, dataclass, field
+
+import httpx
+
+from video2tenhou.logging_setup import command_logging
 
 ENDPOINT = "https://scoremj.com/api/graphql"
 SEATS = ("EAST", "SOUTH", "WEST", "NORTH")
 SEAT_LETTER = {"EAST": "E", "SOUTH": "S", "WEST": "W", "NORTH": "N"}
 
-Q_GAME = """query ViewGame($gameId: Int!) { game(id: $gameId) { id createdAt tableNumber status
-  gameContainer { id name } gameRules { id name }
-  handResults { scoreDelta { EAST SOUTH WEST NORTH } riichiLeftover honba nextRound nextRepeat round repeat
-    events { type han fu tenpai actor target } }
-  players { id startingDirection user { username id } }
-  score { EAST SOUTH WEST NORTH } } }"""
+Q_GAME = (
+    "query ViewGame($gameId: Int!) { game(id: $gameId) { id createdAt tableNumber "
+    "status\n  gameContainer { id name } gameRules { id name }\n  handResults { "
+    "scoreDelta { EAST SOUTH WEST NORTH } riichiLeftover honba nextRound nextRepeat"
+    " round repeat\n    events { type han fu tenpai actor target } }\n  players { "
+    "id startingDirection user { username id } }\n  score { EAST SOUTH WEST NORTH }"
+    " } }"
+)
 
-Q_CONTAINER = """query ViewGameContainer($gameContainerId: Int!, $withGames: Boolean!) {
-  gameContainer(id: $gameContainerId) { id type name startsAt children { id name startsAt }
-  games @include(if: $withGames) { id createdAt status tableNumber
-    players { startingDirection user { username id } } score { EAST SOUTH WEST NORTH } } } }"""
+Q_CONTAINER = (
+    "query ViewGameContainer($gameContainerId: Int!, $withGames: Boolean!) {\n  "
+    "gameContainer(id: $gameContainerId) { id type name startsAt children { id name"
+    " startsAt }\n  games @include(if: $withGames) { id createdAt status "
+    "tableNumber\n    players { startingDirection user { username id } } score { "
+    "EAST SOUTH WEST NORTH } } } }"
+)
+
+
+LOGGER = logging.getLogger("video2tenhou.record")
 
 
 def gql(query: str, variables: dict, timeout: float = 30) -> dict:
-    """Execute a read query against scoremj; HTTP errors propagate and GraphQL errors raise RuntimeError."""
-    req = urllib.request.Request(
+    """Query scoremj, propagating transport errors and rejecting query errors.
+
+    Execute a read query against scoremj; HTTP errors propagate and GraphQL errors raise
+    RuntimeError.
+    """
+    response = httpx.post(
         ENDPOINT,
-        data=json.dumps({"query": query, "variables": variables}).encode(),
-        headers={"Content-Type": "application/json", "User-Agent": "video2tenhou"},
+        json={"query": query, "variables": variables},
+        headers={"User-Agent": "video2tenhou"},
+        timeout=timeout,
+        follow_redirects=True,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.load(r)
+    response.raise_for_status()
+    out = response.json()
     if out.get("errors"):
         raise RuntimeError(out["errors"])
     return out["data"]
@@ -53,7 +74,11 @@ def gql(query: str, variables: dict, timeout: float = 30) -> dict:
 
 @dataclass
 class HandResult:
-    """Authoritative result of one hand; seat identifiers refer to the hanchan starting winds."""
+    """Authoritative hand result using the hanchan's starting-seat names.
+
+    Authoritative result of one hand; seat identifiers refer to the hanchan starting
+    winds.
+    """
 
     kyoku: int  # 0 = East 1 ... 7 = South 4 (site "round")
     honba: int  # site "honba" ("repeat" is the dealer-repeat count)
@@ -69,16 +94,18 @@ class HandResult:
 
     @property
     def name(self) -> str:
-        """Japanese round and honba label for display, using the zero-based kyoku index."""
+        """Format the zero-based round and honba as a Japanese display label."""
         return f"{'東南'[self.kyoku // 4]}{self.kyoku % 4 + 1}局{self.honba}本場"
 
 
 @dataclass
 class Game:
-    """Site record containing starting-seat player identities and ordered hand results."""
+    """Site record with starting-seat player identities and ordered hand results."""
 
     id: int
-    players: dict  # the site's seat name (EAST..NORTH, the wind of the hanchan's first hand) -> username
+    # the site's seat name (EAST..NORTH, the wind of the hanchan's first hand) ->
+    # username
+    players: dict
     final: dict
     hands: list[HandResult]
     rules: str = ""
@@ -87,14 +114,19 @@ class Game:
 
 
 def _tenpai_seats(mask: int | None) -> list[str]:
-    # bitmask in seat order E S W N (verified against score deltas: 3000 split among tenpai players)
+    # bitmask in seat order E S W N (verified against score deltas: 3000 split among
+    # tenpai players)
     if mask is None:
         return []
     return [s for i, s in enumerate(SEATS) if mask >> i & 1]
 
 
 def parse_game(g: dict) -> Game:
-    """Translate a scoremj game payload into reconstruction inputs, preserving starting-seat deltas."""
+    """Translate a scoremj game without changing authoritative results.
+
+    Translate a scoremj game payload into reconstruction inputs, preserving
+    starting-seat deltas.
+    """
     hands = []
     for h in g["handResults"]:
         hr = HandResult(
@@ -131,7 +163,7 @@ def parse_game(g: dict) -> Game:
 
 
 def fetch_game(game_id: int) -> Game:
-    """Fetch and normalize a game by its numeric scoremj ID; network failures propagate."""
+    """Fetch a game by numeric scoremj ID, propagating network failures."""
     return parse_game(gql(Q_GAME, {"gameId": game_id})["game"])
 
 
@@ -152,25 +184,47 @@ def to_dict(g: Game) -> dict:
 
 
 def from_dict(d: dict) -> Game:
-    """Restore a cached game created by to_dict(), including typed HandResult entries."""
-    return Game(**{**d, "hands": [HandResult(**h) for h in d["hands"]]})
+    """Restore a cached game, including typed HandResult entries."""
+    return Game(
+        id=d["id"],
+        players=d["players"],
+        final=d["final"],
+        hands=[HandResult(**h) for h in d["hands"]],
+        rules=d.get("rules", ""),
+        container=d.get("container", ""),
+        created=d.get("created", ""),
+    )
 
 
-def main(argv=None):
+@command_logging
+def main(argv: list[str] | None = None) -> None:
     """Print authoritative game and hand summaries for the requested scoremj IDs."""
-    import argparse
-
     ap = argparse.ArgumentParser(description="print scoremj.com games")
     ap.add_argument("--game", type=int, nargs="+")
     a = ap.parse_args(argv)
     for g in (fetch_game(x) for x in a.game):
-        print(
-            f"game {g.id} ({g.container}, {g.rules}) players {g.players} final {g.final}"
+        LOGGER.info(
+            "game %s (%s, %s) players %s final %s",
+            g.id,
+            g.container,
+            g.rules,
+            g.players,
+            g.final,
         )
         for i, h in enumerate(g.hands):
-            print(
-                f"  {i:2d} {h.name} sticks={h.sticks} {h.outcome} {h.winner or ''}{'<-' + h.loser if h.loser else ''} "
-                f"{h.han or ''}/{h.fu or ''} riichi={h.riichi} tenpai={h.tenpai} {h.deltas}"
+            LOGGER.info(
+                "  %2d %s sticks=%s %s %s%s %s/%s riichi=%s tenpai=%s %s",
+                i,
+                h.name,
+                h.sticks,
+                h.outcome,
+                h.winner or "",
+                "<-" + h.loser if h.loser else "",
+                h.han or "",
+                h.fu or "",
+                h.riichi,
+                h.tenpai,
+                h.deltas,
             )
 
 

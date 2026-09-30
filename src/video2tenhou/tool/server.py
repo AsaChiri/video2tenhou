@@ -1,257 +1,283 @@
-"""Loopback-only browser workspace, including streamed video import and exports.
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
 
-One router serves the Vue application and all workspace and review APIs.
-Review state is resolved from the project URL on every request so two tabs
-cannot write facts into each other's recording.
-"""
+"""Starlette workspace API and loopback-only Uvicorn application lifecycle."""
 
 from __future__ import annotations
 
-import json
+import logging
 import re
+import socket
 import threading
 import uuid
 import webbrowser
-from http.server import ThreadingHTTPServer
+from contextlib import asynccontextmanager
+from http import HTTPStatus
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from typing import TYPE_CHECKING
+from urllib.parse import unquote
 
-from .http import LocalHandler
-from .review_routes import get_review, post_review
+import anyio
+import uvicorn
+from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException
+from starlette.requests import ClientDisconnect, Request
+from starlette.responses import FileResponse, Response
+from starlette.routing import Route
+
+from video2tenhou.logging_setup import command_logging
+
+from .http import (
+    PROJECT_BODY_LIMIT,
+    STATIC,
+    UPLOAD_BODY_LIMIT,
+    LocalAccess,
+    json_response,
+    read_json_body,
+)
+from .review_routes import review_routes
 from .workflow import VIDEO_SUFFIXES, Workspace
 
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
 
-class Handler(LocalHandler):
-    """Serve the studio, scoped review APIs and explicitly allowlisted exports."""
+    from starlette.types import ASGIApp
 
-    @property
-    def workspace(self) -> Workspace:
-        """Access the server-owned workspace, never process-global project state."""
-        return self.server.workspace
+LOGGER = logging.getLogger(__name__)
 
-    @property
-    def state(self):
-        """Resolve review state from this request's project route."""
-        return self.workspace.review_state(self.project_key)
 
-    def do_GET(self):
-        """Read project status, stream exports or dispatch project review requests."""
-        if not self._host_ok():
-            return self._json(
-                {"error": "Use the localhost address shown when starting the app."}, 403
-            )
-        path = urlparse(self.path).path
-        try:
-            if path == "/api/workspace":
-                with self.workspace.lock:
-                    return self._json(
-                        {
-                            "setup": self.workspace.setup(),
-                            "projects": [
-                                self.workspace.snapshot(k)
-                                for k in self.workspace.projects
-                            ],
-                        }
-                    )
-            match = re.fullmatch(r"/api/projects/([a-f0-9]{32})", path)
-            if match:
-                return self._json(self.workspace.snapshot(match[1]))
-            match = re.fullmatch(r"/api/projects/([a-f0-9]{32})/results", path)
-            if match:
-                return self._json(self.workspace.results(match[1]))
-            match = re.fullmatch(r"/exports/([a-f0-9]{32})/([^/]+)", path)
-            if match:
-                file = self.workspace.artifact(match[1], unquote(match[2]))
-                content_type = (
-                    "text/html; charset=utf-8"
-                    if file.suffix == ".html"
-                    else "application/json; charset=utf-8"
-                    if file.suffix == ".json"
-                    else "text/plain; charset=utf-8"
-                )
-                headers = (
-                    {}
-                    if file.suffix == ".html"
-                    else {"Content-Disposition": f'attachment; filename="{file.name}"'}
-                )
-                return self._bytes(file.read_bytes(), content_type, headers=headers)
-            match = re.fullmatch(r"/review/([a-f0-9]{32})(/api/.*)", path)
-            if match:
-                self.project_key, route = match.groups()
-                if route.startswith("/api/read") and any(
-                    p.get("job", {}).get("running")
-                    for p in self.workspace.projects.values()
-                ):
-                    return self._json(
-                        {
-                            "error": "Analysis is running. Tile labeling becomes available when it finishes."
-                        },
-                        409,
-                    )
-                query = {
-                    key: values[0]
-                    for key, values in parse_qs(urlparse(self.path).query).items()
+def request_error(request: Request, error: Exception) -> Response:
+    """Keep failures structured and preserve the existing read/write status contract."""
+    if isinstance(error, HTTPException):
+        response = json_response({"error": str(error.detail)}, error.status_code)
+        if error.headers:
+            response.headers.update(error.headers)
+        return response
+    if isinstance(error, (KeyError, FileNotFoundError)):
+        status = HTTPStatus.NOT_FOUND
+    elif isinstance(error, (ValueError, ClientDisconnect)) or (
+        request.method == "POST" and isinstance(error, (TypeError, OSError))
+    ):
+        status = HTTPStatus.BAD_REQUEST
+    else:
+        LOGGER.error("Workspace request failed", exc_info=error)
+        status = HTTPStatus.INTERNAL_SERVER_ERROR
+    return json_response({"error": str(error)}, status)
+
+
+class WorkspaceRoutes:
+    """Bind workspace endpoints and keep blocking work off the event loop."""
+
+    def __init__(self, workspace: Workspace) -> None:
+        """Retain the application-owned workspace for these routes."""
+        self.workspace = workspace
+
+    def status(self, _request: Request) -> Response:
+        """Return setup status and current project snapshots."""
+        with self.workspace.lock:
+            return json_response(
+                {
+                    "setup": self.workspace.setup(),
+                    "projects": [
+                        self.workspace.snapshot(key) for key in self.workspace.projects
+                    ],
                 }
-                return get_review(self, self.state, route, query)
-            if path in ("/", "/index.html"):
-                self.path = "/index.html"
-            elif not re.fullmatch(
-                r"/(?:tiles/[A-Za-z0-9_-]+\.(?:svg|md)|assets/[A-Za-z0-9_-]+\.(?:js|css))",
-                path,
-            ):
-                return self._json({"error": "Page not found."}, 404)
-            return super().do_GET()
-        except (KeyError, FileNotFoundError) as exc:
-            return self._json({"error": str(exc)}, 404)
-        except ValueError as exc:
-            return self._json({"error": str(exc)}, 400)
-        except Exception as exc:
-            return self._json({"error": str(exc)}, 500)
-
-    def do_POST(self):
-        """Accept same-origin project actions and bounded JSON or streamed uploads."""
-        if not self._local_request():
-            return self._json(
-                {"error": "Only requests from this local app are accepted."}, 403
             )
-        path = urlparse(self.path).path
+
+    def project(self, request: Request) -> Response:
+        """Return one recording's current workflow state."""
+        return json_response(self.workspace.snapshot(request.path_params["key"]))
+
+    def results(self, request: Request) -> Response:
+        """List current validated exports and pending corrections."""
+        return json_response(self.workspace.results(request.path_params["key"]))
+
+    def export(self, request: Request) -> Response:
+        """Stream an allowlisted export with bounded memory use."""
+        file = self.workspace.artifact(
+            request.path_params["key"], request.path_params["name"]
+        )
+        return FileResponse(
+            file, filename=None if file.suffix == ".html" else file.name
+        )
+
+    async def create(self, request: Request) -> Response:
+        """Validate a bounded project request and persist its recording metadata."""
+        body = await read_json_body(request, PROJECT_BODY_LIMIT)
+        project = await run_in_threadpool(self.workspace.create, body)
+        return json_response(project, HTTPStatus.CREATED)
+
+    async def action(self, request: Request) -> Response:
+        """Apply one named project action with bounded input."""
+        body = await read_json_body(request, PROJECT_BODY_LIMIT)
+        return await run_in_threadpool(
+            self.apply_action,
+            request.path_params["key"],
+            request.path_params["action"],
+            body,
+        )
+
+    def apply_action(self, key: str, action: str, body: dict) -> Response:
+        """Dispatch explicit project actions in a worker thread."""
+        actions: dict[str, Callable[[], dict]] = {
+            "rename": lambda: self.workspace.rename(key, body),
+            "delete": lambda: self.workspace.delete(key),
+            "settings": lambda: self.workspace.update(key, body),
+            "prepare": lambda: self.workspace.start(key, "prepare"),
+            "analyze": lambda: self.workspace.start(key, "analyze"),
+        }
+        if action not in actions:
+            return json_response({"error": "Unknown action."}, HTTPStatus.NOT_FOUND)
+        status = (
+            HTTPStatus.ACCEPTED if action in ("prepare", "analyze") else HTTPStatus.OK
+        )
+        return json_response(actions[action](), status)
+
+    async def upload(self, request: Request) -> Response:
+        """Stream a recording to a temporary file and publish only a complete upload."""
+        size = int(request.headers.get("content-length", "0"))
+        filename = unquote(request.headers.get("x-filename", ""))
+        path = await run_in_threadpool(self.upload_path, filename, size)
+        partial = path.with_suffix(path.suffix + ".upload")
         try:
-            match = re.fullmatch(r"/review/([a-f0-9]{32})(/api/.*)", path)
-            if match:
-                self.project_key, route = match.groups()
-                with self.workspace.lock:
-                    if any(
-                        p.get("job", {}).get("running")
-                        for p in self.workspace.projects.values()
-                    ):
-                        return self._json(
-                            {
-                                "error": "Analysis is running. Wait until it finishes before changing review data."
-                            },
-                            409,
-                        )
-                    # Facts are durable inputs for the next reconstruction.
-                    # Saving them does not launch another model process; the
-                    # review ledger keeps changes made during a job pending.
-                    if route not in ("/api/facts", "/api/facts/delete") and any(
-                        any(job.get("running") for job in state.jobs.values())
-                        for state in self.workspace.states.values()
-                    ):
-                        return self._json(
-                            {
-                                "error": "A review job is running. Wait for it to finish first."
-                            },
-                            409,
-                        )
-                    size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 <= size <= 4 * 1024 * 1024:
-                        return self._json({"error": "Request body is too large."}, 413)
-                    body = json.loads(self._read_request_bytes(size) or b"{}")
-                    if not isinstance(body, dict):
-                        raise ValueError("Expected a JSON object.")
-                    return post_review(self, self.state, route, body)
-            size = int(self.headers.get("Content-Length", "0"))
-            if path == "/api/upload":
-                return self._upload(size)
-            if not 0 <= size <= 65536:
-                return self._json({"error": "Request body is too large."}, 413)
-            body = json.loads(self._read_request_bytes(size) or b"{}")
-            if not isinstance(body, dict):
-                raise ValueError("Expected a JSON object.")
-            if path == "/api/projects":
-                return self._json(self.workspace.create(body), 201)
-            match = re.fullmatch(r"/api/projects/([a-f0-9]{32})/(rename|delete)", path)
-            if match:
-                if match[2] == "rename":
-                    return self._json(self.workspace.rename(match[1], body))
-                return self._json(self.workspace.delete(match[1]))
-            match = re.fullmatch(r"/api/projects/([a-f0-9]{32})/settings", path)
-            if match:
-                return self._json(self.workspace.update(match[1], body))
-            match = re.fullmatch(
-                r"/api/projects/([a-f0-9]{32})/(prepare|analyze)", path
-            )
-            if match:
-                return self._json(self.workspace.start(match[1], match[2]), 202)
-            return self._json({"error": "Unknown action."}, 404)
-        except (KeyError, FileNotFoundError) as exc:
-            return self._json({"error": str(exc)}, 404)
-        except (ValueError, OSError) as exc:
-            return self._json({"error": str(exc)}, 400)
-        except Exception as exc:
-            return self._json({"error": str(exc)}, 500)
+            await receive_video(request, partial, size)
+            await run_in_threadpool(partial.replace, path)
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(partial.unlink, missing_ok=True)
+            raise
+        return json_response({"path": str(path), "name": path.name}, HTTPStatus.CREATED)
 
-    def _upload(self, size: int):
-        filename = unquote(self.headers.get("X-Filename", ""))
-        error, status = None, 400
-        if not 0 < size <= 100 * 1024**3:
-            error, status = "Choose a nonempty recording smaller than 100 GB.", 413
+    def upload_path(self, filename: str, size: int) -> Path:
+        """Validate an upload and choose a unique path in the sample directory."""
+        if not 0 < size <= UPLOAD_BODY_LIMIT:
+            raise HTTPException(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "Choose a nonempty recording smaller than 100 GB.",
+            )
         if Path(filename).name != filename or "\\" in filename or "/" in filename:
-            error = "Invalid upload filename."
+            message = "Invalid upload filename."
+            raise ValueError(message)
         suffix = Path(filename).suffix.lower()
         if suffix not in VIDEO_SUFFIXES:
-            error = "Choose an MP4, MKV, MOV, WebM, AVI or M4V recording."
-        if error:
-            return self._json({"error": error}, status)
+            message = "Choose an MP4, MKV, MOV, WebM, AVI or M4V recording."
+            raise ValueError(message)
         stem = (
             re.sub(r"[^\w .-]", "_", Path(filename).stem).strip(" .")[:80]
             or "recording"
         )
         folder = self.workspace.root / "samples"
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
-        partial = path.with_suffix(path.suffix + ".upload")
+        return folder / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+
+
+async def receive_video(request: Request, partial: Path, remaining: int) -> None:
+    """Write a bounded upload asynchronously and reject truncated body streams."""
+    try:
+        async with await anyio.open_file(partial, "xb") as output:
+            async for chunk in request.stream():
+                remaining -= len(chunk)
+                if remaining < 0:
+                    raise HTTPException(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        "Upload exceeds its declared length.",
+                    )
+                await output.write(chunk)
+    except ClientDisconnect as error:
+        message = "The upload was interrupted. Choose the file again to retry."
+        raise ValueError(message) from error
+    if remaining:
+        message = "The upload was interrupted. Choose the file again to retry."
+        raise ValueError(message)
+
+
+def static_file(request: Request) -> Response:
+    """Serve only the packaged application and explicitly supported static assets."""
+    path = request.url.path
+    if path in ("/", "/index.html"):
+        path = "/index.html"
+    elif not re.fullmatch(
+        r"/(?:tiles/[A-Za-z0-9_-]+\.(?:svg|md)|assets/[A-Za-z0-9_-]+\.(?:js|css))", path
+    ):
+        return json_response({"error": "Page not found."}, HTTPStatus.NOT_FOUND)
+    file = STATIC / path.lstrip("/")
+    if not file.is_file():
+        return json_response({"error": "Page not found."}, HTTPStatus.NOT_FOUND)
+    return FileResponse(file)
+
+
+def create_app(workspace: Workspace) -> ASGIApp:
+    """Build the ASGI app; its lifespan owns shutdown of all workspace child jobs."""
+    endpoints = WorkspaceRoutes(workspace)
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
         try:
-            with partial.open("xb") as output:
-                remaining = size
-                while remaining:
-                    chunk = self._read_request_bytes(min(1024 * 1024, remaining))
-                    if not chunk:
-                        raise ValueError(
-                            "The upload was interrupted. Choose the file again to retry."
-                        )
-                    output.write(chunk)
-                    remaining -= len(chunk)
-            partial.replace(path)
-        except BaseException:
-            partial.unlink(missing_ok=True)
-            raise
-        return self._json({"path": str(path), "name": path.name}, 201)
+            yield
+        finally:
+            await run_in_threadpool(workspace.close)
+
+    routes = [
+        Route("/api/workspace", endpoints.status),
+        Route("/api/projects", endpoints.create, methods=["POST"]),
+        Route("/api/projects/{key}", endpoints.project),
+        Route("/api/projects/{key}/results", endpoints.results),
+        Route("/api/projects/{key}/{action}", endpoints.action, methods=["POST"]),
+        Route("/api/upload", endpoints.upload, methods=["POST"]),
+        Route("/exports/{key}/{name:path}", endpoints.export),
+        review_routes(workspace),
+        Route("/{path:path}", static_file),
+    ]
+    errors = dict.fromkeys(
+        (
+            HTTPException,
+            KeyError,
+            ValueError,
+            TypeError,
+            OSError,
+            ClientDisconnect,
+            Exception,
+        ),
+        request_error,
+    )
+    return LocalAccess(
+        Starlette(routes=routes, lifespan=lifespan, exception_handlers=errors)
+    )
 
 
-class Server(ThreadingHTTPServer):
-    """Own one workspace and close all its processes with the listener."""
-
-    allow_reuse_address = False
-
-    def server_close(self):
-        if hasattr(self, "workspace"):
-            self.workspace.close()
-        super().server_close()
-
-
-def make_server(root: Path, port: int = 8765, *, runner=None) -> Server:
-    """Construct a loopback server; port zero is useful for isolated HTTP tests."""
-    server = Server(("127.0.0.1", port), Handler)
-    server.workspace = Workspace(root, runner=runner)
-    return server
-
-
+@command_logging
 def serve_workspace(root: Path, port: int = 8765, *, open_browser: bool = True) -> None:
-    """Open the local studio and serve until interrupted; no external listener."""
-    try:
-        server = make_server(root, port)
-    except OSError as exc:
-        raise SystemExit(
-            f"Cannot start the app on port {port}: {exc}. Try --port with another number."
-        ) from exc
-    url = f"http://localhost:{server.server_port}"
-    print(f"video2tenhou: {url}\nKeep this window open while a recording is running.")
-    if open_browser:
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    """Bind loopback explicitly and let Uvicorn manage the ASGI server lifecycle."""
+    with socket.socket() as listener:
+        try:
+            listener.bind(("127.0.0.1", port))
+        except OSError as error:
+            message = (
+                f"Cannot start the app on port {port}: {error}. "
+                "Try --port with another number."
+            )
+            raise SystemExit(message) from error
+        workspace = Workspace(root)
+        server = uvicorn.Server(
+            uvicorn.Config(
+                create_app(workspace),
+                host="127.0.0.1",
+                port=listener.getsockname()[1],
+                access_log=False,
+                proxy_headers=False,
+                ws="none",
+                http="h11",
+                timeout_graceful_shutdown=5,
+            )
+        )
+        url = f"http://localhost:{listener.getsockname()[1]}"
+        LOGGER.info(
+            "video2tenhou: %s\nKeep this window open while a recording is running.", url
+        )
+        if open_browser:
+            threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+        try:
+            server.run(sockets=[listener])
+        finally:
+            workspace.close()

@@ -1,18 +1,30 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Calls anchored on the discards they took (DESIGN.md 4.8 "call anchor").
 
-The meld camera says *that* a seat laid a meld, and roughly what it looks like; the pond says which discard
-it took; the hand says which of its tiles went with it. So a meld event becomes a call only when
+The meld camera says *that* a seat laid a meld, and roughly what it looks like; the pond
+says which discard it took; the hand says which of its tiles went with it. So a meld
+event becomes a call only when
 
-- a discard was taken — a removal in a calm pond log, or a tile a dense read sees laid and gone again in the
-  seconds before the meld appeared: a chi, pon or daiminkan of that tile from that seat, whose tiles from the
-  hand are a choice among the legal melds on the called tile (`melds.meld_options`), decided by the solver
+- a discard was taken — a removal in a calm pond log, or a tile a dense read sees laid
+  and gone again in the
+  seconds before the meld appeared: a chi, pon or daiminkan of that tile from that seat,
+  whose tiles from the
+  hand are a choice among the legal melds on the called tile (`melds.meld_options`),
+  decided by the solver
   with the caller's hand;
-- the caller's hand confirms it: a chi, pon or daiminkan leaves the resting hand three tiles shorter, so a
-  hand that still holds as many tiles as the seat's known calls allow says the camera re-read a meld already
+- the caller's hand confirms it: a chi, pon or daiminkan leaves the resting hand three
+  tiles shorter, so a
+  hand that still holds as many tiles as the seat's known calls allow says the camera
+  re-read a meld already
   counted (the insets regroup their tiles from view to view), and nothing is taken;
-- nothing was taken but the camera shows a kan pattern — a pair of identical face-up tiles (an ankan's middle)
-  or a pon grown by a tile of its kind: an ankan or a kakan. An ankan holds all four tiles of its kind, so a
-  kind that a call or a pond shows elsewhere cannot be one: a pair seen only as a fragment is then no kan, and
+- nothing was taken but the camera shows a kan pattern — a pair of identical face-up
+  tiles (an ankan's middle)
+  or a pon grown by a tile of its kind: an ankan or a kakan. An ankan holds all four
+  tiles of its kind, so a
+  kind that a call or a pond shows elsewhere cannot be one: a pair seen only as a
+  fragment is then no kan, and
   a kan the camera saw whole has its kind misread (the solver names it).
 
 Anything else the camera shows is not a call.
@@ -22,16 +34,23 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+from video2tenhou.engine.dense import DenseContext
+from video2tenhou.train.data import CLASS_INDEX, CLASSES
 
 from . import dense, rules
 from .hand import MELD_LOOK, in_window, melds_shown, seat_of
 from .melds import Call, fragments, meld_options, track_melds
-from .ponds import PondSlot
 from .turns import removal_gap
 
-DENSE_BEFORE = 25.0  # s before a meld appeared that the ponds are read densely for the discard it took (CALL_TOL)
+if TYPE_CHECKING:
+    from .ponds import PondSlot
+
+# Seconds before a meld appears to scan densely for the discard it took.
+DENSE_BEFORE = 25.0
 PLAY_SLACK = 20.0  # s: the first discard may have been called away before any calm view
 
 
@@ -46,8 +65,10 @@ class Taken:
 
 
 def meld_events(entry: dict, obs: dict, t0: float, t1: float) -> list[Call]:
-    """Every new group of every seat's meld camera: legal melds and fragments (two tiles of a meld with no legal
-    third). None of them is a call yet.
+    """Collect newly observed melds and persistent two-tile fragments.
+
+    Every new group of every seat's meld camera: legal melds and fragments (two tiles of
+    a meld with no legal third). None of them is a call yet.
     """
     out: list[Call] = []
     for corner in ("TL", "TR", "BL", "BR"):
@@ -82,13 +103,18 @@ class CallAnchor:
     def __init__(
         self,
         logs: dict[str, list[PondSlot]],
-        entry: dict,
-        models,
-        work_dir,
-        t0: float,
-        problems: list[str],
         obs: dict | None = None,
-    ):
+        *,
+        context: DenseContext,
+    ) -> None:
+        """Bind pond logs and optional dense readers for single-use call anchoring."""
+        entry, models, work_dir, t0, problems = (
+            context.entry,
+            context.models,
+            context.work_dir,
+            context.t0,
+            context.problems,
+        )
         self.logs, self.entry, self.models, self.work_dir, self.t0 = (
             logs,
             entry,
@@ -107,7 +133,7 @@ class CallAnchor:
         last_discard: float | None,
         tsumo_winner: str | None,
     ) -> list[Call]:
-        """Validate camera hypotheses against pond removals and the playable hand interval.
+        """Validate camera hypotheses against pond removals and the play interval.
 
         Targeted dense reads may add a called-away discard to the shared logs.
         Diagnostics explain rejected hypotheses; only established calls are returned.
@@ -121,8 +147,10 @@ class CallAnchor:
             )
             if ev.t_first < first_discard - PLAY_SLACK or late:
                 self.problems.append(
-                    f"{ev.seat}'s meld camera shows {' '.join(ev.tiles)} at {ev.t_first:.0f}s, "
-                    f"{'before the first' if not late else 'after the last'} discard: not a call"
+                    f"{ev.seat}'s meld camera shows {' '.join(ev.tiles)} at "
+                    f"{ev.t_first:.0f}s, "
+                    f"{('before the first' if not late else 'after the last')} "
+                    "discard: not a call"
                 )
                 continue
             if ev.type == "kakan":
@@ -139,10 +167,12 @@ class CallAnchor:
                 kans.append(ev)
             else:
                 self.problems.append(
-                    f"{ev.seat}'s meld camera shows {' '.join(ev.tiles)} at {ev.t_first:.0f}s, but no discard "
-                    f"was taken and it is no kan: not a call"
+                    f"{ev.seat}'s meld camera shows {' '.join(ev.tiles)} at "
+                    f"{ev.t_first:.0f}s, but no discard was taken and it is no "
+                    "kan: not a call"
                 )
-        # the kans once every call is known: the pons they grow and the tiles an ankan cannot share
+        # the kans once every call is known: the pons they grow and the tiles an ankan
+        # cannot share
         for ev in kans:
             kan = self._self_kan(ev, calls)
             if kan is not None:
@@ -150,8 +180,10 @@ class CallAnchor:
         return sorted(calls, key=lambda c: c.t_first)
 
     def reread(self, ev: Call, calls: list[Call]) -> bool:
-        """The caller's hand holds as many tiles as its known calls allow: the camera re-read a meld already
-        counted (a note).
+        """Check whether the hand size identifies a repeated view of a known meld.
+
+        The caller's hand holds as many tiles as its known calls allow: the camera
+        re-read a meld already counted (a note).
         """
         shown = melds_shown(
             self.obs, self.entry, ev.seat, ev.t_first, ev.t_first + MELD_LOOK
@@ -164,18 +196,19 @@ class CallAnchor:
         if shown is None or shown > known:
             return False
         self.problems.append(
-            f"{ev.seat}'s meld camera shows a {ev.type} of {' '.join(ev.tiles)} at {ev.t_first:.0f}s, but the "
-            f"hand still holds the tiles of {shown} meld(s), which the known calls explain: a re-read, not a call"
+            f"{ev.seat}'s meld camera shows a {ev.type} of {' '.join(ev.tiles)}"
+            f" at {ev.t_first:.0f}s, but the hand still holds the tiles of "
+            f"{shown} meld(s), which the known calls explain: a re-read, not a "
+            "call"
         )
         return True
 
-    # -- was a discard taken? -----------------------------------------------------------------------------------
+    # -- was a discard taken?
+    # --------------------------------------------------------------------------
 
     @staticmethod
     def _support(ev: Call, tile: str) -> float:
         """How strongly the event's boxes read this tile (its best box)."""
-        from ..train.data import CLASS_INDEX
-
         ids = [CLASS_INDEX[rules.plain(tile)]] + (
             [CLASS_INDEX[tile]] if tile in rules.REDS else []
         )
@@ -185,11 +218,12 @@ class CallAnchor:
 
     @staticmethod
     def _suit_agrees(ev: Call, tile: str) -> bool:
-        """A chi or pon is of one suit, and the meld insets confuse numbers, not suits: the taken tile's suit is the
-        one most of the event's boxes read (any, when it has none).
-        """
-        from ..train.data import CLASSES
+        """Check the taken tile's suit against the observed meld.
 
+        A chi or pon is of one suit, and the meld insets confuse numbers, not suits: the
+        taken tile's suit is the one most of the event's boxes read (any, when it has
+        none).
+        """
         suits = Counter(
             rules.suit(CLASSES[int(np.argmax(p))])
             for p in ev.p
@@ -217,8 +251,10 @@ class CallAnchor:
         )
 
     def _calm(self, ev: Call) -> Taken | None:
-        """A removal of another seat's calm pond log in the event's window, of the suit the camera reads, that no
-        call has taken yet.
+        """Find an unused calm pond removal matching the meld's window and suit.
+
+        A removal of another seat's calm pond log in the event's window, of the suit the
+        camera reads, that no call has taken yet.
         """
         best = None
         for s, sls in self.logs.items():
@@ -233,7 +269,7 @@ class CallAnchor:
                 ):
                     continue
                 d = removal_gap(ev, sl)
-                if d is None:
+                if d is None or sl.t_removed is None:
                     continue
                 key = (d, -self._support(ev, sl.tile))
                 if best is None or key < best[0]:
@@ -241,14 +277,27 @@ class CallAnchor:
         return best[1] if best else None
 
     def _dense(self, ev: Call) -> Taken | None:
-        """A tile laid in another pond and gone again in the seconds before the meld appeared (5 fps reads)."""
+        """Find a recently placed and removed tile through dense pond readings.
+
+        A tile laid in another pond and gone again in the seconds before the meld
+        appeared (5 fps reads).
+        """
         if self.models is None:
             return None
+        if self.work_dir is None:
+            msg = "Dense call evidence requires a workspace directory"
+            raise ValueError(msg)
         lo, hi = max(self.t0, ev.t_window[0] - DENSE_BEFORE), ev.t_first + 1.0
         runs = [
             (s, r)
             for s, r in dense.taken_discards(
-                ev.seat, lo, hi, self.logs, self.entry, self.models, self.work_dir
+                ev.seat,
+                lo,
+                hi,
+                self.logs,
+                context=DenseContext(
+                    entry=self.entry, models=self.models, work_dir=self.work_dir
+                ),
             )
             if (
                 r["t_last"] <= ev.t_first + 1.0
@@ -268,16 +317,25 @@ class CallAnchor:
             ),
         )
         sl = dense.place_taken(s, run, self.logs)
+        if sl.t_removed is None:
+            msg = "A dense taken-discard reading must include its removal time"
+            raise ValueError(msg)
         self.problems.append(
-            f"{ev.seat}'s meld at {ev.t_first:.0f}s took {s}'s {run['tile']}, seen in its pond from "
-            f"{run['t_first']:.1f}s to {run['t_last']:.1f}s in a dense read"
+            f"{ev.seat}'s meld at {ev.t_first:.0f}s took {s}'s {run['tile']}, "
+            f"seen in its pond from {run['t_first']:.1f}s to "
+            f"{run['t_last']:.1f}s in a dense read"
         )
         return Taken(s, sl, sl.tile, sl.t_removed)
 
-    # -- the call -----------------------------------------------------------------------------------------------
+    # -- the call
+    # --------------------------------------------------------------------------
 
     def _on_discard(self, ev: Call, taken: Taken) -> Call:
-        """A chi, pon or daiminkan of the taken tile: its tiles from the hand are a choice (the solver's)."""
+        """Build call candidates taking the observed discard.
+
+        A chi, pon or daiminkan of the taken tile: its tiles from the hand are a choice
+        (the solver's).
+        """
         source = rules.relative(ev.seat, taken.seat)
         options = meld_options(
             taken.tile, source, [np.asarray(p) for p in ev.p], four=ev.type == "kan"
@@ -313,8 +371,10 @@ class CallAnchor:
         )
 
     def _self_kan(self, ev: Call, calls: list[Call]) -> Call | None:
-        """Nothing taken and a kan shown: a kakan on the seat's pon of that kind, else an ankan — if its kind can
-        still be all four.
+        """Resolve a shown kan with no taken discard as kakan or ankan.
+
+        Nothing taken and a kan shown: a kakan on the seat's pon of that kind, else an
+        ankan — if its kind can still be all four.
         """
         known = [t for t in ev.tiles if t not in ("X", "?")]
         if not known:
@@ -354,14 +414,15 @@ class CallAnchor:
         )
         if pon is not None:
             self.problems.append(
-                f"{ev.seat} added a {kind} to its pon at {ev.t_first:.0f}s (nothing taken from a pond): kakan"
+                f"{ev.seat} added a {kind} to its pon at {ev.t_first:.0f}s "
+                "(nothing taken from a pond): kakan"
             )
             return Call(
                 ev.seat,
                 ev.t_first,
                 ev.t_window,
                 "kakan",
-                pon.tiles + [kind],
+                [*pon.tiles, kind],
                 pon.called_pos,
                 pon.source,
                 pon.called_tile,
@@ -374,20 +435,23 @@ class CallAnchor:
         elsewhere = self._shown_elsewhere(kind, calls)
         if elsewhere and ev.type == "fragment":
             self.problems.append(
-                f"{ev.seat}'s meld camera shows {' '.join(ev.tiles)} at {ev.t_first:.0f}s and no discard was "
-                f"taken, but {elsewhere} holds a {kind}: an ankan needs all four, so it is no kan"
+                f"{ev.seat}'s meld camera shows {' '.join(ev.tiles)} at "
+                f"{ev.t_first:.0f}s and no discard was taken, but {elsewhere} "
+                f"holds a {kind}: an ankan needs all four, so it is no kan"
             )
             return None
         if elsewhere:
             self.problems.append(
-                f"{ev.seat}'s meld camera shows an ankan at {ev.t_first:.0f}s read {kind}, but {elsewhere} "
-                f"holds a {kind}: the kan's kind is misread and left to the solver"
+                f"{ev.seat}'s meld camera shows an ankan at {ev.t_first:.0f}s "
+                f"read {kind}, but {elsewhere} holds a {kind}: the kan's kind "
+                "is misread and left to the solver"
             )
             kind = "?"
         else:
             self.problems.append(
-                f"{ev.seat}'s meld camera shows {' '.join(ev.tiles)} at {ev.t_first:.0f}s and no discard was "
-                f"taken: an ankan of {kind}"
+                f"{ev.seat}'s meld camera shows {' '.join(ev.tiles)} at "
+                f"{ev.t_first:.0f}s and no discard was taken: an ankan of "
+                f"{kind}"
             )
         return Call(
             ev.seat,
@@ -406,8 +470,10 @@ class CallAnchor:
         )
 
     def _shown_elsewhere(self, kind: str, calls: list[Call]) -> str | None:
-        """Where a tile of `kind` is seen outside a would-be ankan: a call's called tile or a pon/kan of it, or
-        a discard at rest in a pond.
+        """Find visible copies that rule out a proposed concealed kan.
+
+        Where a tile of `kind` is seen outside a would-be ankan: a call's called tile or
+        a pon/kan of it, or a discard at rest in a pond.
         """
         for c in calls:
             if c.called_tile is not None and rules.plain(c.called_tile) == kind:

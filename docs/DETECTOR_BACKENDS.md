@@ -18,10 +18,14 @@ requires `backend`, `architecture` (for example `yolo9-s`), a string-keyed
 settings override metadata defaults. Invalid settings, incompatible classes
 and mismatched hashes fail during loading.
 
-CUDA graphs are enabled through metadata or `cuda_graph=True`. Each capture
-owns its warmed anchor/stride grids. The cache retains at most twelve shapes;
-unsupported runtimes, further shapes and failed captures use eager inference.
-Validate mixed-shape sequences before enabling graphs for a checkpoint.
+All inference uses LibreYOLO's public `predict()` API. CUDA graphs are enabled
+on CUDA through metadata or `cuda_graph=True`. The adapter calls public
+`release_graphs()` before the padded input shape changes, because YOLO9 replaces
+its anchor/stride grids on a shape change. Only the current padded shape retains
+captures; consecutive calls of that shape can replay. Returning to an earlier
+shape requires a new capture and can increase mixed-shape processing time.
+CPU uses eager inference. Validate mixed-shape sequences and performance before
+enabling graphs for a checkpoint.
 
 Recognition identities include weights, preprocessing, class mapping, inference
 settings, device and numerical runtime. Set runtime flags before constructing

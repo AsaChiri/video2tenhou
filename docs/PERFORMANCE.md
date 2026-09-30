@@ -11,13 +11,13 @@ The [benchmark workloads](BENCHMARKS.md) define representative inputs and checks
   transfers contain up to 512 tile crops, including sideways orientations. Detector
   calls process images individually. Sampling windows, pixels, ordering and batch
   boundaries stay stable; cancellation joins the producer and closes its decoder.
-- The supported LibreYOLO9 CUDA-graph path prepares one detector input ahead on
-  the CPU. It converts upright BGR arrays directly to the backend's RGB recipe,
-  avoiding image copies used for visualization. Resize, padding, normalization,
-  tensor layout, single-image inference and postprocessing remain unchanged.
-  A shared model lock covers inference and result materialization; preparation
-  workers are joined on failure. Other backend versions and eager execution use
-  the public prediction path. The selected path is part of recognition identity.
+- Every detector input uses LibreYOLO's public prediction API. A shared model
+  lock covers each complete batch, including graph release, inference and result
+  materialization. CUDA captures are released through the public API before the
+  padded input shape changes, protecting YOLO9's shape-specific decode grids.
+  Consecutive inputs of the same padded shape can replay; shape changes require
+  recapture, which can increase processing time. The graph policy is part of
+  recognition identity. Benchmark mixed-shape workloads before enabling graphs.
 - Count-change checks and votes reuse filtered, structured readings. Classifier
   inference loads the complete local checkpoint without downloading initialization
   weights.

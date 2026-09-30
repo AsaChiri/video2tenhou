@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Preserve unresolved pond replacements without inventing a call or discard.
 
 Posterior alignment can mistake a changed reading of the last tile for a refill.
@@ -10,19 +13,41 @@ whether a call really occurred.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 from copy import deepcopy
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..train.data import CLASSES
+from video2tenhou.read import ReadContext, dense_reads
+from video2tenhou.train.data import CLASSES
+
 from .hand import corner_of
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from pathlib import Path
+
+    from video2tenhou.engine.ponds import PondSlot
+    from video2tenhou.engine.turns import Turn
+    from video2tenhou.read import ReadModels
+
+MIN_ANCHORED_CALL_VIEWS = 2
+DISCARD_FACT_WINDOW = 3
+MIN_REPLACEMENT_FRAMES = 3
+MAX_REPLACEMENT_EDGE_GAP = 0.25
+MAX_REPLACEMENT_FRAME_GAP = 0.5
+MIN_REPLACEMENT_OVERLAP = 0.3
+MIN_REMAINING_POSTERIOR_MASS = -1e-8
+MIN_REPLACEMENT_TILE_VOTES = 3
+
 
 MAX_REPLACEMENT_WINDOW = 30.0
 
 
 def replacement_requests(
-    turns, entry: dict, facts: dict, t0: float, t1: float
+    turns: list[Turn], entry: dict, facts: dict, t0: float, t1: float
 ) -> list[dict]:
     """Identify unresolved source slots and one bounded pond window for each.
 
@@ -37,18 +62,25 @@ def replacement_requests(
         j = counts.get(turn.seat, 0)
         counts[turn.seat] = j + 1
         slot = turn.slot
-        pending = slot.pending_replacement if slot is not None else None
+        if slot is None:
+            continue
+        pending = slot.pending_replacement
         if not pending:
             continue
         call = turn.call
         corroborated = call is not None and (
             call.human
-            or (call.anchor == "discard" and call.seen >= 2 and not call.partial_only)
+            or (
+                call.anchor == "discard"
+                and call.seen >= MIN_ANCHORED_CALL_VIEWS
+                and not call.partial_only
+            )
         )
         if corroborated:
             continue
         reviewed = any(
-            f["seat"] == turn.seat and abs(float(f["t"]) - turn.t) <= 3
+            f["seat"] == turn.seat
+            and abs(float(f["t"]) - turn.t) <= DISCARD_FACT_WINDOW
             for f in facts.get("discard", [])
         )
         if reviewed:
@@ -114,16 +146,22 @@ def replacement_question(request: dict, *, chosen: str | None = None) -> dict:
         "evidence_t": views[-1]["t0"],
         "tracking_uncertain": not request.get("acquired", False),
         "text": (
-            "Continuous pond tracking links the conflicting views, but reconstruction could not "
-            "certify the discard identity. Check both views."
+            (
+                "Continuous pond tracking links the conflicting views, but "
+                "reconstruction could not certify the discard identity. Check both "
+                "views."
+            )
             if request.get("acquired")
-            else "A later pond view conflicts with this discard, and its correspondence is unresolved. "
-            "Check the discard and the later view before accepting the log."
+            else (
+                "A later pond view conflicts with this discard, and its "
+                "correspondence is unresolved. Check the discard and the later view"
+                " before accepting the log."
+            )
         ),
     }
 
 
-def read_replacement(request: dict, models, work_dir) -> list[dict]:
+def read_replacement(request: dict, models: ReadModels, work_dir: Path) -> list[dict]:
     """Read a planned window using normal dense provenance and retention policy.
 
     Return raw structured dense readings for a correspondence probe; do not vote
@@ -133,16 +171,96 @@ def read_replacement(request: dict, models, work_dir) -> list[dict]:
     """
     if request["window"] is None:
         return []
-    from ..read import dense_reads
 
     detector, classifier, video, calibration = models
     lo, hi = request["window"]
     return dense_reads(
-        video, calibration, work_dir, detector, classifier, lo, hi, [request["region"]]
+        ReadContext(video, calibration, work_dir, detector, classifier),
+        lo,
+        hi,
+        [request["region"]],
     )[request["region"]]
 
 
-def consume_replacement(slot, request: dict, readings: list[dict]) -> bool:
+def _replacement_matches_slot(slot: PondSlot, request: dict) -> bool:
+    return not (
+        request["window"] is None
+        or request.get("call_ambiguous")
+        or slot.t_removed is not None
+        or slot.id != request["slot_id"]
+        or slot.pending_replacement != request["pending"]
+        or slot.replacement_acquisition is not None
+    )
+
+
+def _replacement_frames(request: dict, readings: list[dict]) -> list[dict]:
+    pending = request["pending"]
+    lo, hi = request["window"]
+    stable = pending["stable_view"]
+    if (
+        not pending["prefix_complete"]
+        or stable["partial"]
+        or lo != stable["t0"]
+        or any(view["partial"] for view in pending["views"])
+    ):
+        return []
+    frames = sorted((r for r in readings if lo <= r["t"] <= hi), key=lambda r: r["t"])
+    if (
+        len(frames) < MIN_REPLACEMENT_FRAMES
+        or frames[0]["t"] - lo > MAX_REPLACEMENT_EDGE_GAP
+        or hi - frames[-1]["t"] > MAX_REPLACEMENT_EDGE_GAP
+        or any(frame.get("rejected") for frame in frames)
+    ):
+        return []
+    return frames
+
+
+def _unique_correspondence(left: list[dict], right: list[dict]) -> bool:
+    overlap = np.asarray([[_iou(a["xyxy"], b["xyxy"]) for b in right] for a in left])
+    if not np.all(np.isfinite(overlap)):
+        return False
+    for i in range(len(left)):
+        if overlap[i, i] <= MIN_REPLACEMENT_OVERLAP:
+            return False
+        if any(
+            overlap[i, j] >= overlap[i, i] or overlap[j, i] >= overlap[i, i]
+            for j in range(len(left))
+            if j != i
+        ):
+            return False
+    return True
+
+
+def _replacement_rows(
+    frames: list[dict], stack_size: int, tile: str
+) -> list[list[dict]]:
+    rows = [
+        sorted(
+            (
+                b
+                for b in frame["boxes"]
+                if b.get("role", "tile") == "tile" and "row" in b
+            ),
+            key=lambda b: (b["row"], b["col"]),
+        )
+        for frame in frames
+    ]
+    if stack_size < 1 or any(len(row) != stack_size for row in rows):
+        return []
+    prefix = [int(np.argmax(box["p"])) for box in rows[0][:-1]]
+    if CLASSES[int(np.argmax(rows[0][-1]["p"]))] != tile:
+        return []
+    if any([int(np.argmax(box["p"])) for box in row[:-1]] != prefix for row in rows):
+        return []
+    for k, (left, right) in enumerate(itertools.pairwise(rows)):
+        if not 0 < frames[k + 1]["t"] - frames[k]["t"] <= MAX_REPLACEMENT_FRAME_GAP:
+            return []
+        if not _unique_correspondence(left, right):
+            return []
+    return rows
+
+
+def consume_replacement(slot: PondSlot, request: dict, readings: list[dict]) -> bool:
     """Substitute dense evidence only after a continuous full-pond correspondence.
 
     Require unchanged count/order and prefix identities, unique mutual geometric
@@ -154,68 +272,19 @@ def consume_replacement(slot, request: dict, readings: list[dict]) -> bool:
     reconstruction. Only a certified, visually supported choice can close review.
     Return false without mutation for insufficient evidence or a repeated receipt.
     """
-    if (
-        request["window"] is None
-        or request.get("call_ambiguous")
-        or slot.t_removed is not None
-        or slot.id != request["slot_id"]
-        or slot.pending_replacement != request["pending"]
-        or slot.replacement_acquisition is not None
-    ):
+    if not _replacement_matches_slot(slot, request):
         return False
     pending = request["pending"]
-    lo, hi = request["window"]
     stable = pending["stable_view"]
-    if (
-        not pending["prefix_complete"]
-        or stable["partial"]
-        or lo != stable["t0"]
-        or any(v["partial"] for v in pending["views"])
-    ):
+    frames = _replacement_frames(request, readings)
+    if not frames:
         return False
-    frames = sorted((r for r in readings if lo <= r["t"] <= hi), key=lambda r: r["t"])
-    if (
-        len(frames) < 3
-        or frames[0]["t"] - lo > 0.25
-        or hi - frames[-1]["t"] > 0.25
-        or any(r.get("rejected") for r in frames)
-    ):
+    rows = _replacement_rows(frames, pending["stack_size"], slot.tile)
+    if not rows:
         return False
-    rows = [
-        sorted(
-            (b for b in r["boxes"] if b.get("role", "tile") == "tile" and "row" in b),
-            key=lambda b: (b["row"], b["col"]),
-        )
-        for r in frames
-    ]
-    n = pending["stack_size"]
-    if n < 1 or any(len(row) != n for row in rows):
-        return False
-    prefix = [int(np.argmax(b["p"])) for b in rows[0][:-1]]
-    if CLASSES[int(np.argmax(rows[0][-1]["p"]))] != slot.tile:
-        return False
-    if any([int(np.argmax(b["p"])) for b in row[:-1]] != prefix for row in rows):
-        return False
-    for k, (left, right) in enumerate(zip(rows, rows[1:], strict=False)):
-        if not 0 < frames[k + 1]["t"] - frames[k]["t"] <= 0.5:
-            return False
-        overlap = np.asarray(
-            [[_iou(a["xyxy"], b["xyxy"]) for b in right] for a in left]
-        )
-        if not np.all(np.isfinite(overlap)):
-            return False
-        for i in range(n):
-            if overlap[i, i] <= 0.3:
-                return False
-            if any(
-                overlap[i, j] >= overlap[i, i] or overlap[j, i] >= overlap[i, i]
-                for j in range(n)
-                if j != i
-            ):
-                return False
     old = np.asarray(stable["tile"]["p"], float) * max(1, stable["tile"]["seen"])
     remaining = slot.p - old
-    if np.min(remaining) < -1e-8:
+    if np.min(remaining) < MIN_REMAINING_POSTERIOR_MASS:
         return False
     replacement = sum(
         (np.asarray(row[-1]["p"], float) for row in rows), np.zeros(len(CLASSES))
@@ -242,17 +311,23 @@ def consume_replacement(slot, request: dict, readings: list[dict]) -> bool:
             {
                 CLASSES[k]
                 for k in range(len(CLASSES))
-                if sum(int(np.argmax(row[-1]["p"])) == k for row in rows) >= 3
+                if sum(int(np.argmax(row[-1]["p"])) == k for row in rows)
+                >= MIN_REPLACEMENT_TILE_VOTES
             }
         ),
     }
     return True
 
 
-def _iou(a, b):
+def _iou(a: Sequence[float], b: Sequence[float]) -> float:
     x, y, u, v = a
-    X, Y, U, V = b
-    intersection = max(0, min(u, U) - max(x, X)) * max(0, min(v, V) - max(y, Y))
+    other_x0, other_y0, other_x1, other_y1 = b
+    intersection = max(0, min(u, other_x1) - max(x, other_x0)) * max(
+        0, min(v, other_y1) - max(y, other_y0)
+    )
     return intersection / max(
-        (u - x) * (v - y) + (U - X) * (V - Y) - intersection, 1e-9
+        (u - x) * (v - y)
+        + (other_x1 - other_x0) * (other_y1 - other_y0)
+        - intersection,
+        1e-9,
     )

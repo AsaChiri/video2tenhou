@@ -27,6 +27,17 @@ recorded in `uv.lock`; their own licenses remain applicable. Distribution of
 broadcast-derived calibration templates and regression images requires rights
 to the underlying material. Record those permissions alongside asset provenance.
 
+## Local web runtime
+
+The local server uses Starlette and Uvicorn (BSD-3-Clause), AnyIO (MIT),
+and h11 (MIT). Their installed distributions retain the upstream license files;
+exact dependency versions are recorded in `uv.lock`. Starlette and Uvicorn
+are copyright Encode OSS Ltd; AnyIO is copyright Alex Grönholm; h11 is
+copyright Nathaniel J. Smith and other contributors.
+
+Outbound score queries and HTTP integration tests use HTTPX (BSD-3-Clause),
+copyright Encode OSS Ltd. Its installed distribution retains the upstream license.
+
 ## Frontend runtime
 
 The bundled Vue runtime and its @vue packages use the following MIT license.

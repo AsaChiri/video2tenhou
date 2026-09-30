@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Stage 2: motion / occlusion per region at 2 fps -> calm and disturbed intervals.
 
 Scores are computed once for the whole video and stored
@@ -11,12 +14,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import zlib
 from dataclasses import dataclass
 from itertools import groupby
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING
 from zipfile import BadZipFile
-from zlib import error as ZlibError
 
 import cv2
 import numpy as np
@@ -25,40 +30,56 @@ from . import video
 from .cache import source_identity
 from .layout import CORNERS, Calibration
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+
+
 REGIONS = (
     [f"pond:{c}" for c in CORNERS]
     + [f"hand:{c}" for c in CORNERS]
     + [f"meld:{c}" for c in CORNERS]
 )
 MOTION_THR = 4.0  # mean abs gray difference between consecutive samples (0.5 s apart)
-SKIN_THR = 0.05  # skin fraction above the region's own baseline (its 20th percentile: static content)
+# skin fraction above the region's own baseline (its 20th percentile: static content)
+SKIN_THR = 0.05
 SCORE_VERSION = 1  # Uniform black padding for crops crossing an image boundary.
 MIN_CALM_SAMPLES = 3  # >= 1 s at 2 fps
 MAX_GAP = (
     15.0  # read floor: no region goes longer than this (one turn cycle) without a read
 )
-FLOOR_MOTION = 1.5  # the read floor's single frames must be this still (× MOTION_THR): a frame in motion shows
+# the read floor's single frames must be this still (x MOTION_THR): a frame in motion
+# shows
+FLOOR_MOTION = 1.5
 # tiles being moved, and at the end of a hand, pushed into the table
 
 
+LOGGER = logging.getLogger("video2tenhou.calm")
+
+
 def region_key(cal: Calibration, name: str) -> str:
-    """Short hash of the pixels one region is cut from: its frame->image matrix, its size, and, for a hand
-    band, the roll the crop is turned by. Two calibrations with the same key give the same picture, so a
-    score or a reading of one is a score or a reading of the other; a `scale: 1.0` written where nothing
-    was written before is not a change.
+    """Hash the geometry determining a region's pixels.
+
+    Short hash of the pixels one region is cut from: its frame->image matrix, its size,
+    and, for a hand band, the roll the crop is turned by. Two calibrations with the same
+    key give the same picture, so a score or a reading of one is a score or a reading of
+    the other; a `scale: 1.0` written where nothing was written before is not a change.
     """
-    M, size = cal.transform(name)
+    transform, size = cal.transform(name)
     roll = cal.roll(name.partition(":")[2]) if name.startswith("hand:") else 0.0
     blob = json.dumps(
-        [[round(float(v), 4) for v in M.ravel()], list(size), round(float(roll), 3)]
+        [
+            [round(float(v), 4) for v in transform.ravel()],
+            list(size),
+            round(float(roll), 3),
+        ]
     )
-    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+    return hashlib.sha1(blob.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 def geometry_key(cal: Calibration) -> str:
     """Geometry component of the calm cache identity, covering all regions at once."""
     blob = json.dumps({r: region_key(cal, r) for r in REGIONS}, sort_keys=True)
-    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+    return hashlib.sha1(blob.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 def skin_mask(bgr: np.ndarray) -> np.ndarray:
@@ -71,10 +92,16 @@ def skin_mask(bgr: np.ndarray) -> np.ndarray:
 
 
 def cheap_regions(frame: np.ndarray, cal: Calibration) -> dict[str, np.ndarray]:
-    """Region crops at scale 1: ponds from one de-rotated square, hands and melds as slices."""
+    """Crop all regions at unit scale, sharing one overhead de-rotation.
+
+    Region crops at scale 1: ponds from one de-rotated square, hands and melds as
+    slices.
+    """
     out = {}
-    D = cal.derotation()
-    derot = cv2.warpAffine(frame, D[:2], (cal.side, cal.side), flags=cv2.INTER_LINEAR)
+    derotation = cal.derotation()
+    derot = cv2.warpAffine(
+        frame, derotation[:2], (cal.side, cal.side), flags=cv2.INTER_LINEAR
+    )
     for c, (rect, k, _) in cal.pond.items():
         img = rect.crop(derot)
         if k:
@@ -92,15 +119,12 @@ def scores(
     cal: Calibration,
     *,
     fps: float = 2.0,
-    start: float = 0.0,
-    end: float | None = None,
-    log=print,
+    log: Callable[[str], None] = LOGGER.info,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(t[n], motion[n, R], skin[n, R]) over the video."""
     ts, mot, skn = [], [], []
     prev: dict[str, np.ndarray] = {}
-    n = 0
-    for t, frame in video.sample(path, fps=fps, start=start, end=end):
+    for n, (t, frame) in enumerate(video.sample(path, fps=fps), start=1):
         regs = cheap_regions(frame, cal)
         m_row, s_row = [], []
         for name in REGIONS:
@@ -120,7 +144,6 @@ def scores(
         ts.append(t)
         mot.append(m_row)
         skn.append(s_row)
-        n += 1
         if n % 1200 == 0:
             log(f"  calm: {t:.0f} s")
     return np.array(ts), np.array(mot, np.float32), np.array(skn, np.float32)
@@ -137,7 +160,9 @@ class Interval:
     calm: bool
     motion: float
     skin: float
-    partial: bool = False  # read floor: still frames with an arm over the region, or the stillest frames of a blind span
+    # read floor: still frames with an arm over the region, or the stillest frames of a
+    # blind span
+    partial: bool = False
 
     def to_dict(self) -> dict:
         """Serialize stage-2 timing and quality fields for inspection and resume."""
@@ -153,7 +178,7 @@ class Interval:
         }
 
 
-def _runs(values):
+def _runs(values: Iterable[object]) -> Iterator[tuple[int, int, bool]]:
     """Yield half-open spans of equal values, retaining both true and false runs."""
     start = 0
     for value, group in groupby(values):
@@ -162,23 +187,38 @@ def _runs(values):
         start = end
 
 
+@dataclass(frozen=True, kw_only=True)
+class CalmThresholds:
+    """Stillness, occlusion and coverage thresholds used to derive read intervals."""
+
+    motion: float = MOTION_THR
+    skin: float = SKIN_THR
+    min_samples: int = MIN_CALM_SAMPLES
+    max_gap: float = MAX_GAP
+
+
+DEFAULT_THRESHOLDS = CalmThresholds()
+
+
 def intervals(
     ts: np.ndarray,
     mot: np.ndarray,
     skn: np.ndarray,
     *,
-    motion_thr: float = MOTION_THR,
-    skin_thr: float = SKIN_THR,
-    min_calm: int = MIN_CALM_SAMPLES,
+    thresholds: CalmThresholds = DEFAULT_THRESHOLDS,
 ) -> list[Interval]:
-    """Maximal runs of calm / disturbed samples per region; calm runs shorter than min_calm become disturbed."""
+    """Find maximal calm and disturbed runs, rejecting short calm spans.
+
+    Maximal runs of calm / disturbed samples per region; calm runs shorter than min_calm
+    become disturbed.
+    """
     out: list[Interval] = []
     for r, name in enumerate(REGIONS):
         base = float(np.percentile(skn[:, r], 20))
-        calm = (mot[:, r] < motion_thr) & (skn[:, r] < base + skin_thr)
+        calm = (mot[:, r] < thresholds.motion) & (skn[:, r] < base + thresholds.skin)
         # a calm run shorter than min_calm is disturbed
         for i, j, is_calm in _runs(calm.copy()):
-            if is_calm and j - i < min_calm:
+            if is_calm and j - i < thresholds.min_samples:
                 calm[i:j] = False
         for i, j, is_calm in _runs(calm):
             out.append(
@@ -187,13 +227,65 @@ def intervals(
                     float(ts[i]),
                     float(ts[j - 1]),
                     j - i,
-                    is_calm,
-                    float(mot[i:j, r].mean()),
-                    float(skn[i:j, r].mean()),
+                    calm=is_calm,
+                    motion=float(mot[i:j, r].mean()),
+                    skin=float(skn[i:j, r].mean()),
                 )
             )
     out.sort(key=lambda iv: (iv.t0, iv.region))
     return out
+
+
+@dataclass
+class RegionMotion:
+    """Motion and skin samples for one named region on the common time axis."""
+
+    name: str
+    ts: np.ndarray
+    motion: np.ndarray
+    skin: np.ndarray
+
+    def floor(
+        self,
+        span: tuple[float, float],
+        covered: list[tuple[float, float]],
+        thresholds: CalmThresholds,
+    ) -> list[Interval]:
+        """Read the stillest available sample in long uncovered chunks."""
+        a, b = span
+        out: list[Interval] = []
+        pts = [a] + [x for c in covered for x in c] + [b]
+        for k in range(0, len(pts), 2):
+            c0, c1 = pts[k], pts[k + 1]
+            if c1 - c0 <= thresholds.max_gap:
+                continue
+            # one sample per half-floor keeps consecutive reads within the floor of
+            # each other
+            nchunk = int(np.ceil((c1 - c0) / (thresholds.max_gap / 2)))
+            for q in range(nchunk):
+                q0, q1 = (
+                    c0 + q * (c1 - c0) / nchunk,
+                    c0 + (q + 1) * (c1 - c0) / nchunk,
+                )
+                ss = np.where((self.ts > q0) & (self.ts < q1))[0]
+                if len(ss) == 0:
+                    continue
+                best = int(ss[int(np.argmin(self.motion[ss]))])
+                if self.motion[best] >= FLOOR_MOTION * thresholds.motion:
+                    continue
+                out.append(
+                    Interval(
+                        self.name,
+                        float(self.ts[best]),
+                        float(self.ts[best]),
+                        1,
+                        calm=True,
+                        motion=float(self.motion[best]),
+                        skin=float(self.skin[best]),
+                        partial=True,
+                    )
+                )
+        return out
 
 
 def fill_gaps(
@@ -202,15 +294,17 @@ def fill_gaps(
     mot: np.ndarray,
     skn: np.ndarray,
     *,
-    max_gap: float = MAX_GAP,
-    motion_thr: float = MOTION_THR,
-    min_calm: int = MIN_CALM_SAMPLES,
+    thresholds: CalmThresholds = DEFAULT_THRESHOLDS,
 ) -> list[Interval]:
-    """Read floor. Wherever a region has no calm interval for longer than max_gap, partial intervals are added:
-    runs of >= min_calm still samples (motion below the threshold whatever the skin score: an arm resting over
-    part of the region), and where the span is still longer than max_gap, the stillest sample of each chunk
-    when it is still enough (FLOOR_MOTION): a chunk with no such frame stays unread.
-    A partial observation is positive evidence only: a tile seen is there, a tile absent may be hidden.
+    """Add partial intervals wherever calm observations leave a long gap.
+
+    Read floor. Wherever a region has no calm interval for longer than max_gap, partial
+    intervals are added: runs of >= min_calm still samples (motion below the threshold
+    whatever the skin score: an arm resting over part of the region), and where the span
+    is still longer than max_gap, the stillest sample of each chunk when it is still
+    enough (FLOOR_MOTION): a chunk with no such frame stays unread. A partial
+    observation is positive evidence only: a tile seen is there, a tile absent may be
+    hidden.
     """
     out = list(ivs)
     for r, name in enumerate(REGIONS):
@@ -223,64 +317,44 @@ def fill_gaps(
             + [float(ts[-1])]
         )
         for a, b in [(edges[i], edges[i + 1]) for i in range(0, len(edges), 2)]:
-            if b - a <= max_gap:
+            if b - a <= thresholds.max_gap:
                 continue
             sel = np.where((ts > a) & (ts < b))[0]
             if len(sel) == 0:
                 continue
-            still = mot[sel, r] < motion_thr
+            still = mot[sel, r] < thresholds.motion
             covered: list[tuple[float, float]] = []
             for i, j, is_still in _runs(still):
-                if is_still and j - i >= min_calm:
+                if is_still and j - i >= thresholds.min_samples:
                     out.append(
                         Interval(
                             name,
                             float(ts[sel[i]]),
                             float(ts[sel[j - 1]]),
                             j - i,
-                            True,
-                            float(mot[sel[i:j], r].mean()),
-                            float(skn[sel[i:j], r].mean()),
+                            calm=True,
+                            motion=float(mot[sel[i:j], r].mean()),
+                            skin=float(skn[sel[i:j], r].mean()),
                             partial=True,
                         )
                     )
                     covered.append((float(ts[sel[i]]), float(ts[sel[j - 1]])))
-            pts = [a] + [x for c in covered for x in c] + [b]
-            for k in range(0, len(pts), 2):
-                c0, c1 = pts[k], pts[k + 1]
-                if c1 - c0 <= max_gap:
-                    continue
-                # one sample per half-floor keeps consecutive reads within the floor of each other
-                nchunk = int(np.ceil((c1 - c0) / (max_gap / 2)))
-                for q in range(nchunk):
-                    q0, q1 = (
-                        c0 + q * (c1 - c0) / nchunk,
-                        c0 + (q + 1) * (c1 - c0) / nchunk,
-                    )
-                    ss = np.where((ts > q0) & (ts < q1))[0]
-                    if len(ss) == 0:
-                        continue
-                    best = int(ss[int(np.argmin(mot[ss, r]))])
-                    if mot[best, r] >= FLOOR_MOTION * motion_thr:
-                        continue
-                    out.append(
-                        Interval(
-                            name,
-                            float(ts[best]),
-                            float(ts[best]),
-                            1,
-                            True,
-                            float(mot[best, r]),
-                            float(skn[best, r]),
-                            partial=True,
-                        )
-                    )
+            out.extend(
+                RegionMotion(name, ts, mot[:, r], skn[:, r]).floor(
+                    (a, b), covered, thresholds
+                )
+            )
     out.sort(key=lambda iv: (iv.t0, iv.region))
     return out
 
 
 def run_calm(
-    path: str | Path, cal: Calibration, work: Path, *, force: bool = False, log=print
+    path: str | Path,
+    cal: Calibration,
+    work: Path,
+    *,
+    force: bool = False,
+    log: Callable[[str], None] = LOGGER.info,
 ) -> list[Interval]:
     """Reuse source- and geometry-matched scores, derive intervals and write calm.jsonl.
 
@@ -323,12 +397,13 @@ def run_calm(
             EOFError,
             BadZipFile,
             TypeError,
-            ZlibError,
+            zlib.error,
         ):
             pass  # Interrupted or obsolete scores are a cache miss, never evidence.
         if cached is None:
             log(
-                "  calm: scores are stale, incomplete or lack provenance; computing scores again"
+                "  calm: scores are stale, incomplete or lack provenance; "
+                "computing scores again"
             )
     if cached is None:
         ts, mot, skn = scores(path, cal, log=log)
@@ -355,7 +430,7 @@ def run_calm(
     else:
         ts, mot, skn = cached
     ivs = fill_gaps(intervals(ts, mot, skn), ts, mot, skn)
-    with open(work / "calm.jsonl", "w", encoding="utf-8") as f:
+    with (work / "calm.jsonl").open("w", encoding="utf-8") as f:
         f.writelines(json.dumps(iv.to_dict()) + "\n" for iv in ivs)
     return ivs
 

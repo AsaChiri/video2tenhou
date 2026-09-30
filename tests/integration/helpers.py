@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Restore recorded solver inputs without changing their evidence or constraints."""
 
 import numpy as np
@@ -12,22 +15,16 @@ from video2tenhou.engine.solver import (
 )
 
 
-def restore_model(data):
+def restore_model(data: dict) -> HandModel:
     """Load recorded evidence in the current solver schema."""
-    turns = {
-        seat: [
-            SeatTurn(
-                **{
-                    **turn,
-                    "discard_p": np.array(turn["discard_p"])
-                    if turn["discard_p"] is not None
-                    else None,
-                }
-            )
-            for turn in rows
-        ]
-        for seat, rows in data["turns"].items()
-    }
+    turns: dict[str, list[SeatTurn]] = {}
+    for seat, rows in data["turns"].items():
+        turns[seat] = []
+        for turn in rows:
+            fields = dict(turn)
+            if fields["discard_p"] is not None:
+                fields["discard_p"] = np.array(fields["discard_p"])
+            turns[seat].append(SeatTurn(**fields))
     model = HandModel(
         data["dealer"],
         turns,
@@ -35,19 +32,17 @@ def restore_model(data):
         tsumo_winner=data["tsumo_winner"],
         ura=data["ura"],
     )
-    model.hand_ev = [
-        HandEvidence(**{**row, "e": np.array(row["e"])}) for row in data["hand_ev"]
-    ]
-    model.draw_ev = [
-        DrawEvidence(**{**row, "p": np.array(row["p"])}) for row in data["draw_ev"]
-    ]
-    facts = data["facts"]
-    model.facts = Facts(
-        **{
-            **facts,
-            "draws": {(row["seat"], row["j"]): row["tile"] for row in facts["draws"]},
-        }
-    )
+    for row in data["hand_ev"]:
+        fields = dict(row)
+        fields["e"] = np.array(fields["e"])
+        model.hand_ev.append(HandEvidence(**fields))
+    for row in data["draw_ev"]:
+        fields = dict(row)
+        fields["p"] = np.array(fields["p"])
+        model.draw_ev.append(DrawEvidence(**fields))
+    facts = dict(data["facts"])
+    facts["draws"] = {(row["seat"], row["j"]): row["tile"] for row in facts["draws"]}
+    model.facts = Facts(**facts)
     for name in (
         "repair",
         "forbidden_hands",
@@ -57,13 +52,8 @@ def restore_model(data):
     ):
         setattr(model, name, data[name])
     if data["win"]:
-        win = data["win"]
-        model.win = WinSpec(
-            **{
-                **win,
-                "ron_from": tuple(win["ron_from"])
-                if win["ron_from"] is not None
-                else None,
-            }
-        )
+        win = dict(data["win"])
+        if win["ron_from"] is not None:
+            win["ron_from"] = tuple(win["ron_from"])
+        model.win = WinSpec(**win)
     return model

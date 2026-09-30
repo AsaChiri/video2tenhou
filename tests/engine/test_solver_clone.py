@@ -1,4 +1,9 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Cloning must preserve CP-SAT search inputs, not merely equivalent constraints."""
+
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -7,15 +12,18 @@ from video2tenhou.engine import rules
 from video2tenhou.engine.solver import (
     NT,
     TI,
+    TILES,
     DrawEvidence,
     HandEvidence,
     HandModel,
+    ResolveOptions,
     SeatTurn,
     _clone_draw_model,
 )
 
 
-def model_fixture():
+def model_fixture() -> "HandModel":
+    """Create controlled model state for solver or graph ownership tests."""
     turns = {seat: [] for seat in rules.SEATS}
     turns["S"] = [SeatTurn(0, "draw", "9m", 10, 20), SeatTurn(1, "draw", "2z", 30, 40)]
     model = HandModel("E", turns, ["7z"])
@@ -41,12 +49,15 @@ def model_fixture():
     counts = np.zeros(NT)
     for tile in tiles:
         counts[TI[tile]] += 1
-    model.hand_ev = [HandEvidence("S", -1, False, counts, 1.0, 0, 5)]
+    model.hand_ev = [
+        HandEvidence("S", -1, after_draw=False, e=counts, weight=1.0, t0=0, t1=5)
+    ]
     return model
 
 
 @pytest.mark.parametrize("repair", [False, True])
-def test_draw_clones_preserve_full_proto_and_independent_hints(repair):
+def test_draw_clones_preserve_full_proto_and_independent_hints(*, repair: bool) -> None:
+    """Verify draw clones preserve full proto and independent hints."""
     model = model_fixture()
     model.repair = repair
     model.turns["S"][0].discard_p = np.ones(NT) / NT
@@ -59,18 +70,21 @@ def test_draw_clones_preserve_full_proto_and_independent_hints(repair):
         cloned, ch, cd = _clone_draw_model(base, h0, draws, (*key, tile))
         rebuilt, rh, rd, _ = model.build(forbid=(*key, tile))
         for m, hs, ds in [(cloned, ch, cd), (rebuilt, rh, rd)]:
-            for _seat, variables in hs.items():
+            for variables in hs.values():
                 for v in variables:
-                    m.AddHint(v, 0)
+                    m.add_hint(v, 0)
             for other_key, variables in ds.items():
                 if other_key != key:
                     for v in variables:
-                        m.AddHint(v, 0)
+                        m.add_hint(v, 0)
         assert str(cloned.proto) == str(rebuilt.proto)
         assert str(base.proto) == untouched
 
 
-def test_prior_margins_require_unchanged_evidence_and_objective(monkeypatch):
+def test_prior_margins_require_unchanged_evidence_and_objective(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """Verify prior margins require unchanged evidence and objective."""
     model = model_fixture()
     # Establish all starting hands once, so this test isolates draw alternatives.
     first = model.solve(margins=False, workers=1)
@@ -78,8 +92,10 @@ def test_prior_margins_require_unchanged_evidence_and_objective(monkeypatch):
     model.facts.haipai.update(first.haipai)
     calls = []
 
-    def resolve(*args, **kwargs):
-        calls.append(kwargs["watch"])
+    def resolve(
+        *_unused_args: object, options: ResolveOptions, **_unused_kwargs: object
+    ) -> tuple:
+        calls.append(options.watch)
         return 2.0, "3z", 4.0
 
     monkeypatch.setattr(model, "_resolve", resolve)
@@ -87,7 +103,8 @@ def test_prior_margins_require_unchanged_evidence_and_objective(monkeypatch):
     assert len(calls) == 2
     calls.clear()
     same = model.solve(workers=1, prior=first)
-    assert not calls and same.margins == first.margins
+    assert not calls
+    assert same.margins == first.margins
     assert same.alternative_gaps == first.alternative_gaps
     # A changed baseline objective makes the old separation unsafe too.
     same.objective += 1
@@ -101,7 +118,8 @@ def test_prior_margins_require_unchanged_evidence_and_objective(monkeypatch):
     assert len(calls) == 2
 
 
-def test_prior_hints_allow_new_facts_and_valid_cloned_alternatives():
+def test_prior_hints_allow_new_facts_and_valid_cloned_alternatives() -> None:
+    """Verify prior hints allow new facts and valid cloned alternatives."""
     model = model_fixture()
     first = model.solve(workers=1, margins=False)
     model.facts.haipai.update(first.haipai)
@@ -120,14 +138,19 @@ def test_prior_hints_allow_new_facts_and_valid_cloned_alternatives():
 
 
 def test_prior_haipai_certificates_require_same_model_objective_and_multiset(
-    monkeypatch,
-):
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """Verify prior haipai certificates require same model objective and multiset."""
     model = model_fixture()
     calls = []
 
-    def resolve(*args, **kwargs):
-        if "forbid_haipai" in kwargs:
-            calls.append(kwargs["forbid_haipai"][0])
+    def resolve(
+        *_unused_args: object,
+        options: ResolveOptions,
+        **_unused_kwargs: object,
+    ) -> tuple:
+        if options.forbid_haipai is not None:
+            calls.append(options.forbid_haipai[0])
         return 2.0, None, 3.0
 
     monkeypatch.setattr(model, "_resolve", resolve)
@@ -150,11 +173,8 @@ def test_prior_haipai_certificates_require_same_model_objective_and_multiset(
     assert set(calls) == {"E", "W", "N"}
 
 
-def test_proof_stopping_keeps_equal_cost_alternative_uncertain():
-    from collections import Counter
-
-    from video2tenhou.engine.solver import TILES
-
+def test_proof_stopping_keeps_equal_cost_alternative_uncertain() -> None:
+    """Verify proof stopping keeps equal cost alternative uncertain."""
     model = model_fixture()
     model.draw_ev[0].p[TI["2z"]] = model.draw_ev[0].p[TI["3z"]] = 0.5
     sol = model.solve(workers=1, margins=False)
@@ -169,14 +189,18 @@ def test_proof_stopping_keeps_equal_cost_alternative_uncertain():
             hint,
             sol.objective,
             1,
-            baseline=baseline,
-            watch=key,
-            forbid=(*key, sol.draws[key]),
-            stop_when_certified=stop,
+            options=ResolveOptions(
+                baseline=baseline,
+                watch=key,
+                forbid=(*key, sol.draws[key]),
+                stop_when_certified=stop,
+            ),
         )
         for stop in (False, True)
     ]
     # Early stopping needs a close witness, not the exact runner-up optimum.
-    assert results[1][0] <= results[1][2] <= 0.5
+    witness_gap = results[1][2]
+    assert witness_gap is not None
+    assert results[1][0] <= witness_gap <= 0.5
     assert results[1][1] != sol.draws[key]
     assert results[0][0] == results[0][2] == 0

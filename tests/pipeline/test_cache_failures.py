@@ -1,11 +1,16 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Unreadable storage is an operational failure, not a reason to redo recognition."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from video2tenhou import calibfit, calm, observe, timeline
 from video2tenhou.layout import Calibration
+from video2tenhou.perception import detector
 
 
 @pytest.mark.parametrize(
@@ -13,14 +18,18 @@ from video2tenhou.layout import Calibration
 )
 @pytest.mark.parametrize("error_type", [PermissionError, OSError])
 def test_storage_errors_propagate_without_regenerating_caches(
-    tmp_path, monkeypatch, stage, error_type
-):
+    tmp_path: "Path",
+    monkeypatch: "pytest.MonkeyPatch",
+    stage: str,
+    error_type: "type[OSError]",
+) -> None:
+    """Verify storage errors propagate without regenerating caches."""
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")
     work = tmp_path / "work"
     work.mkdir()
     cal = Calibration.load("pml")
-    hand = dict(hand=0, t_start=0.0, t_end=1.0)
+    hand = {"hand": 0, "t_start": 0.0, "t_end": 1.0}
     paths = {
         "calm": "calm_scores.npz",
         "plate": "plate.meta.json",
@@ -34,17 +43,19 @@ def test_storage_errors_propagate_without_regenerating_caches(
     failure = error_type("storage unavailable")
     read_text, load = Path.read_text, calm.np.load
 
-    def denied_read(path, *args, **kwargs):
+    def denied_read(
+        path: "Path", encoding: str | None = None, errors: str | None = None
+    ) -> str:
         if path == inaccessible:
             raise failure
-        return read_text(path, *args, **kwargs)
+        return read_text(path, encoding=encoding, errors=errors)
 
-    def denied_load(path, *args, **kwargs):
+    def denied_load(path: "Path", *, allow_pickle: bool = False) -> object:
         if path == inaccessible:
             raise failure
-        return load(path, *args, **kwargs)
+        return load(path, allow_pickle=allow_pickle)
 
-    def unexpected(*args, **kwargs):
+    def unexpected(*_unused_args: object, **_unused_kwargs: object) -> None:
         pytest.fail("Storage failure started recognition again")
 
     monkeypatch.setattr(Path, "read_text", denied_read)
@@ -53,10 +64,7 @@ def test_storage_errors_propagate_without_regenerating_caches(
     monkeypatch.setattr(calibfit.videomod, "probe", unexpected)
     monkeypatch.setattr(timeline, "read_pond_counts", unexpected)
     if stage == "timing":
-        from types import SimpleNamespace
-        from video2tenhou.perception import detector
-
-        monkeypatch.setattr(calm, "run_calm", lambda *a, **kw: [])
+        monkeypatch.setattr(calm, "run_calm", lambda *_unused_a, **_unused_kw: [])
         monkeypatch.setattr(detector, "Detector", lambda: SimpleNamespace(id="test"))
     runs = {
         "calm": lambda: calm.run_calm(source, cal, work),

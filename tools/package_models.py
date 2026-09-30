@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepare local weights for a separately reviewed release; never upload them.
 
 Run from the repository with ``uv run python tools/package_models.py``. The
@@ -8,9 +11,15 @@ training data, videos or external base checkpoints.
 import argparse
 import hashlib
 import json
+import logging
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
+
+from video2tenhou.paths import MODEL_DIR
+from video2tenhou.perception.detector_metadata import inference_settings
+from video2tenhou.perception.evidence_policy import resolve_policy
 
 FILES = (
     "detector/weights.pt",
@@ -24,6 +33,9 @@ METADATA = (
     "classifier/provenance.json",
     "classifier/LICENSE",
 )
+
+
+LOGGER = logging.getLogger("tools.package_models")
 
 
 def _members(models: Path) -> dict[str, bytes]:
@@ -43,16 +55,14 @@ def _members(models: Path) -> dict[str, bytes]:
         or meta.get("classes") != {"0": "face"}
         or meta.get("architecture") not in {"yolo9-t", "yolo9-s", "yolo9-m", "yolo9-c"}
     ):
-        raise ValueError(
-            "Release metadata must describe a standard LibreYOLO YOLO9 face detector"
-        )
+        msg = "Release metadata must describe a standard LibreYOLO YOLO9 face detector"
+        raise ValueError(msg)
     actual = hashlib.sha256(members["detector/weights.pt"]).hexdigest()
     if meta.get("weights_sha256") != actual:
-        raise ValueError("Detector metadata does not match its weights SHA-256")
-    from video2tenhou.perception.detector_metadata import inference_settings
+        msg = "Detector metadata does not match its weights SHA-256"
+        raise ValueError(msg)
 
     inference_settings(meta.get("inference", {}))
-    from video2tenhou.perception.evidence_policy import resolve_policy
 
     resolve_policy(meta.get("evidence_policy"))
     required = ("detector/provenance.json", "detector/LICENSE")
@@ -115,7 +125,7 @@ def bundle(models: Path, destination: Path) -> Path:
 
 def main() -> None:
     """Build a local model archive; custom paths permit separate data directories."""
-    from video2tenhou.paths import MODEL_DIR
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models", type=Path, default=MODEL_DIR)
@@ -123,7 +133,7 @@ def main() -> None:
         "--out", type=Path, default=Path("dist/video2tenhou-pml-models.zip")
     )
     args = parser.parse_args()
-    print(bundle(args.models, args.out))
+    LOGGER.info("%s", bundle(args.models, args.out))
 
 
 if __name__ == "__main__":

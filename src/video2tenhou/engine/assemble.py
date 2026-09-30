@@ -1,24 +1,41 @@
-"""Stage 6: decoded hands -> tenhou.net/6 Game objects (one per hanchan) plus the confidence sidecar.
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
 
-Seat index: tenhou seat 0 is the starting East (site seat E), 1 = S, 2 = W, 3 = N.
-The dealer's 14-tile haipai is written as 13 tiles plus a first draw (the
-first discard when it is among the 14, so that discard shows as tsumogiri).
+"""Stage 6: validated decoded hands as Tenhou games and score results.
+
+Stage 6: decoded hands -> tenhou.net/6 Game objects (one per hanchan) plus the
+confidence sidecar.
+
+Seat index: tenhou seat 0 is the starting East (site seat E), 1 = S, 2 = W, 3 = N. The
+dealer's 14-tile haipai is written as 13 tiles plus a first draw (the first discard when
+it is among the 14, so that discard shows as tsumogiri).
 """
 
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
-from .. import tenhou6 as T
-from ..record import Game as SiteGame
-from ..record import HandResult
+from video2tenhou import tenhou6
+
 from . import rules
 from .scoring import score_text
 
+if TYPE_CHECKING:
+    from video2tenhou.record import Game as SiteGame
+    from video2tenhou.record import HandResult
+
+YAKUMAN_HAN = 13
+FIRST_RED_TILE_ID = 51
+DEALER_STARTING_TILES = 14
+
 
 def player_index(seat: str, kyoku: int) -> int:
-    """Tenhou indexes the four players by the wind they held in the hanchan's first hand (player 0 is the
-    site's EAST); our seats are the winds of this hand, so the index shifts with the kyoku.
+    """Map a hand's wind to the player's starting-seat index.
+
+    Tenhou indexes the four players by the wind they held in the hanchan's first hand
+    (player 0 is the site's EAST); our seats are the winds of this hand, so the index
+    shifts with the kyoku.
     """
     return (rules.SEATS.index(seat) + kyoku) % 4
 
@@ -83,7 +100,7 @@ YAKU_JA = {
 
 
 def _yaku_text(yaku: list[str]) -> list[str]:
-    """ "Name (han)" from the scoring library -> tenhou's "名前(n飜)" (a yakuman: "名前(役満)")."""
+    """Format a scoring-library yaku name for Tenhou, including yakuman."""
     out = []
     for y in yaku:
         name, _, han = y.rpartition(" (")
@@ -93,14 +110,19 @@ def _yaku_text(yaku: list[str]) -> list[str]:
         n = han.rstrip(")").strip()
         ja = YAKU_JA.get(name, name)
         out.append(
-            f"{ja}(役満)" if n and int(n) >= 13 else (f"{ja}({n}飜)" if n else ja)
+            f"{ja}(役満)"
+            if n and int(n) >= YAKUMAN_HAN
+            else (f"{ja}({n}飜)" if n else ja)
         )
     return out
 
 
 def tenhou_deltas(result: HandResult) -> list[int]:
-    """The site's deltas in tenhou's order (EAST..NORTH is tenhou's player 0..3) with the riichi deposits taken
-    out: the site charges a declarer's 1000 in the hand's deltas, the viewer charges it at the `r` discard.
+    """Map site deltas to Tenhou order and account for riichi deposits.
+
+    The site's deltas in Tenhou order (EAST..NORTH is Tenhou's player 0..3) with
+    riichi deposits taken out: the site charges a declarer's 1000 in the hand's deltas,
+    the viewer charges it at the `r` discard.
     """
     return [
         result.deltas[n] + (1000 if n in result.riichi else 0)
@@ -109,33 +131,37 @@ def tenhou_deltas(result: HandResult) -> list[int]:
 
 
 def _one_red(ids: list[int], protect: int = -1) -> list[int]:
-    """A kan of fives holds all four fives, so exactly one of its ids is red whatever the camera read; the
-    tile at `protect` (the called or added one) keeps its reading when it can.
+    """Ensure a kan of fives contains exactly one red five.
+
+    A kan of fives holds all four fives, so exactly one of its ids is red whatever the
+    camera read; the tile at `protect` (the called or added one) keeps its reading when
+    it can.
     """
-    kind = T.deaka(ids[0])
+    kind = tenhou6.deaka(ids[0])
     if kind not in (15, 25, 35):
         return ids
     red = {15: 51, 25: 52, 35: 53}[kind]
     keep = (
         protect
-        if 0 <= protect < len(ids) and ids[protect] >= 51
-        else next((i for i, x in enumerate(ids) if x >= 51), None)
+        if 0 <= protect < len(ids) and ids[protect] >= FIRST_RED_TILE_ID
+        else next((i for i, x in enumerate(ids) if x >= FIRST_RED_TILE_ID), None)
     )
     if keep is None:
         keep = next((i for i in range(len(ids)) if i != protect), 0)
-    return [red if i == keep else T.deaka(x) for i, x in enumerate(ids)]
+    return [red if i == keep else tenhou6.deaka(x) for i, x in enumerate(ids)]
 
 
-def call_string(c: dict, caller: str) -> str:
+def call_string(c: dict) -> str:
     """Tenhou call string for a decoded call (dict from Call.to_dict)."""
     known = [t for t in c["tiles"] if t not in ("X", "?")]
     if c["type"] == "ankan":
         base = rules.plain(known[0]) if known else None
         if base is None:
-            raise ValueError("ankan without a known tile")
+            msg = "ankan without a known tile"
+            raise ValueError(msg)
         # a concealed kan of fives is all four fives, the red one among them
-        return T.ankan(T.tile(base), has_aka=base in ("5m", "5p", "5s"))
-    tiles = [T.tile(t) for t in c["tiles"]]
+        return tenhou6.ankan(tenhou6.tile(base), has_aka=base in ("5m", "5p", "5s"))
+    tiles = [tenhou6.tile(t) for t in c["tiles"]]
     pos = c.get("called_pos")
     pos = pos if pos is not None else 0
     typ = c["type"]
@@ -145,34 +171,109 @@ def call_string(c: dict, caller: str) -> str:
         called = tiles[pos]
         rest = [x for i, x in enumerate(tiles) if i != pos]
         if typ == "chi":
-            return T.chi(called, rest[0], rest[1])
+            return tenhou6.chi(called, rest[0], rest[1])
     src = c.get("source") or "kamicha"
     rel = {"kamicha": 0, "toimen": 1, "shimocha": 2}[src]
     if typ == "pon":
-        return T.pon(called, rest[0], rest[1], rel=rel)
+        return tenhou6.pon(called, rest[0], rest[1], rel=rel)
     if typ == "kan":
-        return T.daiminkan(called, rest[0], rest[1], rest[2], rel=rel)
+        return tenhou6.daiminkan(called, rest[0], rest[1], rest[2], rel=rel)
     if typ == "kakan":
-        # the added tile is the last one (for fives, the plain or red one the solver decided)
+        # the added tile is the last one (for fives, the plain or red one the solver
+        # decided)
         tiles = _one_red(tiles, 3)
-        return T.kakan(tiles[3], tiles[0], tiles[1], tiles[2], rel=rel)
+        return tenhou6.kakan(tiles[3], tiles[0], tiles[1], tiles[2], rel=rel)
     raise ValueError(typ)
+
+
+def _call_stream(t: dict, draws: list, discards: list) -> None:
+    """Append a call and any replacement draw in Tenhou event order."""
+    c = t["own_call"]
+    if c["type"] in ("chi", "pon", "kan"):
+        draws.append(call_string(c))
+        if c["type"] == "kan":
+            discards.append(0)
+            if t["draw"] is not None:
+                draws.append(tenhou6.tile(t["draw"]))
+    elif c["type"] in ("ankan", "kakan"):
+        if t["draw"] is not None:
+            draws.append(tenhou6.tile(t["draw"]))
+        discards.append(call_string(c))
+        if t.get("draw2") is not None:
+            draws.append(tenhou6.tile(t["draw2"]))
+
+
+def _turn_streams(
+    turns: list[dict], *, is_dealer: bool, first_tsumogiri: bool
+) -> tuple[list, list]:
+    """Encode calls, replacement draws and discards in seat order."""
+    draws: list = []
+    discards: list = []
+    for t in turns:
+        if t["kind"] in ("call", "kan") and t.get("own_call"):
+            _call_stream(t, draws, discards)
+        elif t["kind"] == "draw" and t["draw"] is not None:
+            draws.append(tenhou6.tile(t["draw"]))
+        dealer_first = (
+            is_dealer and t["j"] == 0 and t["kind"] == "draw"
+        )  # no draw of its own: the 14th tile
+        if t["discard"] is not None:
+            tsumogiri = first_tsumogiri if dealer_first else bool(t["tsumogiri"])
+            discards.append(
+                tenhou6.discard(
+                    tenhou6.tile(t["discard"]),
+                    tsumogiri=tsumogiri,
+                    riichi=bool(t["riichi"]),
+                )
+            )
+    return draws, discards
+
+
+def _hand_result(
+    d: dict, entry: dict, result: HandResult
+) -> tenhou6.Agari | tenhou6.Ryukyoku:
+    """Encode the authoritative payments and accepted score explanation."""
+    deltas = tenhou_deltas(result)
+    if result.outcome in ("ron", "tsumo"):
+        w = player_index(d["result"]["winner"], entry["kyoku"])
+        frm = (
+            player_index(d["result"]["loser"], entry["kyoku"])
+            if result.outcome == "ron"
+            else w
+        )
+        sc = d.get("score") or {}
+        # the site's han/fu, or the reviewer's when they confirmed the site wrong (the
+        # deltas stay the site's)
+        han, fu = (
+            (d["result"]["han"], d["result"]["fu"])
+            if d["result"].get("site_wrong")
+            else (result.han, result.fu)
+        )
+        text = score_text(
+            han or 0,
+            fu or 0,
+            dealer=d["result"]["winner"] == d["dealer"],
+            tsumo=result.outcome == "tsumo",
+        )
+        yaku = _yaku_text(sc.get("yaku") or []) if sc.get("match") else []
+        return tenhou6.Agari([tenhou6.Win(w, frm, deltas, text, yaku)])
+    return tenhou6.Ryukyoku(deltas)
 
 
 def kyoku_from_decode(
     d: dict, entry: dict, result: HandResult
-) -> tuple[T.Kyoku, list[dict]]:
+) -> tuple[tenhou6.Kyoku, list[dict]]:
     """Build the tenhou/6 kyoku. Returns (kyoku, confidence rows)."""
     scores = [0, 0, 0, 0]
     for s in rules.SEATS:
         scores[player_index(s, entry["kyoku"])] = entry["scores"][s]
-    k = T.Kyoku(
+    k = tenhou6.Kyoku(
         entry["kyoku"],
         entry["honba"],
         entry["sticks"],
         scores,
-        dora=[T.tile(t) for t in d["dora"]],
-        ura=[T.tile(t) for t in d.get("ura", [])],
+        dora=[tenhou6.tile(t) for t in d["dora"]],
+        ura=[tenhou6.tile(t) for t in d.get("ura", [])],
     )
     conf: list[dict] = list(d.get("confidence", []))
     dealer = d["dealer"]
@@ -184,8 +285,9 @@ def kyoku_from_decode(
         haipai = list(d["haipai"].get(s, []))
         first_draw: str | None = None
         first_tsumogiri = False
-        if s == dealer and len(haipai) == 14:
-            # the split: the first discard when it is among the 14 (that discard then shows as tsumogiri)
+        if s == dealer and len(haipai) == DEALER_STARTING_TILES:
+            # the split: the first discard when it is among the 14 (that discard then
+            # shows as tsumogiri)
             mine = turns_by_seat[s]
             fd = (
                 mine[0]["discard"]
@@ -208,86 +310,39 @@ def kyoku_from_decode(
                     "note": "dealer split is arbitrary",
                 }
             )
-        k.haipai[i] = sorted(T.tile(t) for t in haipai)
+        k.haipai[i] = sorted(tenhou6.tile(t) for t in haipai)
         draws: list = []
         discards: list = []
         if first_draw is not None:
-            draws.append(T.tile(first_draw))
-        for t in turns_by_seat[s]:
-            if t["kind"] in ("call", "kan") and t.get("own_call"):
-                c = t["own_call"]
-                if c["type"] in ("chi", "pon", "kan"):
-                    draws.append(call_string(c, s))
-                    if c["type"] == "kan":
-                        discards.append(0)
-                        if t["draw"] is not None:
-                            draws.append(T.tile(t["draw"]))
-                elif c["type"] in ("ankan", "kakan"):
-                    if t["draw"] is not None:
-                        draws.append(T.tile(t["draw"]))
-                    discards.append(call_string(c, s))
-                    if t.get("draw2") is not None:
-                        draws.append(T.tile(t["draw2"]))
-            elif t["kind"] in ("draw",) and t["draw"] is not None:
-                draws.append(T.tile(t["draw"]))
-            dealer_first = (
-                s == dealer and t["j"] == 0 and t["kind"] == "draw"
-            )  # no draw of its own: the 14th tile
-            if t["discard"] is not None:
-                tsumogiri = first_tsumogiri if dealer_first else bool(t["tsumogiri"])
-                discards.append(
-                    T.discard(
-                        T.tile(t["discard"]),
-                        tsumogiri=tsumogiri,
-                        riichi=bool(t["riichi"]),
-                    )
-                )
+            draws.append(tenhou6.tile(first_draw))
+        turn_draws, discards = _turn_streams(
+            turns_by_seat[s], is_dealer=s == dealer, first_tsumogiri=first_tsumogiri
+        )
+        draws.extend(turn_draws)
         # the winning tsumo draw
         if result.outcome == "tsumo" and d["result"]["winner"] == s:
             jw = len(turns_by_seat[s])
             wd = d["draws"].get(f"{s}:{jw}")
             if wd:
-                draws.append(T.tile(wd))
+                draws.append(tenhou6.tile(wd))
         k.draws[i] = draws
         k.discards[i] = discards
-    # result
-    deltas = tenhou_deltas(result)
-    if result.outcome in ("ron", "tsumo"):
-        w = player_index(d["result"]["winner"], entry["kyoku"])
-        frm = (
-            player_index(d["result"]["loser"], entry["kyoku"])
-            if result.outcome == "ron"
-            else w
-        )
-        sc = d.get("score") or {}
-        # the site's han/fu, or the reviewer's when they confirmed the site wrong (the deltas stay the site's)
-        han, fu = (
-            (d["result"]["han"], d["result"]["fu"])
-            if d["result"].get("site_wrong")
-            else (result.han, result.fu)
-        )
-        text = score_text(
-            han or 0,
-            fu or 0,
-            dealer=d["result"]["winner"] == dealer,
-            tsumo=result.outcome == "tsumo",
-        )
-        yaku = _yaku_text(sc.get("yaku") or []) if sc.get("match") else []
-        k.result = T.Agari([T.Win(w, frm, deltas, text, yaku)])
-    else:
-        k.result = T.Ryukyoku(deltas)
+    k.result = _hand_result(d, entry, result)
     return k, conf
 
 
 def game_from_decodes(
     decodes: list[dict], entries: list[dict], site: SiteGame, title: str
-) -> tuple[T.Game, dict[int, list[dict]], dict[int, list[str]]]:
-    """The log of one hanchan: a kyoku per decoded hand, except the hands left out (section 6: nothing is written
-    for a conflict) — those with no legal reconstruction, and those the replayer rejects. Returns the game, the
-    confidence rows by hand, and the reasons each left-out hand was left out.
+) -> tuple[tenhou6.Game, dict[int, list[dict]], dict[int, list[str]]]:
+    """Build one hanchan log from the hands accepted for export.
+
+    The log of one hanchan: a kyoku per decoded hand, except the hands left out (section
+    6: nothing is written for a conflict) — those with no legal reconstruction, and
+    those the replayer rejects. Returns the game, the confidence rows by hand, and the
+    reasons each left-out hand was left out.
     """
     names = [site.players.get(n, "") for n in ("EAST", "SOUTH", "WEST", "NORTH")]
-    g = T.Game(names=names, title=[title, f"scoremj game {site.id}"])
+    g = tenhou6.Game(names=names, title=[title, f"scoremj game {site.id}"])
     conf: dict[int, list[dict]] = {}
     left_out: dict[int, list[str]] = {}
     by_hand = {e["hand"]: e for e in entries}
@@ -297,7 +352,7 @@ def game_from_decodes(
             left_out[d["hand"]] = ["no legal reconstruction (a conflict): not written"]
             continue
         k, rows = kyoku_from_decode(d, e, site.hands[e["site_index"]])
-        violations = T.replay_kyoku(k.dump())
+        violations = tenhou6.replay_kyoku(k.dump())
         if violations:
             left_out[d["hand"]] = violations
             continue

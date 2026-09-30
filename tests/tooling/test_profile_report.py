@@ -1,106 +1,113 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Reports distinguish overlapping search time from conversion wall time."""
 
-import importlib.util
 import json
+from typing import TYPE_CHECKING
 
 import pytest
 
-from tests.paths import ROOT
+from tools import report_profile as reporter
 
-spec = importlib.util.spec_from_file_location(
-    "report_profile", ROOT / "tools/report_profile.py"
-)
-reporter = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(reporter)
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
-def test_overlap_status_and_amdahl_accounting(tmp_path):
+def test_overlap_status_and_amdahl_accounting(tmp_path: "Path") -> None:
+    """Verify overlap status and amdahl accounting."""
     events = [
-        dict(event="start", thread=1, name="cli.cmd_convert", stage=None),
-        dict(
-            event="end",
-            thread=1,
-            name="read.run_read",
-            stage="read.run_read",
-            seconds=80,
-        ),
-        dict(
-            event="cp_search",
-            thread=1,
-            hand=2,
-            stage="engine.decode.run_decode",
-            status="OPTIMAL",
-            time_budget=60,
-            seconds=3,
-            elapsed=83,
-        ),
-        dict(
-            event="cp_search",
-            thread=2,
-            hand=2,
-            stage="engine.decode.run_decode",
-            status="FEASIBLE",
-            time_budget=4,
-            seconds=4,
-            elapsed=88,
-        ),
-        dict(
-            event="cp_search",
-            thread=3,
-            hand=2,
-            stage="engine.decode.run_decode",
-            status="UNKNOWN",
-            time_budget=4,
-            seconds=4,
-            elapsed=89,
-        ),
-        dict(
-            event="end",
-            thread=1,
-            hand=2,
-            name="read.dense_reads",
-            stage="engine.decode.run_decode",
-            seconds=2,
-        ),
-        dict(
-            event="end",
-            thread=1,
-            hand=2,
-            name="read.dense_reads",
-            stage="engine.decode.run_decode",
-            seconds=3,
-        ),
-        dict(
-            event="end",
-            thread=1,
-            name="decode.decode_hand",
-            stage="decode.run_decode",
-            hand=2,
-            seconds=10,
-            failed=False,
-        ),
-        dict(
-            event="end",
-            thread=1,
-            name="decode.run_decode",
-            stage="decode.run_decode",
-            seconds=20,
-        ),
-        dict(event="end", thread=1, name="cli.cmd_convert", stage=None, seconds=100),
+        {"event": "start", "thread": 1, "name": "cli.cmd_convert", "stage": None},
+        {
+            "event": "end",
+            "thread": 1,
+            "name": "read.run_read",
+            "stage": "read.run_read",
+            "seconds": 80,
+        },
+        {
+            "event": "cp_search",
+            "thread": 1,
+            "hand": 2,
+            "stage": "engine.decode.run_decode",
+            "status": "OPTIMAL",
+            "time_budget": 60,
+            "seconds": 3,
+            "elapsed": 83,
+        },
+        {
+            "event": "cp_search",
+            "thread": 2,
+            "hand": 2,
+            "stage": "engine.decode.run_decode",
+            "status": "FEASIBLE",
+            "time_budget": 4,
+            "seconds": 4,
+            "elapsed": 88,
+        },
+        {
+            "event": "cp_search",
+            "thread": 3,
+            "hand": 2,
+            "stage": "engine.decode.run_decode",
+            "status": "UNKNOWN",
+            "time_budget": 4,
+            "seconds": 4,
+            "elapsed": 89,
+        },
+        {
+            "event": "end",
+            "thread": 1,
+            "hand": 2,
+            "name": "read.dense_reads",
+            "stage": "engine.decode.run_decode",
+            "seconds": 2,
+        },
+        {
+            "event": "end",
+            "thread": 1,
+            "hand": 2,
+            "name": "read.dense_reads",
+            "stage": "engine.decode.run_decode",
+            "seconds": 3,
+        },
+        {
+            "event": "end",
+            "thread": 1,
+            "name": "decode.decode_hand",
+            "stage": "decode.run_decode",
+            "hand": 2,
+            "seconds": 10,
+            "failed": False,
+        },
+        {
+            "event": "end",
+            "thread": 1,
+            "name": "decode.run_decode",
+            "stage": "decode.run_decode",
+            "seconds": 20,
+        },
+        {
+            "event": "end",
+            "thread": 1,
+            "name": "cli.cmd_convert",
+            "stage": None,
+            "seconds": 100,
+        },
     ]
     (tmp_path / "events.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in events)
     )
     (tmp_path / "summary.json").write_text(
         json.dumps(
-            dict(
-                conversion_wall_seconds=100,
-                conversion_process_cpu_seconds=200,
-                timings=[],
-            )
+            {
+                "conversion_wall_seconds": 100,
+                "conversion_process_cpu_seconds": 200,
+                "timings": [],
+            }
         )
     )
-    (tmp_path / "metadata.json").write_text(json.dumps(dict(logical_cpus=8)))
+    (tmp_path / "metadata.json").write_text(json.dumps({"logical_cpus": 8}))
     result = reporter.summarize(tmp_path, ["read.run_read"], 2)
     assert result["amdahl"]["predicted_total_speedup"] == pytest.approx(1 / 0.6)
     assert result["amdahl"]["infinite_stage_speedup_ceiling"] == pytest.approx(5)
@@ -108,7 +115,8 @@ def test_overlap_status_and_amdahl_accounting(tmp_path):
     alternative = next(
         row for row in result["cp_searches"] if row["role"] == "alternative"
     )
-    assert alternative["seconds"] == 8 and alternative["near_budget"] == 2
+    assert alternative["seconds"] == 8
+    assert alternative["near_budget"] == 2
     assert alternative["active_wall_seconds"] == 5
     assert result["cp_active_wall_seconds_by_role"] == {
         "main_or_diagnostic": 3,
@@ -121,11 +129,13 @@ def test_overlap_status_and_amdahl_accounting(tmp_path):
     assert not result["active_spans"]
 
 
-def test_running_profile_ignores_only_incomplete_last_line(tmp_path):
-    start = dict(event="start", thread=1, name="cli.cmd_convert", stage=None)
+def test_running_profile_ignores_only_incomplete_last_line(tmp_path: "Path") -> None:
+    """Verify running profile ignores only incomplete last line."""
+    start = {"event": "start", "thread": 1, "name": "cli.cmd_convert", "stage": None}
     (tmp_path / "events.jsonl").write_text(json.dumps(start) + "\n" + '{"event":')
     result = reporter.summarize(tmp_path, ["read.run_read"])
-    assert not result["finished"] and result["active_spans"] == [start]
+    assert not result["finished"]
+    assert result["active_spans"] == [start]
     assert "unavailable" in result["amdahl"]
     (tmp_path / "events.jsonl").write_text('{"event":\n')
     with pytest.raises(json.JSONDecodeError):
@@ -133,7 +143,7 @@ def test_running_profile_ignores_only_incomplete_last_line(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "intervals, expected",
+    ("intervals", "expected"),
     [
         ([(4, 8), (1, 5), (7, 10)], 9),  # Overlap chain in unsorted arrival order.
         (
@@ -143,5 +153,8 @@ def test_running_profile_ignores_only_incomplete_last_line(tmp_path):
         ([(0, 2), (2, 3), (7, 9)], 5),  # Touching endpoints plus a genuine idle gap.
     ],
 )
-def test_interval_union_counts_only_occupied_wall_time(intervals, expected):
+def test_interval_union_counts_only_occupied_wall_time(
+    intervals: list[tuple[int, int]], expected: int
+) -> None:
+    """Verify interval union counts only occupied wall time."""
     assert reporter.interval_union_seconds(intervals) == expected

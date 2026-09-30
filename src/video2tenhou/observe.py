@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Stage 4: one voted observation per region per calm interval.
 
 Within a calm interval nothing changes, so the readings of the interval are
@@ -12,27 +15,47 @@ and stays changed splits the interval into two observations.
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .calm import REGIONS, Interval
 from .files import atomic_write_json, sha256_file
 from .perception.evidence_policy import prepare_reading, resolve_policy
+from .read import load_reads
 from .train.data import CLASSES
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from video2tenhou.perception.evidence_policy import EvidencePolicy
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+MIN_CALM_READING_RUN = 2
+MERGEABLE_RUN_COUNT = 2
+
 
 NC = len(CLASSES)
 PERSIST = 0.5
 OBSERVATION_VERSION = 2
 
 
+LOGGER = logging.getLogger("video2tenhou.observe")
+
+
 @dataclass
 class Slot:
     """A stable position's weighted tile vote and evidence disagreement."""
 
-    key: tuple  # pond: (row, col); hand: (index,); meld: (group, index); indicator: ("ind", i)
+    # Keys encode pond (row, col), hand (index,), meld (group, index),
+    # or indicator ("ind", i) positions.
+    key: tuple
     p: np.ndarray  # normalised posterior
     seen: int  # readings in which the slot appeared
     sideways: float  # fraction of readings with the sideways flag
@@ -76,7 +99,8 @@ class Observation:
     quality: float
     slots: list[Slot] = field(default_factory=list)
     indicators: list[Slot] = field(default_factory=list)
-    partial: bool = False  # read-floor interval: what is seen is there, what is absent may be hidden
+    # read-floor interval: what is seen is there, what is absent may be hidden
+    partial: bool = False
     iv_t0: float = 0.0  # the calm interval's bounds
     iv_t1: float = 0.0
     extra: list[list[Slot]] = field(
@@ -128,9 +152,13 @@ def _vote(entries: list[tuple[dict, float]]) -> tuple[np.ndarray, float, bool, t
 
 
 def _prepared(
-    kind: str, readings: list[dict], iv: Interval, *, policy=None
+    kind: str,
+    readings: list[dict],
+    iv: Interval,
+    *,
+    policy: EvidencePolicy | dict | None = None,
 ) -> list[dict]:
-    """Prepare fresh interval readings without removing boxes from reusable raw input."""
+    """Prepare interval readings while preserving all reusable raw boxes."""
     effective = resolve_policy(policy)
     rs = sorted(
         (r for r in readings if iv.t0 - 1e-6 <= r["t"] <= iv.t1 + 1e-6),
@@ -149,12 +177,19 @@ def _count(r: dict) -> int:
 
 
 def observe_interval(
-    region: str, readings: list[dict], iv: Interval, *, policy=None
+    region: str,
+    readings: list[dict],
+    iv: Interval,
+    *,
+    policy: EvidencePolicy | dict | None = None,
 ) -> list[Observation]:
-    """The observations of one calm interval: one, or two when the box count changed once and stayed changed
-    (a discard or a draw made quickly enough to leave the interval calm). Two runs of at least two readings
-    each are two states; a single odd reading is noise and the mode decides (`observe`).
-    Confidence floors follow the supplied policy; raw reading objects remain reusable.
+    """Aggregate one calm interval, splitting a persistent count change.
+
+    The observations of one calm interval: one, or two when the box count changed once
+    and stayed changed (a discard or a draw made quickly enough to leave the interval
+    calm). Two runs of at least two readings each are two states; a single odd reading
+    is noise and the mode decides (`observe`). Confidence floors follow the supplied
+    policy; raw reading objects remain reusable.
     """
     kind = region.partition(":")[0]
     prepared = _prepared(kind, readings, iv, policy=policy)
@@ -165,14 +200,14 @@ def observe_interval(
             runs[-1].append(r)
         else:
             runs.append([r])
-    runs = [run for run in runs if len(run) >= 2]
+    runs = [run for run in runs if len(run) >= MIN_CALM_READING_RUN]
     merged: list[list[dict]] = []
     for run in runs:
         if merged and _count(merged[-1][0]) == _count(run[0]):
             merged[-1] += run
         else:
             merged.append(run)
-    if len(merged) == 2:
+    if len(merged) == MERGEABLE_RUN_COUNT:
         a, b = merged
         first, second = replace(iv, t1=a[-1]["t"]), replace(iv, t0=b[0]["t"])
         return [
@@ -187,42 +222,24 @@ def observe_interval(
 
 
 def observe(
-    region: str, readings: list[dict], iv: Interval, *, policy=None
+    region: str,
+    readings: list[dict],
+    iv: Interval,
+    *,
+    policy: EvidencePolicy | dict | None = None,
 ) -> Observation:
-    """One voted observation of the readings inside `iv`: readings off the mode count are dropped."""
+    """Vote readings inside a calm interval into one observation.
+
+    One voted observation of the readings inside `iv`: readings off the mode count are
+    dropped.
+    """
     return _observe_prepared(
         region, _prepared(region.partition(":")[0], readings, iv, policy=policy), iv
     )
 
 
-def _observe_prepared(region: str, rs: list[dict], iv: Interval) -> Observation:
-    """Vote on already structured evidence; the interval split reuses the work."""
-    kind = region.partition(":")[0]
-    obs = Observation(
-        region,
-        iv.t0,
-        iv.t1,
-        len(rs),
-        0,
-        0,
-        0.0,
-        partial=iv.partial,
-        iv_t0=iv.t0,
-        iv_t1=iv.t1,
-    )
-    if not rs:
-        return obs
-    # a pond reading with a row of more than six positions is impossible (rule of six): the reader rejects
-    # it as a whole and it takes no part in the vote
-    rs = [r for r in rs if not r.get("rejected")]
-    if not rs:
-        return obs
-    counts = [_count(r) for r in rs]
-    mode = Counter(counts).most_common(1)[0][0]
-    used = [r for r, c in zip(rs, counts, strict=False) if c == mode]
-    obs.count, obs.n_used = mode, len(used)
-    # the observation spans what was seen: reads are clipped to the hand window and sampled sparsely
-    obs.t0, obs.t1 = min(r["t"] for r in used), max(r["t"] for r in used)
+def _group_reading_boxes(kind: str, used: list[dict]) -> tuple[dict, dict, dict]:
+    """Group standing tiles, exposed extras and indicators independently."""
     by_key: dict[tuple, list[tuple[dict, float]]] = defaultdict(list)
     ex_key: dict[tuple, list[tuple[dict, float]]] = defaultdict(list)
     ind: dict[int, list[tuple[dict, float]]] = defaultdict(list)
@@ -249,7 +266,42 @@ def _observe_prepared(region: str, rs: list[dict], iv: Interval) -> Observation:
             j += 1
             if key is not None:
                 by_key[key].append((b, b["conf"]))
-    # a tile at rest is seen in every reading of the interval; a slot present in fewer than half
+    return by_key, ex_key, ind
+
+
+def _observe_prepared(region: str, rs: list[dict], iv: Interval) -> Observation:
+    """Vote on already structured evidence; the interval split reuses the work."""
+    kind = region.partition(":")[0]
+    obs = Observation(
+        region,
+        iv.t0,
+        iv.t1,
+        len(rs),
+        0,
+        0,
+        0.0,
+        partial=iv.partial,
+        iv_t0=iv.t0,
+        iv_t1=iv.t1,
+    )
+    if not rs:
+        return obs
+    # a pond reading with a row of more than six positions is impossible (rule of six):
+    # the reader rejects
+    # it as a whole and it takes no part in the vote
+    rs = [r for r in rs if not r.get("rejected")]
+    if not rs:
+        return obs
+    counts = [_count(r) for r in rs]
+    mode = Counter(counts).most_common(1)[0][0]
+    used = [r for r, c in zip(rs, counts, strict=False) if c == mode]
+    obs.count, obs.n_used = mode, len(used)
+    # the observation spans what was seen: reads are clipped to the hand window and
+    # sampled sparsely
+    obs.t0, obs.t1 = min(r["t"] for r in used), max(r["t"] for r in used)
+    by_key, ex_key, ind = _group_reading_boxes(kind, used)
+    # a tile at rest is seen in every reading of the interval; a slot present in fewer
+    # than half
     # of the readings is a flickering false detection
     need = max(1, int(np.ceil(PERSIST * len(used))))
     for key in sorted(by_key):
@@ -265,9 +317,7 @@ def _observe_prepared(region: str, rs: list[dict], iv: Interval) -> Observation:
         if len(ex_key[key]) < need:
             continue
         p, side, dis, xy = _vote(ex_key[key])
-        groups[key[0]].append(
-            Slot(("extra",) + key, p, len(ex_key[key]), side, dis, xy)
-        )
+        groups[key[0]].append(Slot(("extra", *key), p, len(ex_key[key]), side, dis, xy))
     obs.extra = [groups[g] for g in sorted(groups)]
     mean_conf = (
         float(np.mean([b["conf"] for r in used for b in r["boxes"]]))
@@ -285,7 +335,11 @@ def _digest(path: Path) -> str | None:
 
 
 def _observation_inputs(
-    work: Path, hand: dict, ivs: list[Interval], *, policy=None
+    work: Path,
+    hand: dict,
+    ivs: list[Interval],
+    *,
+    policy: EvidencePolicy | dict | None = None,
 ) -> dict:
     hdir = work / "reads" / f"{hand['hand']:02d}"
     intervals = [
@@ -296,19 +350,19 @@ def _observation_inputs(
         and iv.t1 >= hand["t_start"]
         and iv.t0 <= hand["t_end"]
     ]
-    return dict(
-        version=OBSERVATION_VERSION,
-        window=[hand["t_start"], hand["t_end"]],
-        manifest=_digest(hdir / "done.json"),
-        readings={
+    return {
+        "version": OBSERVATION_VERSION,
+        "window": [hand["t_start"], hand["t_end"]],
+        "manifest": _digest(hdir / "done.json"),
+        "readings": {
             region: _digest(hdir / f"{region.replace(':', '_')}.jsonl")
             for region in REGIONS
         },
-        intervals=intervals,
-        classes=list(CLASSES),
-        evidence_policy=resolve_policy(policy).fingerprint_for("sparse"),
-        persist=PERSIST,
-    )
+        "intervals": intervals,
+        "classes": list(CLASSES),
+        "evidence_policy": resolve_policy(policy).fingerprint_for("sparse"),
+        "persist": PERSIST,
+    }
 
 
 def _observation_current(work: Path, hand: dict, inputs: dict) -> bool:
@@ -331,7 +385,11 @@ def _observation_current(work: Path, hand: dict, inputs: dict) -> bool:
 
 
 def validate_observation_cache(
-    work: Path, hands: list[dict], ivs: list[Interval] | None = None, *, policy=None
+    work: Path,
+    hands: list[dict],
+    ivs: list[Interval] | None = None,
+    *,
+    policy: EvidencePolicy | dict | None = None,
 ) -> None:
     """Require voted evidence derived from the current reads and calm intervals.
 
@@ -357,9 +415,11 @@ def validate_observation_cache(
             UnicodeError,
             TypeError,
         ) as error:
-            raise ValueError(
-                "Saved observations cannot be verified. Choose Analyze recording to refresh evidence before rebuilding logs."
-            ) from error
+            msg = (
+                "Saved observations cannot be verified. Choose Analyze recording to"
+                " refresh evidence before rebuilding logs."
+            )
+            raise ValueError(msg) from error
     stale = [
         str(hand["hand"])
         for hand in hands
@@ -368,10 +428,20 @@ def validate_observation_cache(
         )
     ]
     if stale:
-        raise ValueError(
+        msg = (
             f"Saved observations are stale for hand(s) {', '.join(stale)}. "
             "Choose Analyze recording to refresh evidence before rebuilding logs."
         )
+        raise ValueError(msg)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ObservationOptions:
+    """Refresh selection and sparse evidence policy for observation publication."""
+
+    force: bool = False
+    touched: set[int] | None = None
+    policy: EvidencePolicy | dict | None = None
 
 
 def run_observe(
@@ -379,10 +449,8 @@ def run_observe(
     hands: list[dict],
     ivs: list[Interval],
     *,
-    force: bool = False,
-    touched: set | None = None,
-    policy=None,
-    log=print,
+    log: Callable[[str], None] = LOGGER.info,
+    options: ObservationOptions | None = None,
 ) -> dict:
     """Vote current readings, atomically publishing observations and their provenance.
 
@@ -394,8 +462,8 @@ def run_observe(
     Returned ``changed_hands`` identifies results whose downstream decode must
     be refreshed, including changes recovered from an earlier interrupted run.
     """
-    from .read import load_reads
-
+    options = options or ObservationOptions()
+    force, touched, policy = (options.force, options.touched, options.policy)
     policy = resolve_policy(policy)
     stats = defaultdict(int)
     changed = []
@@ -424,15 +492,18 @@ def run_observe(
                     or iv.t0 > h["t_end"]
                 ):
                     continue
-                for o in observe_interval(region, reads[region], iv, policy=policy):
-                    if o.n_readings:
-                        obs_list.append(o.to_dict())
+                obs_list.extend(
+                    observation.to_dict()
+                    for observation in observe_interval(
+                        region, reads[region], iv, policy=policy
+                    )
+                    if observation.n_readings
+                )
             result[region] = obs_list
             stats["observations"] += len(obs_list)
         if inputs != _observation_inputs(work, h, ivs, policy=policy):
-            raise ValueError(
-                "Reading inputs changed while building observations; retry analysis."
-            )
+            msg = "Reading inputs changed while building observations; retry analysis."
+            raise ValueError(msg)
         atomic_write_json(out, result)
         atomic_write_json(
             odir / "provenance" / f"{h['hand']:02d}.json",
@@ -441,11 +512,12 @@ def run_observe(
         changed.append(h["hand"])
         stats["hands"] += 1
         log(
-            f"  observe hand {h['hand']:2d}: {sum(len(v) for v in result.values())} observations"
+            f"  observe hand {h['hand']:2d}: "
+            f"{sum(len(v) for v in result.values())} observations"
         )
     return {**stats, "changed_hands": changed}
 
 
 def load_obs(work: Path, hand: int) -> dict[str, list[dict]]:
     """Load one hand's voted evidence; a missing cache is an explicit error."""
-    return json.load(open(work / "obs" / f"{hand:02d}.json", encoding="utf-8"))
+    return json.loads((work / "obs" / f"{hand:02d}.json").read_text(encoding="utf-8"))

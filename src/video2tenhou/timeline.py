@@ -1,32 +1,59 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Locate hands from table clearings; take identities and scores from scoremj."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import itertools
 import json
+import logging
 from collections import defaultdict
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from . import calm, video
 from .cache import source_identity
+from .engine.ponds import clearings
 from .files import atomic_write_json
 from .layout import CORNERS, Calibration
-from .record import SEATS, SEAT_LETTER, Game
+from .perception import detector as detector_backend
+from .perception.reader import Box, assign_pond
+from .record import SEAT_LETTER, SEATS, Game
+from .train.data import CLASSES
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from video2tenhou.perception.reader import RegionDetector
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+POND_DETECTION_CONFIDENCE = 0.4
+MIN_HAND_WINDOW = 30
+
 
 # PML's first dealer is top left; physical chairs stay fixed within a game.
 STARTING_SEATS = {"TL": "EAST", "BL": "SOUTH", "BR": "WEST", "TR": "NORTH"}
 FPS = 2.0
 
 
+LOGGER = logging.getLogger("video2tenhou.timeline")
+
+
 def read_pond_counts(
-    path, cal, intervals, detector, log=print
+    path: str | Path,
+    cal: Calibration,
+    intervals: list[calm.Interval],
+    detector: RegionDetector,
+    log: Callable[[str], None] = LOGGER.info,
 ) -> dict[str, list[dict]]:
     """Count discards on calm pond frames without classifying broadcast text."""
-    from .perception.reader import Box, assign_pond
-    from .train.data import CLASSES
-
     requests = defaultdict(list)
     for iv in intervals:
         if iv.region.startswith("pond:") and iv.calm and not iv.partial:
@@ -50,11 +77,11 @@ def read_pond_counts(
                 Box(
                     d.xyxy,
                     d.conf,
-                    d.xyxy[2] - d.xyxy[0] > 1.15 * (d.xyxy[3] - d.xyxy[1]),
-                    np.zeros(len(CLASSES)),
+                    sideways=d.xyxy[2] - d.xyxy[0] > 1.15 * (d.xyxy[3] - d.xyxy[1]),
+                    p=np.zeros(len(CLASSES)),
                 )
                 for d in detections
-                if d.conf >= 0.4 and not d.back
+                if d.conf >= POND_DETECTION_CONFIDENCE and not d.back
             ]
             rejected = assign_pond(boxes, image.shape[0], image.shape[1])
             out[iv.region.partition(":")[2]].append(
@@ -76,12 +103,10 @@ def hand_windows(
     observations: dict[str, list[dict]], duration: float
 ) -> list[tuple[float, float]]:
     """Split at corroborated pond clearings, excluding empty lead-in/out spans."""
-    from .engine.ponds import clearings
-
     cuts = clearings(observations, 0, duration)
     bounds = [0.0, *[t for t in cuts if 0 < t < duration], duration]
     windows = []
-    for index, (start, end) in enumerate(zip(bounds, bounds[1:], strict=False)):
+    for index, (start, end) in enumerate(itertools.pairwise(bounds)):
         active = [
             row
             for rows in observations.values()
@@ -105,7 +130,7 @@ def hand_windows(
                     break
             if not growing:
                 continue
-        if end - start >= 30 and active:
+        if end - start >= MIN_HAND_WINDOW and active:
             windows.append((start + (1 / FPS if index else 0), end))
     return windows
 
@@ -117,8 +142,11 @@ def site_entries(
     expected = sum(len(game.hands) for game in games)
     if len(windows) != expected:
         return [], [
-            f"Table clearings identify {len(windows)} hands, but scoremj lists {expected}. "
-            "Check the pond calibration, recording range and game IDs before retrying."
+            (
+                f"Table clearings identify {len(windows)} hands, but scoremj "
+                f"lists {expected}. Check the pond calibration, recording range"
+                " and game IDs before retrying."
+            )
         ]
     entries = []
     for gi, game in enumerate(games):
@@ -159,14 +187,11 @@ def run_header(
     work: Path,
     *,
     force: bool = False,
-    log=print,
-):
+) -> tuple[list[dict], list[str]]:
     """Cache table evidence, then align physical hand order to scoremj records."""
-    from .perception.detector import Detector
-
     work.mkdir(parents=True, exist_ok=True)
-    intervals = calm.run_calm(path, cal, work, force=force, log=log)
-    detector = Detector()
+    intervals = calm.run_calm(path, cal, work, force=force, log=LOGGER.info)
+    detector = detector_backend.Detector()
     signature = {
         "version": 1,
         "source": source_identity(path, refresh=True),
@@ -178,12 +203,10 @@ def run_header(
         "fps": FPS,
     }
     cache_path = work / "table-timing.json"
-    saved = None
+    saved: dict | None = None
     if not force:
-        try:
+        with contextlib.suppress(FileNotFoundError, json.JSONDecodeError):
             saved = json.loads(cache_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
     valid_cache = (
         isinstance(saved, dict)
         and saved.get("signature") == signature
@@ -194,7 +217,7 @@ def run_header(
         ).hexdigest()
     )
     if not valid_cache:
-        observations = read_pond_counts(path, cal, intervals, detector, log=log)
+        observations = read_pond_counts(path, cal, intervals, detector, log=LOGGER.info)
         saved = {
             "signature": signature,
             "observations": observations,
@@ -203,6 +226,9 @@ def run_header(
             ).hexdigest(),
         }
         atomic_write_json(cache_path, saved)
+    if saved is None:
+        msg = "Table timing did not produce an observation cache"
+        raise RuntimeError(msg)
     windows = hand_windows(saved["observations"], video.probe(str(path)).duration)
     entries, problems = site_entries(windows, games)
     if not problems:

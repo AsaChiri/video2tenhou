@@ -1,9 +1,18 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """The rules of section 1 of docs/DESIGN.md as checkable functions and constants."""
 
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+MELD_SIZE = 3
+
 
 SEATS = "ESWN"
 KINDS = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + [
@@ -23,13 +32,17 @@ def suit(tile: str) -> str:
 
 
 def number(tile: str) -> int:
-    """Return rank 1–9 (honors 1–7), treating a red zero as rank five."""
+    """Return rank 1-9 (honors 1-7), treating a red zero as rank five."""
     n = int(tile[0])
     return 5 if n == 0 else n
 
 
 def max_count(tile: str) -> int:
-    """How many copies of exactly this token exist: red fives once, plain fives three, others four."""
+    """Return the inventory limit of a tile, distinguishing red fives.
+
+    How many copies of exactly this token exist: red fives once, plain fives three,
+    others four.
+    """
     if tile in REDS:
         return 1
     if tile in ("5m", "5p", "5s"):
@@ -56,7 +69,7 @@ def relative(me: str, other: str) -> str:
 
 def is_chi(tiles: list[str]) -> bool:
     """Check a three-tile sequence, accepting red fives and excluding honors."""
-    if len(tiles) != 3:
+    if len(tiles) != MELD_SIZE:
         return False
     s = {suit(t) for t in tiles}
     if len(s) != 1 or "z" in s:
@@ -67,11 +80,15 @@ def is_chi(tiles: list[str]) -> bool:
 
 def is_pon(tiles: list[str]) -> bool:
     """Check three matching ranks; physical copy limits are checked separately."""
-    return len(tiles) == 3 and len({plain(t) for t in tiles}) == 1
+    return len(tiles) == MELD_SIZE and len({plain(t) for t in tiles}) == 1
 
 
 def kan_tiles(kind: str) -> list[str]:
-    """The four tiles of any kan of `kind`: a kan of fives is all four fives, three plain and the red one."""
+    """Return all four tiles of a kan, preserving its single red five.
+
+    The four tiles of any kan of `kind`: a kan of fives is all four fives, three plain
+    and the red one.
+    """
     k = plain(kind)
     red = next((r for r, p in REDS.items() if p == k), None)
     return [k] * 3 + [red] if red else [k] * 4

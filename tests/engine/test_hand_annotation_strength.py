@@ -1,10 +1,13 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Uncertain hand annotations guide evidence without becoming human constraints."""
 
 from collections import Counter
-from types import SimpleNamespace
 
 import pytest
 
+from tests.engine.factories import hand_decoder
 from video2tenhou.engine import rules
 from video2tenhou.engine.decode import HandDecoder
 from video2tenhou.engine.review import facts_for_hand
@@ -19,7 +22,8 @@ ENTRY = {
 HAND = ["1m", "2m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "1z", "1z", "3z", "6z"]
 
 
-def annotation(kind, **fields):
+def annotation(kind: "str", **fields: "object") -> "dict":
+    """Create a hand-scoped annotation with explicitly supplied evidence fields."""
     return {
         "game": 0,
         "kyoku": 0,
@@ -33,30 +37,35 @@ def annotation(kind, **fields):
 
 @pytest.mark.parametrize("kind", ["haipai", "final_hand"])
 @pytest.mark.parametrize("source", ["legacy-import", "camera-import"])
-def test_sourced_hand_requires_explicit_strength(kind, source):
+def test_sourced_hand_requires_explicit_strength(kind: str, source: str) -> None:
+    """Verify sourced hand requires explicit strength."""
     with pytest.raises(ValueError, match="must explicitly set soft"):
         facts_for_hand([annotation(kind, source=source)], ENTRY)
 
 
 @pytest.mark.parametrize("soft", ["false", "true", 0, 1, None])
-def test_strength_rejects_non_boolean_values(soft):
+def test_strength_rejects_non_boolean_values(soft: int | str | None) -> None:
+    """Verify strength rejects non boolean values."""
     with pytest.raises(ValueError, match="soft must be a boolean"):
         facts_for_hand([annotation("final_hand", soft=soft)], ENTRY)
 
 
 @pytest.mark.parametrize("kind", ["haipai", "final_hand"])
 @pytest.mark.parametrize(
-    "fields,soft",
+    ("fields", "soft"),
     [
         ({}, False),
         ({"source": "reviewed-import", "soft": False}, False),
         ({"source": "camera-import", "soft": True}, True),
     ],
 )
-def test_explicit_hand_strength_controls_constraint_and_evidence(kind, fields, soft):
+def test_explicit_hand_strength_controls_constraint_and_evidence(
+    *, kind: str, fields: "dict", soft: bool
+) -> None:
+    """Verify explicit hand strength controls constraint and evidence."""
     facts = facts_for_hand([annotation(kind, **fields)], ENTRY)
     model = HandModel("E", {seat: [] for seat in rules.SEATS}, [])
-    decoder = SimpleNamespace(
+    decoder = hand_decoder(
         facts=facts, live_calls=[], tsumo_winner=None, t0=10, t1=20, problems=[]
     )
     HandDecoder._apply_hand_facts(decoder, model)
@@ -65,7 +74,8 @@ def test_explicit_hand_strength_controls_constraint_and_evidence(kind, fields, s
     if soft:
         assert "S" not in constraints
         (evidence,) = model.hand_ev
-        assert evidence.seat == "S" and evidence.j == -1
+        assert evidence.seat == "S"
+        assert evidence.j == -1
         assert evidence.t0 == evidence.t1 == (10 if kind == "haipai" else 20)
         assert evidence.e.tolist() == [HAND.count(tile) for tile in TILES]
     else:
@@ -73,10 +83,11 @@ def test_explicit_hand_strength_controls_constraint_and_evidence(kind, fields, s
         assert model.hand_ev == []
 
 
-def test_soft_winning_hand_without_winning_tile_targets_pre_draw_state():
+def test_soft_winning_hand_without_winning_tile_targets_pre_draw_state() -> None:
+    """Verify soft winning hand without winning tile targets pre draw state."""
     facts = facts_for_hand([annotation("final_hand", soft=True)], ENTRY)
     model = HandModel("E", {seat: [] for seat in rules.SEATS}, [], tsumo_winner="S")
-    decoder = SimpleNamespace(
+    decoder = hand_decoder(
         facts=facts, live_calls=[], tsumo_winner="S", t0=10, t1=20, problems=[]
     )
     HandDecoder._apply_hand_facts(decoder, model)
@@ -85,7 +96,8 @@ def test_soft_winning_hand_without_winning_tile_targets_pre_draw_state():
 
 
 @pytest.mark.parametrize("kind", ["haipai", "final_hand"])
-def test_incorrect_soft_hand_cannot_override_confirmed_tiles(kind):
+def test_incorrect_soft_hand_cannot_override_confirmed_tiles(kind: str) -> None:
+    """Verify incorrect soft hand cannot override confirmed tiles."""
     fact = annotation(kind, soft=True)
     fact["tiles"] = [
         "1m"
@@ -93,7 +105,7 @@ def test_incorrect_soft_hand_cannot_override_confirmed_tiles(kind):
     facts = facts_for_hand([fact], ENTRY)
     model = HandModel("E", {seat: [] for seat in rules.SEATS}, [])
     model.facts.haipai["S"] = HAND
-    decoder = SimpleNamespace(
+    decoder = hand_decoder(
         facts=facts, live_calls=[], tsumo_winner=None, t0=10, t1=20, problems=[]
     )
     HandDecoder._apply_hand_facts(decoder, model)

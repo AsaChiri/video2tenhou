@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Combine a built source release and authenticated model bundle for local startup.
 
 Inputs are read without extraction. No environment, model or source file is
@@ -7,8 +10,10 @@ modified, and no dependencies are imported beyond the Python standard library.
 import argparse
 import hashlib
 import json
+import logging
 import re
 import stat
+import sys
 import tarfile
 import tempfile
 import tomllib
@@ -41,10 +46,15 @@ SOURCE_REQUIRED = {
 }
 
 
+LOGGER = logging.getLogger("tools.package_starter")
+FIRST_PRINTABLE_CHARACTER = 32
+
+
 def _path(name: str) -> str:
     # Reject Windows aliases too: the ZIP is intended for both supported OSes.
     if not name or "\\" in name or name.startswith("/") or ":" in name:
-        raise ValueError(f"Unsafe archive path: {name!r}")
+        msg = f"Unsafe archive path: {name!r}"
+        raise ValueError(msg)
     value = name.removesuffix("/")
     parts = value.split("/")
     reserved = re.compile(
@@ -54,18 +64,20 @@ def _path(name: str) -> str:
         part in ("", ".", "..")
         or part.endswith((".", " "))
         or reserved.fullmatch(part)
-        or any(ord(char) < 32 for char in part)
+        or any(ord(char) < FIRST_PRINTABLE_CHARACTER for char in part)
         for part in parts
     ):
-        raise ValueError(f"Unsafe archive path: {name!r}")
+        msg = f"Unsafe archive path: {name!r}"
+        raise ValueError(msg)
     return value
 
 
-def _register(seen: dict[str, bool], name: str, directory: bool) -> str:
+def _register(seen: dict[str, bool], name: str, *, directory: bool) -> str:
     value = _path(name)
     key = value.casefold()
     if key in seen:
-        raise ValueError(f"Duplicate or colliding archive entry: {name}")
+        msg = f"Duplicate or colliding archive entry: {name}"
+        raise ValueError(msg)
     parents = [
         str(parent).casefold()
         for parent in PurePosixPath(value).parents
@@ -74,7 +86,8 @@ def _register(seen: dict[str, bool], name: str, directory: bool) -> str:
     if any(parent in seen and not seen[parent] for parent in parents) or (
         not directory and any(old.startswith(key + "/") for old in seen)
     ):
-        raise ValueError(f"File/directory collision: {name}")
+        msg = f"File/directory collision: {name}"
+        raise ValueError(msg)
     seen[key] = directory
     return value
 
@@ -85,22 +98,33 @@ def _source(path: Path) -> tuple[str, dict[str, bytes]]:
     with tarfile.open(path, "r:*") as archive:
         for info in archive:
             if not (info.isfile() or info.isdir()):
-                raise ValueError(f"Unsupported source archive entry: {info.name}")
-            name = _register(seen, info.name, info.isdir())
+                msg = f"Unsupported source archive entry: {info.name}"
+                raise ValueError(msg)
+            name = _register(seen, info.name, directory=info.isdir())
             roots.add(name.split("/")[0])
             if info.isfile():
-                with archive.extractfile(info) as stream:
+                stream = archive.extractfile(info)
+                if stream is None:
+                    msg = f"Source archive file has no content: {info.name}"
+                    raise ValueError(msg)
+                with stream:
                     entries[name] = stream.read()
     if len(roots) != 1:
-        raise ValueError("Source archive must contain exactly one package root")
+        msg = "Source archive must contain exactly one package root"
+        raise ValueError(msg)
     prefix = roots.pop() + "/"
     if any(not name.startswith(prefix) for name in entries):
-        raise ValueError("Source files must be below the package root")
+        msg = "Source files must be below the package root"
+        raise ValueError(msg)
     entries = {name[len(prefix) :]: data for name, data in entries.items()}
+    return _source_version(entries), entries
+
+
+def _source_version(entries: dict[str, bytes]) -> str:
+    """Validate launchers, built UI assets and project identity before bundling."""
     if not entries.keys() >= SOURCE_REQUIRED:
-        raise ValueError(
-            "Source release is missing required launchers or project files"
-        )
+        msg = "Source release is missing required launchers or project files"
+        raise ValueError(msg)
     for suffix in (".js", ".css"):
         if not any(
             name.startswith("src/video2tenhou/tool/static/assets/")
@@ -113,17 +137,17 @@ def _source(path: Path) -> tuple[str, dict[str, bytes]]:
         "project", {}
     )
     if not isinstance(project, dict):
-        raise ValueError("Source release has no project metadata table")
+        msg = "Source release has no project metadata table"
+        raise TypeError(msg)
     version = project.get("version", "")
     if (
         project.get("name") != "video2tenhou"
         or not isinstance(version, str)
         or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", version)
     ):
-        raise ValueError(
-            "Source release must identify video2tenhou and a safe static version"
-        )
-    return version, entries
+        msg = "Source release must identify video2tenhou and a safe static version"
+        raise ValueError(msg)
+    return version
 
 
 def _models(path: Path) -> dict[str, bytes]:
@@ -132,31 +156,41 @@ def _models(path: Path) -> dict[str, bytes]:
         for info in archive.infolist():
             mode = info.external_attr >> 16
             if stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR):
-                raise ValueError(f"Unsupported model archive entry: {info.filename}")
-            name = _register(seen, info.filename, info.is_dir())
+                msg = f"Unsupported model archive entry: {info.filename}"
+                raise ValueError(msg)
+            name = _register(seen, info.filename, directory=info.is_dir())
             if info.is_dir():
                 if not any(allowed.startswith(name + "/") for allowed in MODEL_ALLOWED):
-                    raise ValueError(f"Unexpected model directory: {name}")
+                    msg = f"Unexpected model directory: {name}"
+                    raise ValueError(msg)
             else:
                 if name not in MODEL_ALLOWED | {"models/manifest.json"}:
-                    raise ValueError(f"Unexpected model file: {name}")
+                    msg = f"Unexpected model file: {name}"
+                    raise ValueError(msg)
                 entries[name] = archive.read(info)
+    _verify_model_inventory(entries)
+    return entries
+
+
+def _verify_model_inventory(entries: dict[str, bytes]) -> None:
+    """Require a complete model manifest and authenticate every bundled file."""
     if not MODEL_REQUIRED | {"models/manifest.json"} <= entries.keys():
-        raise ValueError(
-            "Model archive is missing required weights, metadata or provenance"
-        )
+        msg = "Model archive is missing required weights, metadata or provenance"
+        raise ValueError(msg)
     manifest = json.loads(entries["models/manifest.json"])
     if (
         not isinstance(manifest, dict)
         or type(manifest.get("format")) is not int
         or manifest["format"] != 1
     ):
-        raise ValueError("Unsupported model manifest")
+        msg = "Unsupported model manifest"
+        raise ValueError(msg)
     inventory = manifest.get("files")
     if not isinstance(inventory, dict) or set(inventory) != entries.keys() - {
         "models/manifest.json"
     }:
-        raise ValueError("Model manifest inventory differs from archive files")
+        msg = "Model manifest inventory differs from archive files"
+        raise ValueError(msg)
     for name, expected in inventory.items():
         data = entries[name]
         if (
@@ -165,8 +199,8 @@ def _models(path: Path) -> dict[str, bytes]:
             or expected["bytes"] != len(data)
             or expected.get("sha256") != hashlib.sha256(data).hexdigest()
         ):
-            raise ValueError(f"Model checksum/size mismatch: {name}")
-    return entries
+            msg = f"Model checksum/size mismatch: {name}"
+            raise ValueError(msg)
 
 
 def bundle(source: Path, models: Path, destination: Path) -> Path:
@@ -183,12 +217,13 @@ def bundle(source: Path, models: Path, destination: Path) -> Path:
         destination.resolve() in inputs
         or destination.with_suffix(".sha256").resolve() in inputs
     ):
-        raise ValueError("Starter output must not overwrite an input archive")
+        msg = "Starter output must not overwrite an input archive"
+        raise ValueError(msg)
     version, entries = _source(source)
     models_data = _models(models)
     seen = {}
     for name in (*entries, *models_data):
-        _register(seen, name, False)
+        _register(seen, name, directory=False)
     entries.update(models_data)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -218,13 +253,14 @@ def bundle(source: Path, models: Path, destination: Path) -> Path:
 
 
 def main() -> None:
-    """Build a starter from explicit source/model releases without touching a runtime."""
+    """Build a starter from source/model releases without changing a runtime."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--models", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    print(bundle(args.source, args.models, args.out))
+    LOGGER.info("%s", bundle(args.source, args.models, args.out))
 
 
 if __name__ == "__main__":

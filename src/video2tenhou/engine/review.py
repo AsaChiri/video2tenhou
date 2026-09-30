@@ -1,47 +1,52 @@
-"""Review items and confidence rows (DESIGN.md 4.8 `review.py`), and the human facts that answer them.
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
 
-An item is a question for the tool about one decision the program could not settle and whose answer settles
-the most: its kind, the seat and time, the best guess, the candidates with their costs, and where to look
-(evidence: region and time). A confidence row records every decision of the log
-with its margin (and a draw's runner-up), whether a human fixed it and whether
-nothing covered it (`lost`). A tile nothing covered is a question until the reviewer supplies it or says Can't
-tell (DESIGN.md section 6). Covered choices with close competing alternatives are
-grouped for review. Unfinished searches are unresolvable and do not ask for retries. Facts are
-the tool's answers; the next decode applies them as constraints.
+"""Review questions, confidence rows and human reconstruction constraints.
+
+Review items and confidence rows (DESIGN.md 4.8 `review.py`), and the human facts that
+answer them.
+
+An item is a question for the tool about one decision the program could not settle and
+whose answer settles the most: its kind, the seat and time, the best guess, the
+candidates with their costs, and where to look (evidence: region and time). A confidence
+row records every decision of the log with its margin (and a draw's runner-up), whether
+a human fixed it and whether nothing covered it (`lost`). A tile nothing covered is a
+question until the reviewer supplies it or says Can't tell (DESIGN.md section 6).
+Covered choices with close competing alternatives are grouped for review. Unfinished
+searches are unresolvable and do not ask for retries. Facts are the tool's answers; the
+next decode applies them as constraints.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+from .confidence import confidence_state, low_margin
 from .hand import corner_of
-from .melds import Call
-from .solver import HandModel, Solution
-from .turns import Turn
 
-MARGIN_REVIEW = 0.5
+if TYPE_CHECKING:
+    from pathlib import Path
 
+    from .melds import Call
+    from .solver import HandModel, Solution
+    from .turns import Turn
 
-def low_margin(margin: float | None) -> bool:
-    """Whether a measured choice remains uncertain, including the review boundary.
-
-    Objectives use fixed-point costs but are subtracted as floats. The tiny
-    tolerance prevents a mathematical margin of 0.5 rounding just above it.
-    Missing margins are not measured decisions (for example call turns).
-    """
-    return margin is not None and margin <= MARGIN_REVIEW + 1e-9
+DISCARD_FACT_WINDOW = 3
 
 
-def confidence_state(margin: float | None, alternative_gap: float | None) -> str:
-    """Separate a proof, a competing witness, and an unfinished calculation."""
-    if margin is None:
-        return "unmeasured"
-    if margin > MARGIN_REVIEW + 1e-9:
-        return "resolved"
-    if low_margin(alternative_gap):
-        return "ambiguous"
-    return "unresolvable"
+@dataclass(frozen=True, kw_only=True)
+class ReviewContext:
+    """Evidence and human decisions accompanying solver confidence rows."""
+
+    turns: list[Turn]
+    calls: list[Call]
+    inds: list[dict]
+    entry: dict
+    facts: dict
+    lost_keys: set
+    t0: float
 
 
 def draws_to_reread(
@@ -49,12 +54,12 @@ def draws_to_reread(
 ) -> list[tuple[str, int]]:
     """Select draws with a close competing candidate for video acquisition.
 
-    A distant feasible alternative or a search without a candidate does not
-    by itself justify re-reading the video. Proof bounds certify choices; close witnesses establish review
-    questions. An open-kan replacement
-    without direct draw evidence also needs a view around the kan: a certificate
-    inferred from earlier hand states cannot compensate for that acquisition gap.
-    Self-kans have two draws and require separate evidence mapping.
+    A distant feasible alternative or a search without a candidate does not by itself
+    justify re-reading the video. Proof bounds certify choices; close witnesses
+    establish review questions. An open-kan replacement without direct draw evidence
+    also needs a view around the kan: a certificate inferred from earlier hand states
+    cannot compensate for that acquisition gap. Self-kans have two draws and require
+    separate evidence mapping.
     """
     selected = [
         key
@@ -80,25 +85,29 @@ def draws_to_reread(
     return selected
 
 
-# ---------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # facts (labels/<video>/facts.jsonl) -> constraints for one hand
-# ---------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
 def load_facts(labels_dir: Path) -> list[dict]:
-    """Read the append-only review journal; a new video's missing journal means no facts."""
+    """Read review facts; a new video's missing journal means no facts."""
     p = labels_dir / "facts.jsonl"
     if not p.exists():
         return []
-    return [json.loads(line) for line in open(p, encoding="utf-8") if line.strip()]
+    with p.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
 
 
 def facts_for_hand(all_facts: list[dict], entry: dict) -> dict:
-    """Normalize this hand's annotations, keeping soft evidence distinct from confirmed facts.
+    """Separate confirmed constraints from soft hand evidence.
 
-    Hand annotations may explicitly set boolean ``soft``. Unsourced review
-    answers default to confirmed; imported annotations carrying a ``source``
-    must declare their strength instead of deriving trust from its name.
+    Normalize this hand's annotations, keeping soft evidence distinct from confirmed
+    facts.
+
+    Hand annotations may explicitly set boolean ``soft``. Unsourced review answers
+    default to confirmed; imported annotations carrying a ``source`` must declare their
+    strength instead of deriving trust from its name.
     """
     out: dict = {
         "haipai": [],
@@ -124,102 +133,130 @@ def facts_for_hand(all_facts: list[dict], entry: dict) -> dict:
             or f.get("honba") != entry["honba"]
         ):
             continue
-        # the corner is the identity: a fact keeps its meaning whatever the seat letters were when it was saved
+        # the corner is the identity: a fact keeps its meaning whatever the seat letters
+        # were when it was saved
         seat = entry["corner_wind"].get(f.get("corner") or "", None)
         kind = f.get("kind")
-        if (
-            kind in ("haipai", "final_hand")
-            and seat
-            and f.get("tiles")
-            and "?" not in f["tiles"]
+        if kind in ("haipai", "final_hand"):
+            _apply_concealed_fact(out, f, seat)
+        elif kind in (
+            "draw",
+            "discard",
+            "meld",
+            "meld_remove",
+            "missing_discard",
+            "riichi_turn",
+            "kan_time",
         ):
-            if "source" in f and "soft" not in f:
-                raise ValueError(
-                    f"{kind} annotation from {f['source']!r} must explicitly set soft=true for evidence "
-                    "or soft=false after human confirmation. Review the annotation before rebuilding."
-                )
-            soft = f.get("soft", False)
-            if not isinstance(soft, bool):
-                raise ValueError(f"{kind} annotation soft must be a boolean.")
-            out[kind].append({"seat": seat, "tiles": f["tiles"], "soft": soft})
-        elif kind == "draw" and seat and f.get("tile"):
-            t = f.get("t_discard") if f.get("t_discard") is not None else f.get("t")
-            out["draw"].append(
-                {"seat": seat, "t": t, "tile": f["tile"], "j": f.get("j")}
-            )
-        elif kind == "discard" and seat and f.get("tile"):
-            out["discard"].append({"seat": seat, "t": f.get("t"), "tile": f["tile"]})
-        elif (
-            kind == "meld"
-            and seat
-            and f.get("t") is not None
-            and f.get("tiles")
-            and f.get("type")
-        ):
-            out["meld"].append(
-                {
-                    "seat": seat,
-                    "t": float(f["t"]),
-                    "type": f["type"],
-                    "tiles": f["tiles"],
-                    "called_pos": f.get("called_pos"),
-                    "source": f.get("source"),
-                }
-            )
-        elif kind == "meld_remove" and seat and f.get("t") is not None:
-            out["meld_remove"].append(
-                {"seat": seat, "t": float(f["t"]), "type": f.get("type")}
-            )
-        elif (
-            kind == "missing_discard"
-            and seat
-            and f.get("tile")
-            and f.get("t") is not None
-        ):
-            out["missing_discard"].append(
-                {"seat": seat, "t": float(f["t"]), "tile": f["tile"]}
-            )
-        elif kind == "result":
-            raise ValueError(
-                "Unsupported result annotation. Save ura indicators as kind='ura' with tiles, "
-                "or a confirmed concealed hand as kind='final_hand'. The saved journal was not changed."
-            )
-        elif kind == "ura" and f.get("tiles") is not None:
-            out["ura"] = f["tiles"]
-        elif kind == "dora" and f.get("tiles"):
-            out["dora"] = f["tiles"]
-        elif kind == "riichi" and f.get("seats") is not None:
-            out["riichi"] = f["seats"]
-        elif kind == "lost" and f.get("field") == "dora":
-            out["lost_dora"] = (
-                True  # Can't tell: the indicator(s) no view shows stay the rules' guess
-            )
-        elif kind == "lost" and f.get("field") == "haipai" and seat:
-            out["lost_haipai"].append(seat)
-        elif kind == "lost" and seat:
-            out["lost"].append({"seat": seat, "t": f.get("t"), "j": f.get("j")})
-        elif kind == "riichi_turn" and seat and f.get("t") is not None:
-            out["riichi_turn"].append({"seat": seat, "t": float(f["t"])})
-        elif (
-            kind == "site_wrong"
-            and f.get("han") is not None
-            and f.get("fu") is not None
-        ):
-            out["site_score"] = {
-                "han": int(f["han"]),
-                "fu": int(f["fu"]),
-            }  # the reviewer's han/fu replace the site's
-        elif kind == "kan_time" and f.get("t") is not None:
-            out["kan_time"].append(
-                {"seat": seat, "t": float(f["t"])}
-            )  # the seat is optional
+            _apply_turn_fact(out, f, seat)
+        else:
+            _apply_result_fact(out, f, seat)
     return out
 
 
+def _apply_concealed_fact(out: dict, f: dict, seat: str | None) -> None:
+    """Validate explicit annotation strength before adding concealed tiles."""
+    kind = f.get("kind")
+    if (
+        kind in ("haipai", "final_hand")
+        and seat
+        and f.get("tiles")
+        and "?" not in f["tiles"]
+    ):
+        if "source" in f and "soft" not in f:
+            msg = (
+                f"{kind} annotation from {f['source']!r} must explicitly "
+                "set soft=true for evidence or soft=false after human "
+                "confirmation. Review the annotation before rebuilding."
+            )
+            raise ValueError(msg)
+        soft = f.get("soft", False)
+        if not isinstance(soft, bool):
+            msg = f"{kind} annotation soft must be a boolean."
+            raise ValueError(msg)
+        out[kind].append({"seat": seat, "tiles": f["tiles"], "soft": soft})
+
+
+def _apply_turn_fact(out: dict, f: dict, seat: str | None) -> None:
+    """Normalize draw, discard, meld and timing constraints."""
+    kind = f.get("kind")
+    if kind == "draw" and seat and f.get("tile"):
+        t = f.get("t_discard") if f.get("t_discard") is not None else f.get("t")
+        out["draw"].append({"seat": seat, "t": t, "tile": f["tile"], "j": f.get("j")})
+    elif kind == "discard" and seat and f.get("tile"):
+        out["discard"].append({"seat": seat, "t": f.get("t"), "tile": f["tile"]})
+    elif (
+        kind == "meld"
+        and seat
+        and f.get("t") is not None
+        and f.get("tiles")
+        and f.get("type")
+    ):
+        out["meld"].append(
+            {
+                "seat": seat,
+                "t": float(f["t"]),
+                "type": f["type"],
+                "tiles": f["tiles"],
+                "called_pos": f.get("called_pos"),
+                "source": f.get("source"),
+            }
+        )
+    elif kind == "meld_remove" and seat and f.get("t") is not None:
+        out["meld_remove"].append(
+            {"seat": seat, "t": float(f["t"]), "type": f.get("type")}
+        )
+    elif (
+        kind == "missing_discard" and seat and f.get("tile") and f.get("t") is not None
+    ):
+        out["missing_discard"].append(
+            {"seat": seat, "t": float(f["t"]), "tile": f["tile"]}
+        )
+    elif kind == "riichi_turn" and seat and f.get("t") is not None:
+        out["riichi_turn"].append({"seat": seat, "t": float(f["t"])})
+    elif kind == "kan_time" and f.get("t") is not None:
+        out["kan_time"].append(
+            {"seat": seat, "t": float(f["t"])}
+        )  # the seat is optional
+
+
+def _apply_result_fact(out: dict, f: dict, seat: str | None) -> None:
+    """Normalize result corrections, indicators and unresolved decisions."""
+    kind = f.get("kind")
+    if kind == "result":
+        msg = (
+            "Unsupported result annotation. Save ura indicators as "
+            "kind='ura' with tiles, or a confirmed concealed hand as "
+            "kind='final_hand'. The saved journal was not changed."
+        )
+        raise ValueError(msg)
+    if kind == "ura" and f.get("tiles") is not None:
+        out["ura"] = f["tiles"]
+    elif kind == "dora" and f.get("tiles"):
+        out["dora"] = f["tiles"]
+    elif kind == "riichi" and f.get("seats") is not None:
+        out["riichi"] = f["seats"]
+    elif kind == "lost" and f.get("field") == "dora":
+        out["lost_dora"] = (
+            True  # Can't tell: the indicator(s) no view shows stay the rules' guess
+        )
+    elif kind == "lost" and f.get("field") == "haipai" and seat:
+        out["lost_haipai"].append(seat)
+    elif kind == "lost" and seat:
+        out["lost"].append({"seat": seat, "t": f.get("t"), "j": f.get("j")})
+    elif kind == "site_wrong" and f.get("han") is not None and f.get("fu") is not None:
+        out["site_score"] = {
+            "han": int(f["han"]),
+            "fu": int(f["fu"]),
+        }  # the reviewer's han/fu replace the site's
+
+
 def turn_key(model: HandModel, f: dict, tol: float) -> tuple[str, int] | None:
-    """(seat, j) of the draw a draw / lost fact is about: the turn whose discard is nearest the fact's time
-    (within tol), else the turn index the fact carries (the tsumo winner's final draw has no discard, so its
-    index is its only key).
+    """Find the draw whose discard time is nearest a review fact.
+
+    (seat, j) of the draw a draw / lost fact is about: the turn whose discard is nearest
+    the fact's time (within tol), else the turn index the fact carries (the tsumo
+    winner's final draw has no discard, so its index is its only key).
     """
     seat = f["seat"]
     mine = model.turns.get(seat, [])
@@ -227,20 +264,24 @@ def turn_key(model: HandModel, f: dict, tol: float) -> tuple[str, int] | None:
         st = min(mine, key=lambda x: abs(x.t_discard - f["t"]))
         if abs(st.t_discard - f["t"]) <= tol and st.kind in ("draw", "kan"):
             return (seat, st.j)
-    if f.get("j") is not None and int(f["j"]) in model._draw_turns(seat):
+    if f.get("j") is not None and int(f["j"]) in model.draw_turns(seat):
         return (seat, int(f["j"]))
     return None
 
 
-# ---------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # items and confidence rows
-# ---------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
 def _draw_span(
     model: HandModel, turns: list[Turn], seat: str, j: int, t0: float
 ) -> tuple[float, float]:
-    """From the seat's previous turn to the discard of turn j (the tsumo winner's last draw: to its reveal)."""
+    """Find the interval from the seat's previous turn to this discard.
+
+    From the seat's previous turn to the discard of turn j (the tsumo winner's last
+    draw: to its reveal).
+    """
     st = model.turns[seat][j] if j < len(model.turns[seat]) else None
     t_end = st.t_discard if st else (turns[-1].t + 5.0 if turns else t0)
     before = [t.t for t in turns if t.t < t_end - 0.1]
@@ -248,8 +289,11 @@ def _draw_span(
 
 
 def _covered(model: HandModel, seat: str, j: int) -> bool:
-    """Is a draw covered by any evidence: a direct observation, or a full row of the hand next to it (a row short of
-    the hand by a hidden tile is not: the hidden one may be the draw)?
+    """Check whether a draw has direct or complete neighbouring hand evidence.
+
+    Is a draw covered by any evidence: a direct observation, or a full row of the hand
+    next to it (a row short of the hand by a hidden tile is not: the hidden one may be
+    the draw)?
     """
     if any(ev.seat == seat and ev.j == j for ev in model.draw_ev):
         return True
@@ -260,7 +304,11 @@ def _covered(model: HandModel, seat: str, j: int) -> bool:
 
 
 def unseen_draw(model: HandModel, sol: Solution, seat: str, j: int) -> bool:
-    """A draw nothing covers (section 6, `lost`): the solver's margin is low and no reading shows it."""
+    """Identify a low-margin draw without supporting observations.
+
+    A draw nothing covers (section 6, `lost`): the solver's margin is low and no reading
+    shows it.
+    """
     margin = sol.margins.get((seat, j))
     return (
         (seat, j) not in sol.draw_sources
@@ -285,7 +333,11 @@ PRIORITY = [
 
 
 def ranked(items: list[dict]) -> list[dict]:
-    """The questions of a hand in the order they settle it: the ura first, then a conflict, a result, a call."""
+    """Order review questions by their effect on resolving the hand.
+
+    The questions of a hand in the order they settle it: the ura first, then a conflict,
+    a result, a call.
+    """
     return sorted(
         items,
         key=lambda it: (
@@ -336,18 +388,24 @@ def uncertain_tiles(rows: list[dict], items: list[dict]) -> dict | None:
             }
             for row in pending
         ],
-        "text": "The evidence allows competing tile choices. Review the most uncertain choice first.",
+        "text": (
+            "The evidence allows competing tile choices. Review the most uncertain "
+            "choice first."
+        ),
     }
 
 
 def changed_discard(
-    seat: str, j: int, t: float, observed: str, chosen: str, facts: list[dict]
+    key: tuple[str, int], t: float, observed: str, chosen: str, facts: list[dict]
 ) -> dict | None:
-    """Ask about a solver repair that contradicts the pond, unless a reviewer fixed it."""
+    """Question pond-contradicting repairs unless a reviewer confirmed the tile."""
+    seat, j = key
     if not chosen or chosen == observed:
         return None
     if any(
-        f["seat"] == seat and abs(float(f["t"]) - t) <= 3 and f["tile"] == chosen
+        f["seat"] == seat
+        and abs(float(f["t"]) - t) <= DISCARD_FACT_WINDOW
+        and f["tile"] == chosen
         for f in facts
     ):
         return None
@@ -358,7 +416,10 @@ def changed_discard(
         "t": t,
         "tile": chosen,
         "observed": observed,
-        "text": f"The pond read {observed}, but the reconstruction uses {chosen}. Check this discard before accepting the log.",
+        "text": (
+            f"The pond read {observed}, but the reconstruction uses {chosen}. Check"
+            " this discard before accepting the log."
+        ),
     }
 
 
@@ -381,7 +442,10 @@ def uncertain_discards(rows: list[dict], items: list[dict]) -> list[dict]:
                 (e["t"] for e in row.get("evidence", []) if e.get("t") is not None),
                 None,
             ),
-            "text": "The evidence allows two discard identities. Check this tile in the pond.",
+            "text": (
+                "The evidence allows two discard identities. Check this tile in the"
+                " pond."
+            ),
         }
         for row in rows
         if row.get("field") == "discard"
@@ -393,18 +457,23 @@ def uncertain_discards(rows: list[dict], items: list[dict]) -> list[dict]:
 
 
 def confidence_rows(
-    model: HandModel,
-    sol: Solution,
-    turns: list[Turn],
-    calls: list[Call],
-    inds: list[dict],
-    entry: dict,
-    facts: dict,
-    lost_keys: set,
-    t0: float,
+    model: HandModel, sol: Solution, *, context: ReviewContext
 ) -> list[dict]:
-    """One row per decision of the log (section 5): draws, discards, haipai, calls, indicators."""
-    rows = []
+    """Build confidence rows for every reconstructed decision.
+
+    One row per decision of the log (section 5): draws, discards, haipai, calls,
+    indicators.
+    """
+    turns, calls, inds, entry, facts, lost_keys, t0 = (
+        context.turns,
+        context.calls,
+        context.inds,
+        context.entry,
+        context.facts,
+        context.lost_keys,
+        context.t0,
+    )
+    rows: list[dict] = []
     for (s, j), tile in sorted(sol.draws.items()):
         a, b = _draw_span(model, turns, s, j, t0)
         corner = corner_of(entry, s)
@@ -443,13 +512,14 @@ def confidence_rows(
         # solve; that solution then has no variable-discard override. Keep
         # confidence values aligned with the actual exported reconstruction.
         chosen = sol.discards.get((t.seat, st.j), st.discard) if st else None
-        # a virtual discard was never seen in the pond, but its tile is the called tile the meld camera shows
+        # a virtual discard was never seen in the pond, but its tile is the called tile
+        # the meld camera shows
         caller = t.slot.t_removed if t.virtual else None
-        region = (
-            f"meld:{corner_of(entry, next((c.seat for c in calls if c.t_first == caller), t.seat))}"
-            if t.virtual
-            else f"pond:{corner_of(entry, t.seat)}"
-        )
+        if t.virtual:
+            calling_seat = next((c.seat for c in calls if c.t_first == caller), t.seat)
+            region = f"meld:{corner_of(entry, calling_seat)}"
+        else:
+            region = f"pond:{corner_of(entry, t.seat)}"
         rows.append(
             {
                 "seat": t.seat,
@@ -483,38 +553,38 @@ def confidence_rows(
                 "evidence": [{"region": f"hand:{corner_of(entry, s)}", "t": t0}],
             }
         )
-    for c in calls:
-        rows.append(
-            {
-                "seat": c.seat,
-                "turn": None,
-                "field": "call",
-                "value": f"{c.type} {''.join(c.tiles)}",
-                "margin": None,
-                "seen": c.seen,
-                "human": c.human,
-                "lost": False,
-                "evidence": [
-                    {"region": f"meld:{corner_of(entry, c.seat)}", "t": c.t_first}
-                ],
-            }
-        )
-    for v in inds:
-        rows.append(
-            {
-                "seat": None,
-                "turn": None,
-                "field": "dora",
-                "value": v["tile"],
-                "margin": None,
-                "seen": v.get("seen"),
-                "human": bool(v.get("human")),
-                "lost": bool(v.get("lost")),
-                "evidence": [{"region": v.get("region") or "", "t": v.get("t_first")}]
-                if v.get("t_first") is not None
-                else [],
-            }
-        )
+    rows.extend(
+        {
+            "seat": c.seat,
+            "turn": None,
+            "field": "call",
+            "value": f"{c.type} {''.join(c.tiles)}",
+            "margin": None,
+            "seen": c.seen,
+            "human": c.human,
+            "lost": False,
+            "evidence": [
+                {"region": f"meld:{corner_of(entry, c.seat)}", "t": c.t_first}
+            ],
+        }
+        for c in calls
+    )
+    rows.extend(
+        {
+            "seat": None,
+            "turn": None,
+            "field": "dora",
+            "value": v["tile"],
+            "margin": None,
+            "seen": v.get("seen"),
+            "human": bool(v.get("human")),
+            "lost": bool(v.get("lost")),
+            "evidence": [{"region": v.get("region") or "", "t": v.get("t_first")}]
+            if v.get("t_first") is not None
+            else [],
+        }
+        for v in inds
+    )
     for row in rows:
         row["state"] = confidence_state(row.get("margin"), row.get("alternative_gap"))
     return rows

@@ -1,24 +1,66 @@
-"""Engine fixes from the code review: turns, melds, ponds, solver, assemble, decode facts."""
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Regression checks for engine evidence, reconstruction and export fixes."""
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
-from video2tenhou.engine import rules
+from tests.engine.factories import hand_decoder
+from tests.recognition import models_stub
+from video2tenhou.engine import dense, rules
 from video2tenhou.engine.assemble import call_string, kyoku_from_decode
-from video2tenhou.engine.decode import apply_choices, scoring_melds, seat_turns_of
-from video2tenhou.engine.indicators import reconcile_kans
-from video2tenhou.engine.melds import Call, track_melds
+from video2tenhou.engine.confidence import confidence_state, low_margin
+from video2tenhou.engine.decode import (
+    DecodeOptions,
+    HandDecoder,
+    apply_choices,
+    concealed_size,
+    decode_hand,
+    scoring_melds,
+    seat_turns_of,
+)
+from video2tenhou.engine.dense import DenseContext, still_runs
+from video2tenhou.engine.indicators import KanEvidence, reconcile_kans
+from video2tenhou.engine.melds import Call, fragments, track_melds
 from video2tenhou.engine.ponds import PondSlot
-from video2tenhou.engine.review import facts_for_hand
-from video2tenhou.engine.solver import HandModel, SeatTurn, hand_evidence, open_turn
+from video2tenhou.engine.review import (
+    ReviewContext,
+    changed_discard,
+    confidence_rows,
+    draws_to_reread,
+    facts_for_hand,
+    uncertain_discards,
+    uncertain_tiles,
+    unseen_draw,
+)
+from video2tenhou.engine.scoring import payment
+from video2tenhou.engine.solver import (
+    TI,
+    TILES,
+    DrawEvidence,
+    HandModel,
+    HandRole,
+    SeatTurn,
+    Solution,
+    hand_evidence,
+    open_turn,
+)
 from video2tenhou.engine.turns import Turn, assign_calls, merge
 from video2tenhou.record import HandResult
+from video2tenhou.tenhou6 import Agari
 from video2tenhou.train.data import CLASS_INDEX, CLASSES
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
-def test_confidence_boundary_requests_more_evidence():
-    from video2tenhou.engine.review import low_margin
 
+def test_confidence_boundary_requests_more_evidence() -> None:
+    """Verify confidence boundary requests more evidence."""
     assert low_margin(0.5)
     assert low_margin(0.50000000000001)
     assert low_margin(0.0)
@@ -27,10 +69,10 @@ def test_confidence_boundary_requests_more_evidence():
     assert not low_margin(float("inf"))
 
 
-def test_covered_ambiguous_tiles_stay_in_review_without_duplicate_or_answered_questions():
-    from video2tenhou.engine.review import uncertain_tiles
+def test_covered_ambiguity_has_no_duplicate_or_answered_questions() -> None:
+    """Verify covered ambiguity remains reviewable without duplicate questions."""
 
-    def draw(j, **changes):
+    def draw(j: "int", **changes: "object") -> dict:
         return {
             "field": "draw",
             "seat": "W",
@@ -64,7 +106,9 @@ def test_covered_ambiguous_tiles_stay_in_review_without_duplicate_or_answered_qu
         },
     ]
     item = uncertain_tiles(rows, [{"kind": "draw", "seat": "W", "j": 8}])
-    assert item["kind"] == "uncertain_tiles" and item["count"] == 3
+    assert item is not None
+    assert item["kind"] == "uncertain_tiles"
+    assert item["count"] == 3
     assert [(c["field"], c["seat"], c["j"]) for c in item["choices"]] == [
         ("draw", "W", 4),
         ("draw", "W", 5),
@@ -73,10 +117,8 @@ def test_covered_ambiguous_tiles_stay_in_review_without_duplicate_or_answered_qu
     assert uncertain_tiles([draw(6, human=True), draw(7, lost=True)], []) is None
 
 
-def test_cant_tell_starting_hand_does_not_answer_a_draw():
-    from video2tenhou.engine.review import confidence_rows, uncertain_tiles
-    from video2tenhou.engine.solver import Solution
-
+def test_cant_tell_starting_hand_does_not_answer_a_draw() -> None:
+    """Verify cant tell starting hand does not answer a draw."""
     entry = {
         "game": 0,
         "kyoku": 0,
@@ -96,7 +138,8 @@ def test_cant_tell_starting_hand_does_not_answer_a_draw():
         ],
         entry,
     )
-    assert facts["lost_haipai"] == ["S"] and facts["lost"] == []
+    assert facts["lost_haipai"] == ["S"]
+    assert facts["lost"] == []
     model = HandModel("E", {s: [] for s in rules.SEATS}, [])
     model.turns["S"] = [SeatTurn(0, "draw", "1m", 10, 20)]
     sol = Solution(
@@ -108,48 +151,47 @@ def test_cant_tell_starting_hand_does_not_answer_a_draw():
         margins={("S", 0): 0},
         haipai_margins={"S": 0},
     )
-    rows = confidence_rows(model, sol, [], [], [], entry, facts, set(), 0)
+    rows = confidence_rows(
+        model,
+        sol,
+        context=ReviewContext(
+            turns=[], calls=[], inds=[], entry=entry, facts=facts, lost_keys=set(), t0=0
+        ),
+    )
     haipai = next(r for r in rows if r["field"] == "haipai")
-    assert haipai["lost"] and not haipai["human"]
+    assert haipai["lost"]
+    assert not haipai["human"]
     assert uncertain_tiles([haipai], []) is None
     # The first draw is still unreviewed and receives its own unseen question;
     # the starting-hand answer never enters the set of answered draw keys.
-    assert (
-        facts["lost"] == []
-        and not next(r for r in rows if r["field"] == "draw")["human"]
-    )
+    assert facts["lost"] == []
+    assert not next(r for r in rows if r["field"] == "draw")["human"]
 
 
-def test_solver_changed_discard_needs_specific_review_unless_human_fixed():
-    from video2tenhou.engine.review import changed_discard
-
-    item = changed_discard("S", 17, 3097.5, "1m", "2m", [])
-    assert (
-        item["kind"] == "discard" and item["observed"] == "1m" and item["tile"] == "2m"
-    )
-    assert changed_discard("S", 17, 3097.5, "2m", "2m", []) is None
+def test_solver_changed_discard_needs_specific_review_unless_human_fixed() -> None:
+    """Verify solver changed discard needs specific review unless human fixed."""
+    item = changed_discard(("S", 17), 3097.5, "1m", "2m", [])
+    assert item is not None
+    assert item["kind"] == "discard"
+    assert item["observed"] == "1m"
+    assert item["tile"] == "2m"
+    assert changed_discard(("S", 17), 3097.5, "2m", "2m", []) is None
     assert (
         changed_discard(
-            "S", 17, 3097.5, "1m", "2m", [{"seat": "S", "t": 3097.5, "tile": "2m"}]
+            ("S", 17), 3097.5, "1m", "2m", [{"seat": "S", "t": 3097.5, "tile": "2m"}]
         )
         is None
     )
     assert (
         changed_discard(
-            "S", 17, 3097.5, "1m", "2m", [{"seat": "S", "t": 3097.5, "tile": "1m"}]
+            ("S", 17), 3097.5, "1m", "2m", [{"seat": "S", "t": 3097.5, "tile": "1m"}]
         )
         is not None
     )
 
 
-def test_search_uncertainty_does_not_alone_request_more_video():
-    from video2tenhou.engine.review import (
-        draws_to_reread,
-        uncertain_tiles,
-        confidence_state,
-    )
-    from video2tenhou.engine.solver import Solution
-
+def test_search_uncertainty_does_not_alone_request_more_video() -> None:
+    """Verify search uncertainty does not alone request more video."""
     sol = Solution(
         "optimal",
         0,
@@ -185,10 +227,8 @@ def test_search_uncertainty_does_not_alone_request_more_video():
     )
 
 
-def test_serialized_confidence_keeps_threshold_precision():
-    from video2tenhou.engine.review import confidence_rows, uncertain_tiles
-    from video2tenhou.engine.solver import Solution
-
+def test_serialized_confidence_keeps_threshold_precision() -> None:
+    """Verify serialized confidence keeps threshold precision."""
     entry = {"corner_wind": {"TL": "E", "TR": "S", "BR": "W", "BL": "N"}}
     model = HandModel("E", {s: [] for s in rules.SEATS}, [])
     model.turns["S"] = [
@@ -204,33 +244,48 @@ def test_serialized_confidence_keeps_threshold_precision():
         margins={("S", 0): 0.5004, ("S", 1): 0.5},
         alternative_gaps={("S", 0): 0.5004, ("S", 1): 0.5},
     )
-    rows = confidence_rows(model, sol, [], [], [], entry, {}, set(), 0)
+    rows = confidence_rows(
+        model,
+        sol,
+        context=ReviewContext(
+            turns=[], calls=[], inds=[], entry=entry, facts={}, lost_keys=set(), t0=0
+        ),
+    )
     assert rows[0]["margin"] == rows[0]["alternative_gap"] == 0.5004
     # Supply image coverage: these choices belong to the grouped review policy.
     for row in rows:
         row["lost"] = False
-    assert [c["j"] for c in uncertain_tiles(rows, [])["choices"]] == [1]
+    item = uncertain_tiles(rows, [])
+    assert item is not None
+    assert [c["j"] for c in item["choices"]] == [1]
 
 
-def pslot(i, tile, t, removed=None, side=False, row=0, index=None):
+def pslot(
+    i: "int",
+    tile: "str",
+    t: "float",
+    removed: "float | None" = None,
+) -> "PondSlot":
+    """Create a pond slot with controlled tile support, timing and removal."""
     p = np.full(len(CLASSES), 0.002)
     p[CLASS_INDEX[tile]] = 0.9
     s = PondSlot(
         i,
-        row,
-        i if index is None else index,
+        0,
+        i,
         p,
         t,
         (t - 3, t),
         t + 4,
         3,
-        3.0 if side else 0.0,
+        0.0,
     )
     s.t_removed = removed
     return s
 
 
-def mslot(tile, group, i, sideways=0.0):
+def mslot(tile: "str", group: "int", i: "int", sideways: float = 0.0) -> "dict":
+    """Create a meld tile observation with controlled group and orientation."""
     p = np.full(len(CLASSES), 0.002)
     p[CLASS_INDEX[tile]] = 0.8
     p /= p.sum()
@@ -246,7 +301,15 @@ def mslot(tile, group, i, sideways=0.0):
     }
 
 
-def mobs(t0, t1, slots, n_used=3, partial=False):
+def mobs(
+    t0: "float",
+    t1: "float",
+    slots: "list[dict]",
+    n_used: int = 3,
+    *,
+    partial: bool = False,
+) -> "dict":
+    """Create a meld observation interval with explicit support counts."""
     return {
         "region": "meld:TL",
         "t0": t0,
@@ -264,8 +327,10 @@ def mobs(t0, t1, slots, n_used=3, partial=False):
 # ---------------------------------------------------------------- turns
 
 
-def test_unknown_source_prefers_the_pond_that_shows_the_removal():
-    # W pons 3p; its turned tile was not read. S (kamicha of W) has no removed 3p, N (shimocha) does: N is the source
+def test_unknown_source_prefers_the_pond_that_shows_the_removal() -> None:
+    # W pons 3p; its turned tile was not read. S (kamicha of W) has no removed 3p, N
+    # (shimocha) does: N is the source
+    """Verify unknown source prefers the pond that shows the removal."""
     logs = {
         "E": [pslot(0, "1m", 10), pslot(1, "2m", 50)],
         "S": [pslot(2, "3p", 20), pslot(3, "4p", 60)],
@@ -274,13 +339,17 @@ def test_unknown_source_prefers_the_pond_that_shows_the_removal():
     }
     pon = Call("W", 48, (44, 48), "pon", ["3p", "3p", "3p"], None, None, None, [], 0.9)
     turns, problems = merge(logs, [pon], "E")
-    assert pon.source == "shimocha" and pon.called_pos == 2
-    assert problems == [] and not any(t.virtual for t in turns)
-    # after W's call and discard the turn passes to N, who discards; a seat never passes for free
+    assert pon.source == "shimocha"
+    assert pon.called_pos == 2
+    assert problems == []
+    assert not any(t.virtual for t in turns)
+    # after W's call and discard the turn passes to N, who discards; a seat never passes
+    # for free
     assert [t.seat for t in turns] == ["E", "S", "W", "N", "W", "N", "E", "S"]
 
 
-def test_daiminkan_from_shimocha_has_the_turned_tile_last():
+def test_daiminkan_from_shimocha_has_the_turned_tile_last() -> None:
+    """Verify daiminkan from shimocha has the turned tile last."""
     logs = {
         "E": [pslot(0, "1m", 10), pslot(1, "2m", 50)],
         "S": [pslot(2, "3p", 20), pslot(3, "4p", 60)],
@@ -291,11 +360,13 @@ def test_daiminkan_from_shimocha_has_the_turned_tile_last():
         "W", 48, (44, 48), "kan", ["7z", "7z", "7z", "7z"], None, None, None, [], 0.9
     )
     merge(logs, [kan], "E")
-    assert kan.source == "shimocha" and kan.called_pos == 3
+    assert kan.source == "shimocha"
+    assert kan.called_pos == 3
 
 
-def test_one_call_takes_one_removed_slot():
+def test_one_call_takes_one_removed_slot() -> None:
     # S's pond lost two 3p; one pon by W: only the removal nearest the call gets it
+    """Verify one call takes one removed slot."""
     seq = {
         "E": [],
         "S": [pslot(0, "3p", 20, removed=27), pslot(1, "3p", 40, removed=60)],
@@ -312,8 +383,10 @@ def test_one_call_takes_one_removed_slot():
 # ---------------------------------------------------------------- melds
 
 
-def test_two_identical_chis_are_two_calls():
-    def g(k):
+def test_two_identical_chis_are_two_calls() -> None:
+    """Verify two identical chis are two calls."""
+
+    def g(k: "int") -> list:
         return [
             mslot("2m", k, 0, sideways=1.0),
             mslot("3m", k, 1),
@@ -328,15 +401,18 @@ def test_two_identical_chis_are_two_calls():
         mobs(40, 44, g(0) + g(1)),
     ]
     calls = track_melds("E", seq)
-    assert [c.type for c in calls] == ["chi", "chi"] and [c.t_first for c in calls] == [
+    assert [c.type for c in calls] == ["chi", "chi"]
+    assert [c.t_first for c in calls] == [
         10,
         30,
     ]
 
 
-def test_a_meld_seen_once_and_then_absent_is_not_real():
+def test_a_meld_seen_once_and_then_absent_is_not_real() -> None:
+    """Verify a meld seen once and then absent is not real."""
     pon = [mslot("7z", 0, 0), mslot("7z", 0, 1), mslot("7z", 0, 2, sideways=1.0)]
-    # seen once at 10, then two full views without it: a misread; the chi seen once in the last view stays
+    # seen once at 10, then two full views without it: a misread; the chi seen once in
+    # the last view stays
     chi = [mslot("2m", 1, 0, sideways=1.0), mslot("3m", 1, 1), mslot("4m", 1, 2)]
     seq = [
         mobs(0, 5, []),
@@ -349,7 +425,8 @@ def test_a_meld_seen_once_and_then_absent_is_not_real():
     assert [c.type for c in calls] == ["chi"]
 
 
-def test_observation_without_readings_keeps_the_call_window():
+def test_observation_without_readings_keeps_the_call_window() -> None:
+    """Verify observation without readings keeps the call window."""
     pon = [mslot("7z", 0, 0), mslot("7z", 0, 1), mslot("7z", 0, 2, sideways=1.0)]
     seq = [
         mobs(0, 5, []),
@@ -364,8 +441,10 @@ def test_observation_without_readings_keeps_the_call_window():
 # ---------------------------------------------------------------- solver
 
 
-def hobs(t0, t1, tiles):
-    def sd(tile):
+def hobs(t0: "float", t1: "float", tiles: "list[str]") -> "dict":
+    """Create a full hand observation interval with peaked tile posteriors."""
+
+    def sd(tile: "str") -> "dict":
         p = np.full(len(CLASSES), 0.001)
         p[CLASS_INDEX[tile]] = 0.95
         p /= p.sum()
@@ -393,14 +472,14 @@ def hobs(t0, t1, tiles):
     }
 
 
-def test_hand_row_inside_a_turn_window_counts_only_after_a_draw():
+def test_hand_row_inside_a_turn_window_counts_only_after_a_draw() -> None:
+    """Verify hand row inside a turn window counts only after a draw."""
     st = [SeatTurn(0, "draw", "6z", 10, 20), SeatTurn(1, "draw", "9m", 100, 120)]
-    # a row ending within 8 s of the discard's first sighting is ambiguous; one ending long before it is not
-    assert (
-        open_turn(st, 25, 60) is None
-        and open_turn(st, 108, 115) is st[1]
-        and open_turn(st, 102, 110) is None
-    )
+    # a row ending within 8 s of the discard's first sighting is ambiguous; one ending
+    # long before it is not
+    assert open_turn(st, 60) is None
+    assert open_turn(st, 115) is st[1]
+    assert open_turn(st, 110) is None
     thirteen = [
         "1m",
         "2m",
@@ -418,20 +497,20 @@ def test_hand_row_inside_a_turn_window_counts_only_after_a_draw():
     ]
     o13 = hobs(108, 115, thirteen)  # the discard may already have happened: ambiguous
     o14 = hobs(
-        108, 115, thirteen + ["2z"]
+        108, 115, [*thirteen, "2z"]
     )  # one more tile: after the draw, before the discard
-    # the 13 tiles are in the hand at some moment of the turn: all of them are in the hand after its draw
-    hev, dev, _ = hand_evidence("S", st, [o13], {}, dealer=False)
-    assert [(e.j, e.after_draw, e.subset) for e in hev] == [
-        (0, True, True)
-    ] and dev == []
-    hev, dev, _ = hand_evidence("S", st, [o14], {}, dealer=False)
-    assert [(e.j, e.after_draw, e.subset) for e in hev] == [(0, True, False)] and len(
-        dev
-    ) == 2
+    # the 13 tiles are in the hand at some moment of the turn: all of them are in the
+    # hand after its draw
+    hev, dev, _ = hand_evidence("S", st, [o13], {}, role=HandRole(dealer=False))
+    assert [(e.j, e.after_draw, e.subset) for e in hev] == [(0, True, True)]
+    assert dev == []
+    hev, dev, _ = hand_evidence("S", st, [o14], {}, role=HandRole(dealer=False))
+    assert [(e.j, e.after_draw, e.subset) for e in hev] == [(0, True, False)]
+    assert len(dev) == 2
 
 
-def test_ura_indicators_count_against_the_four():
+def test_ura_indicators_count_against_the_four() -> None:
+    """Verify ura indicators count against the four."""
     turns = {s: [] for s in rules.SEATS}
     turns["S"].append(SeatTurn(0, "draw", "9p", 10, 20))
     hand = [
@@ -457,7 +536,8 @@ def test_ura_indicators_count_against_the_four():
     assert without.solve(time_limit=5, margins=False).status != "infeasible"
 
 
-def test_kakan_of_fives_reports_which_five_was_added():
+def test_kakan_of_fives_reports_which_five_was_added() -> None:
+    """Verify kakan of fives reports which five was added."""
     turns = {s: [] for s in rules.SEATS}
     turns["S"] = [
         SeatTurn(0, "call", "1z", 10, 20, removed=["5p", "5p"]),
@@ -480,10 +560,12 @@ def test_kakan_of_fives_reports_which_five_was_added():
         "6z",
     ]
     sol = model.solve(time_limit=5, margins=False)
-    assert sol.status != "infeasible" and sol.kan_added[("S", 1)] == "0p"
+    assert sol.status != "infeasible"
+    assert sol.kan_added[("S", 1)] == "0p"
 
 
-def test_ankan_after_riichi_is_of_the_drawn_tile_and_the_rinshan_draw_is_discarded():
+def test_riichi_ankan_uses_drawn_tile_and_discards_rinshan_draw() -> None:
+    """Verify riichi permits only the drawn-tile kan and replacement discard."""
     turns = {s: [] for s in rules.SEATS}
     turns["S"] = [
         SeatTurn(0, "draw", "1z", 10, 20, riichi=True),
@@ -507,7 +589,8 @@ def test_ankan_after_riichi_is_of_the_drawn_tile_and_the_rinshan_draw_is_discard
     ]
     sol = model.solve(time_limit=5, confidence_timeout=0)
     assert sol.status != "infeasible"
-    assert sol.draws[("S", 1)] == "3m" and sol.draws2[("S", 1)] == "9p"
+    assert sol.draws[("S", 1)] == "3m"
+    assert sol.draws2[("S", 1)] == "9p"
     assert sol.draw_sources[("S", 1)] == "ankan"
     assert sol.margins[("S", 1)] == float("inf")
 
@@ -515,17 +598,9 @@ def test_ankan_after_riichi_is_of_the_drawn_tile_and_the_rinshan_draw_is_discard
 @pytest.mark.parametrize("ambiguous_pond", [False, True])
 @pytest.mark.parametrize("budget", [0, 10])
 def test_post_riichi_draw_uses_discard_without_a_search_or_question(
-    monkeypatch, ambiguous_pond, budget
-):
-    from video2tenhou.engine.review import (
-        confidence_rows,
-        draws_to_reread,
-        uncertain_discards,
-        uncertain_tiles,
-        unseen_draw,
-    )
-    from video2tenhou.engine.solver import TI, TILES, DrawEvidence
-
+    *, monkeypatch: "pytest.MonkeyPatch", ambiguous_pond: bool, budget: int
+) -> None:
+    """Verify post riichi draw uses discard without a search or question."""
     turns = {s: [] for s in rules.SEATS}
     p = np.zeros(len(TILES))
     p[TI["1m"]], p[TI["2m"]] = 0.51, 0.49
@@ -543,12 +618,12 @@ def test_post_riichi_draw_uses_discard_without_a_search_or_question(
         model.draw_ev.append(DrawEvidence("S", 1, draw_p, 1.5))
     original_resolve = model._resolve
 
-    def resolve(*args, **kwargs):
-        assert kwargs.get("watch") != ("S", 1), "This draw is already the discard"
-        return original_resolve(*args, **kwargs)
-
+    resolve = Mock(wraps=original_resolve)
     monkeypatch.setattr(model, "_resolve", resolve)
     sol = model.solve(time_limit=5, confidence_timeout=budget, workers=1)
+    assert all(
+        call.kwargs.get("watch") != ("S", 1) for call in resolve.call_args_list
+    ), "This draw is already the discard"
     assert sol.ok
     assert sol.draws[("S", 1)] == sol.discards.get(("S", 1), "1m")
     assert sol.draw_sources[("S", 1)] == "discard"
@@ -564,7 +639,19 @@ def test_post_riichi_draw_uses_discard_without_a_search_or_question(
         Turn(0, "S", "draw", pslot(0, "1z", 20), 20),
         Turn(1, "S", "draw", pslot(1, "1m", 40), 40),
     ]
-    rows = confidence_rows(model, sol, merged, [], [], entry, {}, set(), 0)
+    rows = confidence_rows(
+        model,
+        sol,
+        context=ReviewContext(
+            turns=merged,
+            calls=[],
+            inds=[],
+            entry=entry,
+            facts={},
+            lost_keys=set(),
+            t0=0,
+        ),
+    )
     row = next(
         r for r in rows if r["field"] == "draw" and r["seat"] == "S" and r["turn"] == 1
     )
@@ -575,7 +662,8 @@ def test_post_riichi_draw_uses_discard_without_a_search_or_question(
         assert [(q["seat"], q["j"]) for q in questions] == [("S", 1)]
 
 
-def test_riichi_declaration_winning_draw_and_red_kan_are_not_assumed_discards():
+def test_riichi_declaration_winning_draw_and_red_kan_are_not_assumed_discards() -> None:
+    """Verify riichi declaration winning draw and red kan are not assumed discards."""
     turns = {s: [] for s in rules.SEATS}
     turns["S"] = [
         SeatTurn(0, "draw", "1z", 10, 20, riichi=True),
@@ -589,10 +677,10 @@ def test_riichi_declaration_winning_draw_and_red_kan_are_not_assumed_discards():
 # ---------------------------------------------------------------- assemble
 
 
-def test_kans_of_fives_hold_the_red_one():
+def test_kans_of_fives_hold_the_red_one() -> None:
+    """Verify kans of fives hold the red one."""
     assert (
-        call_string({"type": "ankan", "tiles": ["5p", "5p", "X", "X"]}, "E")
-        == "522525a25"
+        call_string({"type": "ankan", "tiles": ["5p", "5p", "X", "X"]}) == "522525a25"
     )
     assert (
         call_string(
@@ -602,7 +690,6 @@ def test_kans_of_fives_hold_the_red_one():
                 "called_pos": 0,
                 "source": "kamicha",
             },
-            "E",
         )
         == "k53353535"
     )
@@ -614,7 +701,6 @@ def test_kans_of_fives_hold_the_red_one():
                 "called_pos": 0,
                 "source": "kamicha",
             },
-            "E",
         )
         == "k35533535"
     )
@@ -626,13 +712,13 @@ def test_kans_of_fives_hold_the_red_one():
                 "called_pos": 0,
                 "source": "kamicha",
             },
-            "E",
         )
         == "m15511515"
     )
 
 
-def test_ura_and_the_dealer_split_reach_the_log():
+def test_ura_and_the_dealer_split_reach_the_log() -> None:
+    """Verify ura and the dealer split reach the log."""
     d = {
         "dealer": "E",
         "haipai": {
@@ -687,16 +773,18 @@ def test_ura_and_the_dealer_split_reach_the_log():
     }
     result = HandResult(0, 1, 0, {"EAST": 0, "SOUTH": 0, "WEST": 0, "NORTH": 0}, "draw")
     k, conf = kyoku_from_decode(d, entry, result)
-    assert (
-        k.ura == [32] and k.draws[0] == [29] and k.discards[0] == [60]
-    )  # 9p drawn, discarded tsumogiri
+    assert k.ura == [32]
+    assert k.draws[0] == [29]
+    assert k.discards[0] == [60]
     assert not any(c["lost"] for c in conf)
 
 
-# ---------------------------------------------------------------- decode: kans, melds, facts
+# ---------------------------------------------------------------- decode: kans, melds,
+# facts
 
 
-def test_scoring_melds_fill_kans_and_reds():
+def test_scoring_melds_fill_kans_and_reds() -> None:
+    """Verify scoring melds fill kans and reds."""
     calls = [
         Call(
             "E", 10, (5, 10), "ankan", ["5p", "5p", "X", "X"], None, None, None, [], 0.9
@@ -724,7 +812,8 @@ def test_scoring_melds_fill_kans_and_reds():
     assert rules.count_ok([t for m in scoring_melds(calls, "E") for t in m["tiles"]])
 
 
-def test_solver_kan_choices_reach_the_calls():
+def test_solver_kan_choices_reach_the_calls() -> None:
+    """Verify solver kan choices reach the calls."""
     kan = Call(
         "E", 50, (42, 50), "ankan", ["?", "?", "X", "X"], None, None, None, [], 0.3
     )
@@ -748,16 +837,16 @@ def test_solver_kan_choices_reach_the_calls():
     for s in rules.SEATS:
         model.turns[s], _ = seat_turns_of(turns, s, "E")
 
-    class Sol:
-        kans = {("E", 0): "3m"}
-        kan_added = {("S", 0): "0p"}
-        melds = {}
+    solution = Solution(
+        "optimal", 0, {}, {}, {}, kans={("E", 0): "3m"}, kan_added={("S", 0): "0p"}
+    )
+    apply_choices(solution, model, turns, {id(kan)})
+    assert kan.tiles == ["3m"] * 4
+    assert kakan.tiles == ["5p", "5p", "5p", "0p"]
 
-    apply_choices(Sol(), model, turns, {id(kan)})
-    assert kan.tiles == ["3m"] * 4 and kakan.tiles == ["5p", "5p", "5p", "0p"]
 
-
-def test_dealer_first_turn_ankan_has_no_normal_draw():
+def test_dealer_first_turn_ankan_has_no_normal_draw() -> None:
+    """Verify dealer first turn ankan has no normal draw."""
     kan = Call(
         "E", 12, (5, 12), "ankan", ["3m", "3m", "X", "X"], None, None, None, [], 0.9
     )
@@ -766,12 +855,16 @@ def test_dealer_first_turn_ankan_has_no_normal_draw():
         Turn(1, "S", "draw", pslot(1, "2z", 25), 25),
     ]
     st, _ = seat_turns_of(turns, "E", "E")
-    assert st[0].kind == "first" and st[0].kan == "ankan" and st[0].two_draws
+    assert st[0].kind == "first"
+    assert st[0].kan == "ankan"
+    assert st[0].two_draws
     model = HandModel("E", {"E": st, "S": [], "W": [], "N": []}, ["9s"])
-    assert ("E", 0) not in model.build()[2] and ("E", 0) in model._d2
+    assert ("E", 0) not in model.build()[2]
+    assert ("E", 0) in model._d2
 
 
-def test_a_kan_after_the_winners_last_discard_is_its_last_turn():
+def test_a_kan_after_the_winners_last_discard_is_its_last_turn() -> None:
+    """Verify a kan after the winners last discard is its last turn."""
     kan = Call(
         "S", 100, (92, 100), "ankan", ["3m", "3m", "X", "X"], None, None, None, [], 0.9
     )
@@ -780,16 +873,14 @@ def test_a_kan_after_the_winners_last_discard_is_its_last_turn():
         Turn(1, "S", "draw", pslot(1, "2z", 25), 25),
         Turn(2, "S", "kan", None, 100, own_call=kan),
     ]
-    st, melds_before = seat_turns_of(turns, "S", "E")
-    assert (
-        [x.kind for x in st] == ["draw", "kan"]
-        and not st[1].two_draws
-        and st[1].discard is None
-    )
+    st, _melds_before = seat_turns_of(turns, "S", "E")
+    assert [x.kind for x in st] == ["draw", "kan"]
+    assert not st[1].two_draws
+    assert st[1].discard is None
     model = HandModel(
         "E", {"E": [], "S": st, "W": [], "N": []}, ["9s"], tsumo_winner="S"
     )
-    assert model._draw_turns("S") == [
+    assert model.draw_turns("S") == [
         0,
         1,
         2,
@@ -810,10 +901,12 @@ def test_a_kan_after_the_winners_last_discard_is_its_last_turn():
         "6z",
     ]
     sol = model.solve(time_limit=5, margins=False)
-    assert sol.status != "infeasible" and len(sol.hands[("S", 2)]) == 11
+    assert sol.status != "infeasible"
+    assert len(sol.hands[("S", 2)]) == 11
 
 
-def test_indicator_after_the_last_discard_is_the_tsumo_winners_kan():
+def test_indicator_after_the_last_discard_is_the_tsumo_winners_kan() -> None:
+    """Verify indicator after the last discard is the tsumo winners kan."""
     logs = {"E": [pslot(0, "1z", 15)], "S": [pslot(1, "2z", 25)], "W": [], "N": []}
     inds = [{"tile": "1s", "t_first": 0}, {"tile": "4p", "t_first": 40}]
     entry = {
@@ -821,19 +914,30 @@ def test_indicator_after_the_last_discard_is_the_tsumo_winners_kan():
         "corner_site": {"TL": "EAST", "TR": "SOUTH", "BR": "WEST", "BL": "NORTH"},
     }
     problems = []
-    out = reconcile_kans(inds, logs, [], {}, entry, 0, problems)
-    assert out == [] and "no discard follows" in problems[-1]
-    out = reconcile_kans(inds, logs, [], {}, entry, 0, [], tsumo_winner="S")
-    assert (
-        len(out) == 1
-        and out[0].seat == "S"
-        and out[0].type == "ankan"
-        and out[0].t_window[0] > 25
+    out = reconcile_kans(
+        inds,
+        [],
+        context=KanEvidence(logs=logs, obs={}, entry=entry, t0=0, problems=problems),
     )
+    assert out == []
+    assert "no discard follows" in problems[-1]
+    out = reconcile_kans(
+        inds,
+        [],
+        context=KanEvidence(
+            logs=logs, obs={}, entry=entry, t0=0, problems=[], tsumo_winner="S"
+        ),
+    )
+    assert len(out) == 1
+    assert out[0].seat == "S"
+    assert out[0].type == "ankan"
+    assert out[0].t_window[0] > 25
 
 
-def test_camera_kan_explains_the_indicator_inside_its_window():
-    # the meld camera first shows the ankan 60 s after the indicator, but its window (last view without it) opens before
+def test_camera_kan_explains_the_indicator_inside_its_window() -> None:
+    # the meld camera first shows the ankan 60 s after the indicator, but its window
+    # (last view without it) opens before
+    """Verify camera kan explains the indicator inside its window."""
     kan = Call(
         "S", 100, (30, 100), "ankan", ["3m", "3m", "X", "X"], None, None, None, [], 0.9
     )
@@ -848,13 +952,21 @@ def test_camera_kan_explains_the_indicator_inside_its_window():
         "corner_wind": {"TL": "E", "TR": "S", "BR": "W", "BL": "N"},
         "corner_site": {"TL": "EAST", "TR": "SOUTH", "BR": "WEST", "BL": "NORTH"},
     }
-    out = reconcile_kans(inds, logs, [kan], {}, entry, 0, [])
-    assert out == [kan] and kan.t_window == (32, 40)
+    out = reconcile_kans(
+        inds,
+        [kan],
+        context=KanEvidence(logs=logs, obs={}, entry=entry, t0=0, problems=[]),
+    )
+    assert out == [kan]
+    assert kan.t_window == (32, 40)
 
 
-def test_an_anchored_kan_stands_without_an_indicator():
-    """The second VOD's hand 3: the dora lies at the crop's edge and the ankan's indicator outside every region.
-    A kan the call anchor established stands; an indicator it does not explain adds the kan the cameras missed.
+def test_an_anchored_kan_stands_without_an_indicator() -> None:
+    """Verify an anchored kan stands without an indicator.
+
+    The second VOD's hand 3: the dora lies at the crop's edge and the ankan's indicator
+    outside every region. A kan the call anchor established stands; an indicator it does
+    not explain adds the kan the cameras missed.
     """
     logs = {"E": [pslot(0, "1z", 15)], "S": [], "W": [], "N": []}
     entry = {
@@ -877,11 +989,14 @@ def test_an_anchored_kan_stands_without_an_indicator():
         anchor="kan",
     )
     assert reconcile_kans(
-        [{"tile": "4s", "t_first": 0}], logs, [kan], {}, entry, 0, []
+        [{"tile": "4s", "t_first": 0}],
+        [kan],
+        context=KanEvidence(logs=logs, obs={}, entry=entry, t0=0, problems=[]),
     ) == [kan]
 
 
-def test_facts_for_hand_passes_the_new_kinds():
+def test_facts_for_hand_passes_the_new_kinds() -> None:
+    """Verify facts for hand passes the new kinds."""
     entry = {
         "game": 0,
         "kyoku": 1,
@@ -945,11 +1060,21 @@ def test_facts_for_hand_passes_the_new_kinds():
     assert out["meld_remove"] == [{"seat": "N", "t": 270.0, "type": "kakan"}]
 
 
-# ---------------------------------------------------------------- decode_hand end to end (synthetic ponds)
+# ---------------------------------------------------------------- decode_hand end to
+# end (synthetic ponds)
 
 
-def pond_obs(region, t0, t1, tiles, sideways=(), indicators=()):
-    def sd(tile, r, c, side):
+def pond_obs(
+    region: "str",
+    span: tuple[float, float],
+    tiles: "list[str]",
+    sideways: "Iterable[int]" = (),
+    indicators: "Iterable[str]" = (),
+) -> "dict":
+    """Create a pond interval with explicit sideways tiles and indicators."""
+    t0, t1 = span
+
+    def sd(tile: "str", r: "int", c: "int", *, side: "bool") -> "dict":
         p = np.full(len(CLASSES), 0.002)
         p[CLASS_INDEX[tile]] = 0.9
         p /= p.sum()
@@ -964,8 +1089,8 @@ def pond_obs(region, t0, t1, tiles, sideways=(), indicators=()):
             "p": p.tolist(),
         }
 
-    slots = [sd(t, i // 6, i % 6, i in sideways) for i, t in enumerate(tiles)]
-    ind = [{**sd(t, 0, 0, False), "xyxy": [400, 10, 438, 68]} for t in indicators]
+    slots = [sd(t, i // 6, i % 6, side=i in sideways) for i, t in enumerate(tiles)]
+    ind = [{**sd(t, 0, 0, side=False), "xyxy": [400, 10, 438, 68]} for t in indicators]
     return {
         "region": region,
         "t0": t0,
@@ -979,8 +1104,14 @@ def pond_obs(region, t0, t1, tiles, sideways=(), indicators=()):
     }
 
 
-def synthetic_hand(riichi_seat=None):
-    """Four ponds, three discards each in rotation from 20 s on, one dora indicator; no hands or melds seen."""
+def synthetic_hand(
+    riichi_seat: "str | None" = None,
+) -> "tuple[dict, dict[str, list[dict]], HandResult]":
+    """Create four rotating ponds with one dora indicator and no calls.
+
+    Four ponds, three discards each in rotation from 20 s on, one dora indicator; no
+    hands or melds seen.
+    """
     corners = {"TL": "E", "TR": "S", "BR": "W", "BL": "N"}
     discards = {
         "E": ["1z", "2z", "3z"],
@@ -993,7 +1124,10 @@ def synthetic_hand(riichi_seat=None):
         k = "ESWN".index(seat)
         seq = [
             pond_obs(
-                f"pond:{corner}", 0, 5, [], indicators=["1s"] if corner == "TL" else []
+                f"pond:{corner}",
+                (0, 5),
+                [],
+                indicators=["1s"] if corner == "TL" else [],
             )
         ]
         for n in range(1, 4):
@@ -1001,8 +1135,7 @@ def synthetic_hand(riichi_seat=None):
             seq.append(
                 pond_obs(
                     f"pond:{corner}",
-                    t,
-                    t + 6,
+                    (t, t + 6),
                     discards[seat][:n],
                     indicators=["1s"] if corner == "TL" else [],
                 )
@@ -1010,13 +1143,12 @@ def synthetic_hand(riichi_seat=None):
         seq.append(
             pond_obs(
                 f"pond:{corner}",
-                150,
-                155,
+                (150, 155),
                 discards[seat],
                 indicators=["1s"] if corner == "TL" else [],
             )
         )
-        seq.append(pond_obs(f"pond:{corner}", 170, 175, []))
+        seq.append(pond_obs(f"pond:{corner}", (170, 175), []))
         obs[f"pond:{corner}"] = seq
     entry = {
         "hand": 0,
@@ -1046,76 +1178,73 @@ def synthetic_hand(riichi_seat=None):
     return entry, obs, result
 
 
-def test_decode_hand_returns_ura_and_places_a_riichi_turn_fact():
-    from video2tenhou.engine.decode import decode_hand
-
+def test_decode_hand_returns_ura_and_places_a_riichi_turn_fact() -> None:
+    """Verify decode hand returns ura and places a riichi turn fact."""
     entry, obs, result = synthetic_hand(riichi_seat="S")
     d = decode_hand(
-        entry, obs, result, {"ura": ["2s"]}, time_limit=5, log=lambda *a: None
+        entry, obs, result, {"ura": ["2s"]}, options=DecodeOptions(time_limit=5)
     )
-    assert d["ura"] == ["2s"] and d["dora"] == ["1s"]
+    assert d["ura"] == ["2s"]
+    assert d["dora"] == ["1s"]
     # no turned tile: the last discard of S is the guess and the reviewer is asked
     assert [t["seat"] for t in d["turns"]] == list("ESWN") * 3
-    assert [t["i"] for t in d["turns"] if t["riichi"]] == [9] and any(
-        it["kind"] == "riichi" for it in d["items"]
-    )
-    # the reviewer names S's second discard (at 72 s): that turn alone is the riichi, nothing is asked
+    assert [t["i"] for t in d["turns"] if t["riichi"]] == [9]
+    assert any(it["kind"] == "riichi" for it in d["items"])
+    # the reviewer names S's second discard (at 72 s): that turn alone is the riichi,
+    # nothing is asked
     t_second = next(t["t"] for t in d["turns"] if t["seat"] == "S" and t["j"] == 1)
     d2 = decode_hand(
         entry,
         obs,
         result,
         {"riichi_turn": [{"seat": "S", "t": t_second + 1.0}]},
-        time_limit=5,
-        log=lambda *a: None,
+        options=DecodeOptions(time_limit=5),
     )
-    assert [t["i"] for t in d2["turns"] if t["riichi"]] == [5] and not any(
-        it["kind"] == "riichi" for it in d2["items"]
-    )
+    assert [t["i"] for t in d2["turns"] if t["riichi"]] == [5]
+    assert not any(it["kind"] == "riichi" for it in d2["items"])
 
 
-def test_decode_hand_places_a_named_indicator_with_a_kan_time_fact():
-    from video2tenhou.engine.decode import decode_hand
-
+def test_decode_hand_places_a_named_indicator_with_a_kan_time_fact() -> None:
+    """Verify decode hand places a named indicator with a kan time fact."""
     entry, obs, result = synthetic_hand()
-    # the reviewer names a second indicator no frame shows: its kan has no time and is asked for
+    # the reviewer names a second indicator no frame shows: its kan has no time and is
+    # asked for
     d = decode_hand(
-        entry, obs, result, {"dora": ["1s", "4p"]}, time_limit=5, log=lambda *a: None
+        entry, obs, result, {"dora": ["1s", "4p"]}, options=DecodeOptions(time_limit=5)
     )
-    assert d["dora"] == ["1s", "4p"] and any(
+    assert d["dora"] == ["1s", "4p"]
+    assert any(
         it["kind"] == "kan" and "Which discard" in it["text"] for it in d["items"]
     )
     assert d["stats"]["calls"] == 0
-    # the reviewer clicks W's second discard: a kan by W just before it, its tile chosen by the solver and written
+    # the reviewer clicks W's second discard: a kan by W just before it, its tile chosen
+    # by the solver and written
     t_w = next(t["t"] for t in d["turns"] if t["seat"] == "W" and t["j"] == 1)
     d2 = decode_hand(
         entry,
         obs,
         result,
         {"dora": ["1s", "4p"], "kan_time": [{"seat": None, "t": t_w}]},
-        time_limit=5,
-        log=lambda *a: None,
+        options=DecodeOptions(time_limit=5),
     )
     assert not any(
         it["kind"] == "kan" and "Which discard" in it["text"] for it in d2["items"]
     )
     kan = next(t for t in d2["turns"] if t["seat"] == "W" and t["j"] == 1)
-    assert (
-        kan["kind"] == "kan"
-        and kan["own_call"]["type"] == "ankan"
-        and "?" not in kan["own_call"]["tiles"]
-    )
-    assert (
-        d2["calls"][0]["tiles"] == kan["own_call"]["tiles"] and kan["draw2"] is not None
-    )
+    assert kan["kind"] == "kan"
+    assert kan["own_call"]["type"] == "ankan"
+    assert "?" not in kan["own_call"]["tiles"]
+    assert d2["calls"][0]["tiles"] == kan["own_call"]["tiles"]
+    assert kan["draw2"] is not None
 
 
-def test_concealed_size_counts_melds_the_way_the_hand_does():
-    """13 tiles, three out per meld set; a kan's fourth tile is the one the kan adds, and a kakan is the
-    pon it grew from, not a second set. The winning tile is never in the count.
+def test_concealed_size_counts_melds_the_way_the_hand_does() -> None:
+    """Verify concealed size counts melds the way the hand does.
+
+    13 tiles, three out per meld set; a kan's fourth tile is the one the kan adds, and a
+    kakan is the pon it grew from, not a second set. The winning tile is never in the
+    count.
     """
-    from video2tenhou.engine.decode import concealed_size
-
     assert concealed_size([]) == 13
     assert concealed_size([{"type": "pon", "tiles": ["1m"] * 3}]) == 10
     assert (
@@ -1146,30 +1275,33 @@ def test_concealed_size_counts_melds_the_way_the_hand_does():
     )
 
 
-def _stub_decoder(calls, dora, *, facts=None):
-    """A decoder at the point after the solve, holding only what kan_indicators reads (no win: a draw)."""
-    from types import SimpleNamespace
+def _stub_decoder(
+    calls: "list[Call]", dora: "list[str]", *, facts: "dict | None" = None
+) -> "HandDecoder":
+    """Create a solved draw decoder for indicator reconciliation tests.
 
-    from video2tenhou.engine.decode import HandDecoder
-
+    A decoder at the point after the solve, holding only what kan_indicators reads (no
+    win: a draw).
+    """
     d = HandDecoder.__new__(HandDecoder)
     d.live_calls, d.dora, d.ura, d.facts = calls, list(dora), [], facts or {}
     d.inds = [
         {"tile": x, "t_first": 30.0 + i, "region": "pond:TL"}
         for i, x in enumerate(dora)
     ]
-    d.sol = SimpleNamespace(
-        ok=False, haipai={"E": ["1s"] * 3 + ["2s"]}, draws={}, draws2={}
-    )
+    d.sol = Solution("unsolved", 0, {"E": ["1s"] * 3 + ["2s"]}, {}, {})
     d.winner, d.result = (
         None,
-        HandResult("draw", None, None, None, None, [0, 0, 0, 0], []),
+        HandResult(0, 0, 0, {}, "draw"),
     )
     d.items, d.problems, d.last_discard, d.t1 = [], [], 300.0, 320.0
     return d
 
 
-def test_a_kan_whose_indicator_no_view_shows_is_asked_and_the_log_keeps_a_guess():
+def test_a_kan_whose_indicator_no_view_shows_is_asked_and_the_log_keeps_a_guess() -> (
+    None
+):
+    """Verify a kan whose indicator no view shows is asked and the log keeps a guess."""
     ankan = Call(
         "N",
         200.0,
@@ -1184,25 +1316,27 @@ def test_a_kan_whose_indicator_no_view_shows_is_asked_and_the_log_keeps_a_guess(
     )
     d = _stub_decoder([ankan], ["4s"])
     d.kan_indicators()
-    assert len(d.dora) == 2 and d.dora[0] == "4s"
+    assert len(d.dora) == 2
+    assert d.dora[0] == "4s"
     guess = d.dora[1]
-    assert (
-        guess != "1s" and d.inds[-1]["lost"] and d.inds[-1]["tile"] == guess
-    )  # 1s: every copy is placed
+    assert guess != "1s"
+    assert d.inds[-1]["lost"]
+    assert d.inds[-1]["tile"] == guess
     (item,) = d.items
-    assert (
-        item["kind"] == "dora"
-        and item["tiles"] == ["4s"]
-        and item["guess"] == [guess]
-        and item["t"] == 200.0
-    )
+    assert item["kind"] == "dora"
+    assert item["tiles"] == ["4s"]
+    assert item["guess"] == [guess]
+    assert item["t"] == 200.0
     # the reviewer cannot tell: the guess stays, nothing is asked
     d = _stub_decoder([ankan], ["4s"], facts={"lost_dora": True})
     d.kan_indicators()
-    assert len(d.dora) == 2 and not d.items and d.inds[-1]["human"]
+    assert len(d.dora) == 2
+    assert not d.items
+    assert d.inds[-1]["human"]
 
 
-def test_a_lost_dora_fact_reaches_the_decoder():
+def test_a_lost_dora_fact_reaches_the_decoder() -> None:
+    """Verify a lost dora fact reaches the decoder."""
     entry = {
         "game": 0,
         "kyoku": 2,
@@ -1222,22 +1356,22 @@ def test_a_lost_dora_fact_reaches_the_decoder():
         ],
         entry,
     )
-    assert f["lost_dora"] and not f["lost"]
+    assert f["lost_dora"]
+    assert not f["lost"]
 
 
-def test_a_draw_nothing_covers_is_unseen():
-    from types import SimpleNamespace
-
-    from video2tenhou.engine.review import unseen_draw
-
-    sol = SimpleNamespace(margins={("E", 1): 0.1, ("E", 2): 3.0}, draw_sources={})
-    model = SimpleNamespace(draw_ev=[], hand_ev=[])
-    assert unseen_draw(model, sol, "E", 1) and not unseen_draw(model, sol, "E", 2)
-    model.draw_ev = [SimpleNamespace(seat="E", j=1)]
+def test_a_draw_nothing_covers_is_unseen() -> None:
+    """Verify a draw nothing covers is unseen."""
+    sol = Solution("optimal", 0, {}, {}, {}, margins={("E", 1): 0.1, ("E", 2): 3.0})
+    model = HandModel("E", {s: [] for s in rules.SEATS}, [])
+    assert unseen_draw(model, sol, "E", 1)
+    assert not unseen_draw(model, sol, "E", 2)
+    model.draw_ev = [DrawEvidence("E", 1, np.zeros(37), 1)]
     assert not unseen_draw(model, sol, "E", 1)
 
 
-def test_a_read_floor_row_showing_the_whole_hand_between_turns_is_the_state():
+def test_a_read_floor_row_showing_the_whole_hand_between_turns_is_the_state() -> None:
+    """Verify a read floor row showing the whole hand between turns is the state."""
     st = [SeatTurn(0, "draw", "6z", 10, 20), SeatTurn(1, "draw", "9m", 100, 120)]
     thirteen = [
         "1m",
@@ -1255,57 +1389,63 @@ def test_a_read_floor_row_showing_the_whole_hand_between_turns_is_the_state():
         "9m",
     ]
     o = {**hobs(40, 60, thirteen), "partial": True}
-    hev, _, _ = hand_evidence("S", st, [o], {}, dealer=False)
+    hev, _, _ = hand_evidence("S", st, [o], {}, role=HandRole(dealer=False))
     assert [(e.j, e.after_draw, e.subset, e.hidden) for e in hev] == [
         (0, False, False, 0)
     ]
 
 
-def test_a_calm_row_one_tile_short_between_turns_holds_all_but_one():
+def test_a_calm_row_one_tile_short_between_turns_holds_all_but_one() -> None:
+    """Verify a calm row one tile short between turns holds all but one."""
     st = [SeatTurn(0, "draw", "6z", 10, 20), SeatTurn(1, "draw", "9m", 100, 120)]
     twelve = ["1m", "2m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "1z", "1z", "3z"]
-    hev, _, _ = hand_evidence("S", st, [hobs(40, 60, twelve)], {}, dealer=False)
-    assert [(e.j, e.subset, e.hidden) for e in hev] == [(0, False, 1)]
-    # a read-floor view that short is a sub-multiset only (an arm may hide more than the one)
     hev, _, _ = hand_evidence(
-        "S", st, [{**hobs(40, 60, twelve), "partial": True}], {}, dealer=False
+        "S", st, [hobs(40, 60, twelve)], {}, role=HandRole(dealer=False)
+    )
+    assert [(e.j, e.subset, e.hidden) for e in hev] == [(0, False, 1)]
+    # a read-floor view that short is a sub-multiset only (an arm may hide more than the
+    # one)
+    hev, _, _ = hand_evidence(
+        "S",
+        st,
+        [{**hobs(40, 60, twelve), "partial": True}],
+        {},
+        role=HandRole(dealer=False),
     )
     assert [(e.subset, e.hidden) for e in hev] == [(True, 0)]
     # and it does not cover the draw by itself: the hidden tile may be the drawn one
-    from types import SimpleNamespace
 
-    from video2tenhou.engine.review import unseen_draw
-
-    model = SimpleNamespace(
-        draw_ev=[],
-        hand_ev=hand_evidence("S", st, [hobs(40, 60, twelve)], {}, dealer=False)[0],
-    )
+    model = HandModel("E", {s: [] for s in rules.SEATS}, [])
+    model.hand_ev = hand_evidence(
+        "S", st, [hobs(40, 60, twelve)], {}, role=HandRole(dealer=False)
+    )[0]
     assert unseen_draw(
-        model, SimpleNamespace(margins={("S", 1): 0.1}, draw_sources={}), "S", 1
+        model, Solution("optimal", 0, {}, {}, {}, margins={("S", 1): 0.1}), "S", 1
     )
 
 
-def test_a_misread_run_of_three_is_a_fragment_the_discard_can_anchor():
-    # 4p 3p 0p laid, the 4p read 2p (no legal meld as read): the surest two of the run make the fragment
-    from video2tenhou.engine.melds import fragments
+def test_a_misread_run_of_three_is_a_fragment_the_discard_can_anchor() -> None:
+    # 4p 3p 0p laid, the 4p read 2p (no legal meld as read): the surest two of the run
+    # make the fragment
+    """Verify a misread run of three is a fragment the discard can anchor."""
 
-    def g():
+    def g() -> list:
         return [mslot("2p", 0, 0), mslot("3p", 0, 1), mslot("0p", 0, 2)]
 
     seq = [mobs(0, 5, []), mobs(10, 14, g()), mobs(20, 24, g())]
     (f,) = fragments("E", seq, track_melds("E", seq))
-    assert (
-        f.t_first == 10
-        and len(f.ps) == 3
-        and sorted(f.tiles) in (["2p", "3p"], ["3p", "5p"])
-    )
+    assert f.t_first == 10
+    assert len(f.ps) == 3
+    assert sorted(f.tiles) in (["2p", "3p"], ["3p", "5p"])
 
 
 # ---------------------------------------------------------------- dense still runs
 
 
-def _dframe(t, tiles, flicker=None):
-    def box(x, tile):
+def _dframe(
+    t: "float", tiles: "list[str]", flicker: "tuple[int, str] | None" = None
+) -> "dict":
+    def box(x: "int", tile: "str") -> "dict":
         p = np.full(len(CLASSES), 0.001)
         p[CLASS_INDEX[tile]] = 0.95
         return {
@@ -1321,9 +1461,8 @@ def _dframe(t, tiles, flicker=None):
     return {"t": t, "boxes": [box(x, tl) for x, tl in enumerate(tiles)]}
 
 
-def test_still_runs_are_the_frames_whose_reading_holds():
-    from video2tenhou.engine.dense import still_runs
-
+def test_still_runs_are_the_frames_whose_reading_holds() -> None:
+    """Verify still runs are the frames whose reading holds."""
     row = ["1m", "2m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "1z", "1z", "3z", "9m"]
     frames = (
         [
@@ -1333,7 +1472,7 @@ def test_still_runs_are_the_frames_whose_reading_holds():
         + [
             _dframe(11.2 + 0.2 * k, row[: k % 5 + 8]) for k in range(4)
         ]  # moving: no run
-        + [_dframe(12.0 + 0.2 * k, row + ["2z"]) for k in range(5)]
+        + [_dframe(12.0 + 0.2 * k, [*row, "2z"]) for k in range(5)]
     )  # the drawn tile
     runs = still_runs(frames, "hand:TL")
     assert [(r["count"], r["n_used"], r["t0"]) for r in runs] == [
@@ -1342,11 +1481,11 @@ def test_still_runs_are_the_frames_whose_reading_holds():
     ]
 
 
-def test_dense_draws_read_the_hand_before_and_after_the_turn(monkeypatch):
-    from types import SimpleNamespace
-
-    from video2tenhou.engine import dense
-
+def test_dense_draws_read_the_hand_before_and_after_the_turn(
+    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: Path,
+) -> None:
+    """Verify dense draws read the hand before and after the turn."""
     before = [
         "1m",
         "2m",
@@ -1384,12 +1523,12 @@ def test_dense_draws_read_the_hand_before_and_after_the_turn(monkeypatch):
     monkeypatch.setattr(
         dense,
         "dense_reads",
-        lambda *a, **k: {"hand:TL": [f for f in frames if a[5] <= f["t"] <= a[6]]},
+        lambda *a, **_unused_k: {
+            "hand:TL": [f for f in frames if a[1] <= f["t"] <= a[2]]
+        },
     )
     st = [SeatTurn(0, "draw", "6z", 10, 20), SeatTurn(1, "draw", "9m", 40, 50)]
-    model = SimpleNamespace(
-        turns={"S": st}, hand_ev=[], draw_ev=[], dealer="E", tsumo_winner=None
-    )
+    model = HandModel("E", {"S": st}, [])
     turns = [
         Turn(0, "S", "draw", None, 20.0),
         Turn(1, "W", "draw", None, 30.0),
@@ -1402,12 +1541,9 @@ def test_dense_draws_read_the_hand_before_and_after_the_turn(monkeypatch):
         model,
         turns,
         {"S": {}},
-        entry,
-        {},
-        (None, None, None, None),
-        None,
-        0.0,
-        [],
+        context=DenseContext(
+            entry=entry, models=models_stub(), work_dir=tmp_path, t0=0.0, problems=[]
+        ),
     )
     assert got == 1
     assert sorted((e.j, e.subset, e.hidden) for e in model.hand_ev) == [
@@ -1416,12 +1552,12 @@ def test_dense_draws_read_the_hand_before_and_after_the_turn(monkeypatch):
     ]
 
 
-# ---------------------------------------------------------------- the site's han/fu can be wrong
+# ---------------------------------------------------------------- the site's han/fu can
+# be wrong
 
 
-def test_han_fu_that_pay_the_same_differ_only_on_paper():
-    from video2tenhou.engine.scoring import payment
-
+def test_han_fu_that_pay_the_same_differ_only_on_paper() -> None:
+    """Verify han fu that pay the same differ only on paper."""
     # hand 19 of the second VOD: 10/40 against the site's 9/70, a baiman either way
     assert payment(10, 40, dealer=False, tsumo=False) == payment(
         9, 70, dealer=False, tsumo=False
@@ -1434,9 +1570,8 @@ def test_han_fu_that_pay_the_same_differ_only_on_paper():
     )
 
 
-def test_a_site_wrong_fact_replaces_the_sites_han_fu_and_keeps_the_deltas():
-    from video2tenhou.engine.decode import HandDecoder
-
+def test_a_site_wrong_fact_replaces_the_sites_han_fu_and_keeps_the_deltas() -> None:
+    """Verify a site wrong fact replaces the sites han fu and keeps the deltas."""
     entry = {
         "game": 1,
         "kyoku": 3,
@@ -1460,17 +1595,23 @@ def test_a_site_wrong_fact_replaces_the_sites_han_fu_and_keeps_the_deltas():
     deltas = {"EAST": 0, "SOUTH": 17300, "WEST": 0, "NORTH": -16300}
     result = HandResult(3, 1, 1, deltas, "ron", "SOUTH", "NORTH", 9, 70)
     d = HandDecoder(
-        entry, {}, result, facts, time_limit=1.0, models=None, work_dir=None
+        entry,
+        {},
+        result,
+        facts,
+        options=DecodeOptions(time_limit=1.0, models=None, work_dir=None),
     )
     assert (d.result.han, d.result.fu, d.result.deltas) == (
         10,
         40,
         deltas,
-    ) and d.site_han_fu == (9, 70)
+    )
+    assert d.site_han_fu == (9, 70)
     assert any("the site's 9/70 is wrong" in p for p in d.problems)
 
 
-def test_the_log_is_written_with_the_confirmed_han_fu_and_the_sites_deltas():
+def test_the_log_is_written_with_the_confirmed_han_fu_and_the_sites_deltas() -> None:
+    """Verify the log is written with the confirmed han fu and the sites deltas."""
     d = {
         "dealer": "E",
         "haipai": {
@@ -1542,17 +1683,17 @@ def test_the_log_is_written_with_the_confirmed_han_fu_and_the_sites_deltas():
         70,
     )
     k, _ = kyoku_from_decode(d, entry, result)
+    assert isinstance(k.result, Agari)
     (win,) = k.result.wins
-    assert (
-        win.score_text == "倍満16000点"
-        and win.delta == [-16000, 16000, 0, 0]
-        and win.yaku == ["清一色(6飜)", "ドラ(4飜)"]
-    )
+    assert win.score_text == "倍満16000点"
+    assert win.delta == [-16000, 16000, 0, 0]
+    assert win.yaku == ["清一色(6飜)", "ドラ(4飜)"]
 
 
-def test_uncertain_raw_discard_gets_question_without_duplicate_or_fact_override():
-    from video2tenhou.engine.review import uncertain_discards
-
+def test_uncertain_raw_discard_gets_question_without_duplicate_or_fact_override() -> (
+    None
+):
+    """Verify uncertain raw discard gets question without duplicate or fact override."""
     row = {
         "field": "discard",
         "seat": "S",
@@ -1565,8 +1706,10 @@ def test_uncertain_raw_discard_gets_question_without_duplicate_or_fact_override(
         "evidence": [{"region": "pond:BR", "t": 3097.5}],
     }
     items = uncertain_discards([row], [])
-    assert len(items) == 1 and items[0]["kind"] == "discard"
-    assert items[0]["tile"] == "2m" and items[0]["runner_up"] == "1m"
+    assert len(items) == 1
+    assert items[0]["kind"] == "discard"
+    assert items[0]["tile"] == "2m"
+    assert items[0]["runner_up"] == "1m"
     assert items[0]["t"] == 3097.5
     assert not uncertain_discards([row], items)
     assert not uncertain_discards([{**row, "human": True}], [])
@@ -1575,21 +1718,14 @@ def test_uncertain_raw_discard_gets_question_without_duplicate_or_fact_override(
 
 
 @pytest.mark.parametrize("kind", ["discard", "missing_discard"])
-def test_reviewed_discard_remains_fixed_during_repair(kind):
-    from types import SimpleNamespace
-
-    import numpy as np
-
-    from video2tenhou.engine import rules
-    from video2tenhou.engine.decode import HandDecoder
-    from video2tenhou.engine.solver import TI, TILES, HandModel, SeatTurn
-
+def test_reviewed_discard_remains_fixed_during_repair(kind: str) -> None:
+    """Verify reviewed discard remains fixed during repair."""
     turns = {s: [] for s in rules.SEATS}
     p = np.zeros(len(TILES))
     p[TI["1m"]] = 1
     turns["S"] = [SeatTurn(0, "draw", "1m", 0, 10, discard_p=p)]
     model = HandModel("E", turns, [])
-    decoder = SimpleNamespace(
+    decoder = hand_decoder(
         facts={kind: [{"seat": "S", "t": 10, "tile": "1m"}]}, problems=[]
     )
     HandDecoder._apply_hand_facts(decoder, model)
@@ -1618,30 +1754,47 @@ def test_reviewed_discard_remains_fixed_during_repair(kind):
     assert not model.solve(margins=False, workers=1).ok
 
 
-def test_confidence_reports_repaired_model_discard_when_final_solve_has_no_override():
-    from types import SimpleNamespace
-
-    from video2tenhou.engine import rules
-    from video2tenhou.engine.review import confidence_rows
-    from video2tenhou.engine.solver import HandModel, SeatTurn, Solution
-
+def test_confidence_uses_repaired_discard_without_final_override() -> None:
+    """Verify confidence retains a repaired discard after the final solve."""
     turns = {s: [] for s in rules.SEATS}
     turns["S"] = [SeatTurn(0, "draw", "1m", 0, 10)]
     model = HandModel("E", turns, [])
-    slot = SimpleNamespace(tile="2m", conf=0.93)
-    turn = SimpleNamespace(seat="S", t=10, slot=slot, virtual=False)
+    slot = pslot(0, "2m", 10)
+    turn = Turn(0, "S", "draw", slot, 10)
     # The repaired identity is now fixed, so the final solve records no
     # variable-discard override. The original pond reading remains evidence.
     sol = Solution("repaired", 0, {}, {}, {})
     rows = confidence_rows(
-        model, sol, [turn], [], [], {"corner_wind": {"BR": "S"}}, {}, set(), 0
+        model,
+        sol,
+        context=ReviewContext(
+            turns=[turn],
+            calls=[],
+            inds=[],
+            entry={"corner_wind": {"BR": "S"}},
+            facts={},
+            lost_keys=set(),
+            t0=0,
+        ),
     )
     assert len(rows) == 1
-    assert rows[0]["field"] == "discard" and rows[0]["value"] == "1m"
+    assert rows[0]["field"] == "discard"
+    assert rows[0]["value"] == "1m"
     assert not rows[0]["human"]
     assert slot.tile == "2m"
     facts = {"missing_discard": [{"seat": "S", "t": 10, "tile": "1m"}]}
     reviewed = confidence_rows(
-        model, sol, [turn], [], [], {"corner_wind": {"BR": "S"}}, facts, set(), 0
+        model,
+        sol,
+        context=ReviewContext(
+            turns=[turn],
+            calls=[],
+            inds=[],
+            entry={"corner_wind": {"BR": "S"}},
+            facts=facts,
+            lost_keys=set(),
+            t0=0,
+        ),
     )
-    assert reviewed[0]["human"] and reviewed[0]["value"] == "1m"
+    assert reviewed[0]["human"]
+    assert reviewed[0]["value"] == "1m"

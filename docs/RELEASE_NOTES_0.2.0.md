@@ -11,6 +11,13 @@ application, so Node is not needed. See the [quick start](QUICKSTART.md).
 - One browser studio now owns the project library, recording import,
   calibration, analysis, guided review and exports. Projects can be renamed
   and removed without deleting recordings or human answers.
+- The local backend uses Starlette and Uvicorn, with streamed uploads and
+  exports, bounded request bodies, same-origin checks and coordinated shutdown.
+- Command progress uses Python logging on stderr; JSON reports remain on stdout
+  for scripts. Library imports do not install console handlers.
+- LibreYOLO inference uses public APIs throughout. CUDA graphs are released
+  before input dimensions change; the updated graph policy invalidates earlier
+  graph-enabled recognition caches and may increase mixed-shape processing time.
 - Guided review prioritizes questions across hands, saves answers immediately
   and rebuilds affected hands in the background. Advanced review provides the
   hand inspector, saved facts and training labels.
@@ -45,7 +52,8 @@ frontend before serving or packaging; see [frontend development](../frontend/REA
 ## Preparation status
 
 This release is prepared locally and is not yet approved for publication.
-The mandatory Python Ruff and ty gates expose a repository-wide diagnostic
-backlog. They remain enabled and must pass before tagging or publishing 0.2.0.
+The Python lint, formatting and strict type checks pass. Approved subprocess
+and lazy-import exceptions are scoped to individual lines; the other approved
+test and training exceptions are documented in the maintenance guide.
 The release checklist's fresh-machine CPU/GPU launcher checks and a representative
 full-recording comparison also remain required. See [release preparation](RELEASING.md).

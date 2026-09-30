@@ -1,3 +1,6 @@
+# Copyright 2026 video2tenhou contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared source provenance for pixel-derived caches."""
 
 from __future__ import annotations
