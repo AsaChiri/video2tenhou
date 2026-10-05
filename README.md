@@ -7,7 +7,7 @@ Analysis runs locally. The included layout supports Pacific Mahjong League
 
 ## Start
 
-1. Download **video2tenhou-0.2.0-starter.zip** from the
+1. Download **video2tenhou-0.3.0-starter.zip** from the
    [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
    It includes the application, PML layout and trained models.
 2. Follow the [one-time setup](docs/QUICKSTART.md#one-time-setup) to install

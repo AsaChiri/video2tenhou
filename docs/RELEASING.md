@@ -30,7 +30,7 @@ section for the GitHub release notes; do not commit separate per-version notes.
    distribution:
 
    ```console
-   uv run python tools/package_release.py starter --source dist/video2tenhou-0.2.0.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.2.0-starter.zip
+   uv run python tools/package_release.py starter --source dist/video2tenhou-0.3.0.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.3.0-starter.zip
    ```
 
    Use the matching version in the filenames. The starter contains the application,

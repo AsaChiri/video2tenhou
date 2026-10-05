@@ -1,6 +1,6 @@
 # PML quick start
 
-Download **video2tenhou-0.2.0-starter.zip** from the
+Download **video2tenhou-0.3.0-starter.zip** from the
 [latest release](https://github.com/AsaChiri/video2tenhou/releases/latest).
 The starter includes the application, PML layout and trained models.
 
@@ -238,7 +238,7 @@ automatic runtime selection. For advanced runtime choices, see
 
 The starter already contains the required models. Source users can download
 **video2tenhou-pml-models.zip** and **video2tenhou-pml-models.sha256** from the
-[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.2.0),
+[same release as their source](https://github.com/AsaChiri/video2tenhou/releases/tag/v0.3.0),
 or [train their own models](MAINTENANCE.md#training).
 
 With both downloaded files in the application folder, verify and extract them:

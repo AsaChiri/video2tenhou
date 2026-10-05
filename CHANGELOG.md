@@ -4,6 +4,18 @@ Changes are recorded here for every release, newest first.
 
 ## Unreleased
 
+## 0.3.0 — 2026-10-05
+
+Download **video2tenhou-0.3.0-starter.zip**, extract it into a writable folder,
+and run **Start.cmd** on Windows or `sh start.sh` on Linux/macOS. Install uv
+and FFmpeg first; the first launch installs Python and a compatible PyTorch
+runtime, and later launches start without network access. The starter includes
+the trained models and compiled browser application, so Node is not needed. See
+the [quick start](docs/QUICKSTART.md).
+
+Conversion is several times faster, every reconstructed tile decision is
+checked, and the studio shows reviewers only what they can act on.
+
 ### Changes
 
 - Recordings are hashed once. `work/source-digests.json` keeps each recording's
@@ -107,6 +119,56 @@ because their bindings changed.
 Opening Review on an analyzed project starts an update of its hands, since
 earlier exports lack `export-inputs.json` and decodes by older decoder versions
 are not shown. Saved `note` answers stay in the journal.
+
+### Performance
+
+A 72-minute PML recording (one hanchan, 10 hands) was converted from empty
+caches with the same calibration and saved answers by 0.2.0 and 0.3.0, one after
+the other with no other conversion running, on Windows 11 with an Intel Core
+i9-13900KF, an NVIDIA RTX 4090 (driver 591.86), PyTorch 2.6.0+cu124, LibreYOLO
+1.5.0 and OR-Tools 9.15, using detector weights `ee2e1f99…ebc28` and classifier
+weights `32bd602b…321ce`:
+
+| Stage | 0.2.0 | 0.3.0 |
+|---|---:|---:|
+| Geometry check | 43 s | 28 s |
+| Table timing, including calm scoring | 487 s | 221 s |
+| Tile reading | 3,825 s | 194 s |
+| Voting | 5 s | 5 s |
+| Reconstruction | 319 s | 262 s |
+| **Complete conversion** | **4,680 s** | **715 s** |
+
+Of the recording's 510 draws, 0.3.0 certified 490 and reported 20 as close
+alternatives; 0.2.0 certified 55 and left 455 unchecked. 0.3.0 reread 1,739 s of
+video closely, against 82 s. Both versions exported every hand with a legal
+replay and the site's scores. They chose different tiles for 22 draws and one
+starting hand; neither choice was compared with independent human annotations.
+
+### Validation
+
+- 730 Python tests pass with 86% coverage on the locked PyTorch 2.14.0+cpu;
+  without local reference data, the two tests that need it skip. Ruff, ty and
+  the frontend format, lint, type and build checks pass, as do 68 frontend unit
+  tests and 9 browser tests in Microsoft Edge.
+- Detector boxes and confidences, classifier posteriors, crops and structured
+  readings are bit-identical to 0.2.0 on 2,193 recorded calls covering all 12
+  regions and 10 input shapes on the RTX 4090; recognition identities are
+  unchanged.
+- The staged decoder reproduces the previous decoder's reconstructions exactly
+  when given the same recorded solver answers (28 hand artifacts). Grouped
+  certification agrees with a reference that searched each decision separately
+  until it was decided, on the two adjudicated reference hands.
+- An extracted starter passed a first setup, an offline relaunch and an
+  `--update` launch on the RTX 4090 workstation (PyTorch 2.8.0+cu129 selected)
+  and with `VIDEO2TENHOU_DEVICE=cpu` (PyTorch 2.14.1+cpu, with detector and
+  classifier inference on recorded frames); every launch served the studio.
+- The starter's installed runtime converted the 72-minute recording: every hand
+  was exported with a legal replay and the site's scores, with the same seven
+  questions and certification results as the source run and 2 of 510 draws
+  chosen differently.
+- Not repeated for this release: launcher qualification on a separate CPU-only
+  machine, a fresh machine without uv's download cache and Linux or macOS, and a
+  full-recording comparison against independent human annotations.
 
 ## 0.2.0 — 2026-09-30
 
