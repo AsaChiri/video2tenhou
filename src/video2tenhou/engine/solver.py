@@ -4,22 +4,22 @@
 """Haipai and draw reconstruction as a constraint program (OR-Tools CP-SAT).
 
 Variables: h0[s, k] haipai counts (13 per seat, 14 for the dealer), d[s, j, k]
-one draw per draw turn. The hand after turn j is a linear expression of
-those. Constraints are the rules of docs/DESIGN.md section 1; evidence enters
-as costs (direct draw observations, calm 13-tile states, 14-tile states, and
-rows that show part of the hand: a tile seen is in it). A pond reading is
-evidence too: in repair mode every discard is a choice over all kinds, costed
-by its posterior, so the cheapest re-reading that makes the hand legal is found
-(a discard a call took is read by the meld camera as well and stays).
+one draw per draw turn, and h[s, j, k] the concealed counts after turn j (the
+previous state plus the turn's acquisitions, less what left the hand).
+Constraints are the rules of docs/DESIGN.md section 1; evidence enters as costs
+(direct draw observations, calm 13-tile states, 14-tile states, and rows that
+show part of the hand: a tile seen is in it). A pond reading is evidence too: in
+repair mode every discard is a choice over all kinds, costed by its posterior,
+so the cheapest re-reading that makes the hand legal is found (a discard a call
+took is read by the meld camera as well and stays). Certification bounds the
+cost increase of changing each decision of a solution.
 """
 
 from __future__ import annotations
 
-import hashlib
 import math
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
@@ -27,10 +27,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 from ortools.sat.python import cp_model
 
-from video2tenhou.train.data import CLASS_INDEX, CLASSES
+from video2tenhou.perception.tiles import CLASS_INDEX, CLASSES
 
 from . import rules
-from .confidence import MARGIN_REVIEW, MARGIN_TOLERANCE
+from .confidence import FIXED, MARGIN_REVIEW, MARGIN_TOLERANCE, Certificate
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -53,12 +53,14 @@ REPAIR_COST = 6.0
 # a 14-tile row names its drawn tile only if the rest differs from the 13 by at most
 # this
 MATCH_SLACK = 2
-MARGIN_THREADS = (
-    4  # margin re-solves at once (CP-SAT releases the GIL; each keeps its own workers)
-)
+# the inclusive review threshold on a cost increase
+REVIEW_GAP = MARGIN_REVIEW + MARGIN_TOLERANCE
 
+type TurnKey = tuple[str, int]  # (seat, j): the seat's turn j
+# (field, seat, turn): a draw, a variable discard or a starting hand (turn -1)
+type Decision = tuple[str, str, int]
 type StartingVariables = dict[str, list[cp_model.IntVar]]
-type DrawVariables = dict[tuple[str, int], list[cp_model.IntVar]]
+type DrawVariables = dict[TurnKey, list[cp_model.IntVar]]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -67,37 +69,6 @@ class HandRole:
 
     dealer: bool
     wins_by_tsumo: bool = False
-
-
-class ReconstructionModel(cp_model.CpModel):
-    """Constraint model retaining the insertion point for draw alternatives."""
-
-    draw_forbid_index: int = 0
-
-
-type Baseline = tuple[ReconstructionModel, StartingVariables, DrawVariables]
-
-
-@dataclass(frozen=True, kw_only=True)
-class ResolveOptions:
-    """Decision exclusion, watched evidence and stopping policy for one search."""
-
-    watch: tuple[str, int] | None = None
-    baseline: Baseline | None = None
-    forbid_variable: cp_model.IntVar | int | None = None
-    watch_variables: dict[int, cp_model.IntVar | int] | None = None
-    stop_when_certified: bool = True
-    deadline: float | None = None
-    forbid: tuple[str, int, str] | None = None
-    forbid_haipai: tuple[str, list[str]] | None = None
-
-
-@dataclass(frozen=True)
-class SearchProof:
-    """Reference objective and the certified lower bound in CP-SAT units."""
-
-    reference_cost: float
-    lower_bound: float
 
 
 def posterior_to_tiles(p: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -116,31 +87,21 @@ class SeatTurn:
     discard: str | None  # tile kind, None when the hand ended without a discard
     t_pre: float  # start of the disturbed window in which the turn happened
     t_discard: float  # when the discard was first seen
-    removed: list[str] = field(
-        default_factory=list
-    )  # tiles that left the hand into a meld this turn
+    # tiles that left the hand into a meld this turn
+    removed: list[str] = field(default_factory=list)
     riichi: bool = False
-    discard_p: np.ndarray | None = (
-        # 37-kind posterior of the discard: the solver may take the 2nd choice at a cost
-        None
-    )
+    # 37-kind posterior of the discard: the solver may take the 2nd choice at a cost
+    discard_p: np.ndarray | None = None
     kan: str | None = None  # ankan | kakan | daiminkan when this turn contains a kan
-    kan_tile: str | None = (
-        None  # the kan's tile kind, None when unknown (the solver chooses it)
-    )
-    two_draws: bool = (
-        False  # ankan / kakan: a normal draw, the kan, then the rinshan draw
-    )
-    meld_options: list = field(
-        default_factory=list
-    )  # [(tiles from the hand, cost)]: the call's tiles are a choice
+    kan_tile: str | None = None  # the kan's tile kind, None when the solver chooses it
+    two_draws: bool = False  # ankan / kakan: a normal draw, the kan, the rinshan draw
+    # [(tiles from the hand, cost)]: the call's tiles are a choice
+    meld_options: list = field(default_factory=list)
     # a call took this discard: the meld camera read it too, so it is never re-read
     taken: bool = False
-    t_draw_min: float | None = (
-        # earliest possible draw: preceding player's last pond view without their
-        # discard
-        None
-    )
+    # earliest possible draw: the preceding player's last pond view without their
+    # discard
+    t_draw_min: float | None = None
 
 
 @dataclass
@@ -164,9 +125,8 @@ class HandEvidence:
     subset: bool = False
     # a calm row between turns short of the hand by this many: at most these beyond it
     hidden: int = 0
-    slots: list[np.ndarray] | None = (
-        None  # per-box alternatives; partial views must not count one box twice
-    )
+    # per-box alternatives; partial views must not count one box twice
+    slots: list[np.ndarray] | None = None
 
 
 @dataclass
@@ -183,74 +143,46 @@ class DrawEvidence:
 class Facts:
     """Human-confirmed constraints that cannot be traded for lower cost."""
 
-    haipai: dict = field(default_factory=dict)  # seat -> list of tiles
-    draws: dict = field(default_factory=dict)  # (seat, j) -> tile
-    final: dict = field(
-        default_factory=dict
-    )  # seat -> list of tiles (concealed at the end)
-    final_excl: dict = field(
-        default_factory=dict
-    )  # seat -> True when `final` excludes the winning draw (tsumo winner)
+    haipai: dict[str, list[str]] = field(default_factory=dict)
+    draws: dict[TurnKey, str] = field(default_factory=dict)
+    # seat -> concealed tiles at the end
+    final: dict[str, list[str]] = field(default_factory=dict)
+    # seat -> True when `final` excludes the winning draw (tsumo winner)
+    final_excl: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass
 class Solution:
-    """A reconstruction and alternatives; check ``ok`` before reading tiles.
+    """A reconstruction; check ``ok`` before reading tiles.
 
-    Margins certify objective separation, not visual accuracy or probability. Candidate
-    ``alternative_gaps`` establish ambiguity when close enough, but never certify a
-    choice when far away. None means no candidate was found. ``optimal`` preserves
-    search status even when repair changes ``status``.
+    ``HandModel.certify`` fills ``certificates``: objective separation, not visual
+    accuracy or probability. ``optimal`` preserves the search status even when
+    repair changes ``status``.
     """
 
     status: str
     objective: float
-    haipai: dict  # seat -> list of tiles
-    draws: dict  # (seat, j) -> tile or None
-    hands: dict  # (seat, j) -> list of tiles after turn j
-    margins: dict = field(
-        default_factory=dict
-    )  # (seat, j) -> certified lower bound on the excluded-draw cost gap
-    discards: dict = field(
-        default_factory=dict
-    )  # (seat, j) -> tile chosen when the pond identity was a choice
-    draws2: dict = field(
-        default_factory=dict
-    )  # (seat, j) -> rinshan draw of a self-kan turn
-    kans: dict = field(
-        default_factory=dict
-    )  # (seat, j) -> kan tile chosen when it was unknown
-    kan_added: dict = field(
-        default_factory=dict
-    )  # (seat, j) -> the five (plain or red) a kakan of fives added
-    runner_up: dict = field(
-        default_factory=dict
-    )  # (seat, j) -> a candidate draw with the preferred choice forbidden
-    haipai_margins: dict = field(
-        default_factory=dict
-    )  # seat -> certified lower bound when this exact haipai is forbidden
-    melds: dict = field(
-        default_factory=dict
-    )  # (seat, j) -> index of the meld option the solver chose
-    model_fingerprint: str | None = (
-        None  # exact constraints/objective for safe in-memory margin reuse
-    )
-    optimal: bool | None = (
-        None  # remains meaningful when status is later changed to repaired
-    )
-    confidence_seconds: float = 0.0
-    draw_sources: dict = field(
-        default_factory=dict
-    )  # draws determined by a discard or ankan
-    alternative_gaps: dict = field(
-        default_factory=dict
-    )  # feasible candidate gap, None when no candidate was found
-    haipai_alternative_gaps: dict = field(default_factory=dict)
-    discard_alternative_gaps: dict = field(default_factory=dict)
-    discard_margins: dict = field(
-        default_factory=dict
-    )  # variable pond identities need certification even when unchanged
-    discard_runner_up: dict = field(default_factory=dict)
+    haipai: dict[str, list[str]]
+    draws: dict[TurnKey, str]
+    # concealed tiles after each turn (j = -1: the starting hand)
+    hands: dict[TurnKey, list[str]]
+    # pond identities the reconstruction reads as another kind
+    discards: dict[TurnKey, str] = field(default_factory=dict)
+    # rinshan draws of self-kan turns
+    draws2: dict[TurnKey, str] = field(default_factory=dict)
+    # kan tiles no camera named, chosen by the solver
+    kans: dict[TurnKey, str] = field(default_factory=dict)
+    # the five (plain or red) a kakan of fives added
+    kan_added: dict[TurnKey, str] = field(default_factory=dict)
+    # the index of the meld composition chosen for each call turn
+    melds: dict[TurnKey, int] = field(default_factory=dict)
+    # draws the rules derive after riichi from the turn's discard or ankan
+    draw_sources: dict[TurnKey, str] = field(default_factory=dict)
+    optimal: bool | None = None
+    certificates: dict[Decision, Certificate] = field(default_factory=dict)
+    certified: bool = False
+    # the program this solution was found in; certification searches it
+    program: Program | None = field(default=None, repr=False, compare=False)
 
     @property
     def ok(self) -> bool:
@@ -259,34 +191,52 @@ class Solution:
 
 
 @dataclass
-class BuildVariables:
-    """Per-build variables and objective terms; never shared between solves."""
+class Program:
+    """One CP-SAT model of the hand and the variables that carry its decisions."""
 
-    model: ReconstructionModel = field(default_factory=ReconstructionModel)
+    model: cp_model.CpModel = field(default_factory=cp_model.CpModel)
     starting: StartingVariables = field(default_factory=dict)
     draws: DrawVariables = field(default_factory=dict)
     rinshan: DrawVariables = field(default_factory=dict)
     kan_choices: DrawVariables = field(default_factory=dict)
-    red_kan_choices: dict[tuple[str, int], cp_model.IntVar] = field(
+    red_kan_choices: dict[TurnKey, cp_model.IntVar] = field(default_factory=dict)
+    # pond identity per turn: a fixed identity maps its kind to the constant 1
+    discards: dict[TurnKey, dict[int, cp_model.IntVar | int]] = field(
         default_factory=dict
     )
-    discards: dict[tuple[str, int], dict[int, cp_model.IntVar | int]] = field(
-        default_factory=dict
-    )
-    discard_costs: list[cp_model.LinearExpr | int] = field(default_factory=list)
-    hands: dict[tuple[str, int], list[cp_model.LinearExpr]] = field(
-        default_factory=dict
-    )
+    hands: dict[TurnKey, list[cp_model.LinearExpr]] = field(default_factory=dict)
     meld_choices: DrawVariables = field(default_factory=dict)
+    # objective terms: evidence costs, then pond and meld choice costs
     terms: list[cp_model.LinearExpr | int] = field(default_factory=list)
+    discard_costs: list[cp_model.LinearExpr | int] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class ConfidenceBudget:
-    """CPU allocation and total seconds shared by alternative checks."""
+@dataclass(frozen=True, eq=False)
+class _OpenDecision:
+    """A decision certification has yet to separate from its alternatives."""
 
-    workers: int
-    seconds: float
+    key: Decision
+    variables: list[cp_model.IntVar]
+    chosen: list[int]  # the variables' values in the solution
+    differs: cp_model.LiteralT  # only a reconstruction that changes it can be true
+    tiles: list[str] | None = None  # each one-hot variable's tile; None for counts
+
+    def changed_in(self, search: cp_model.CpSolver) -> bool:
+        """Whether the search's reconstruction changes this decision."""
+        return any(
+            search.value(v) != c
+            for v, c in zip(self.variables, self.chosen, strict=True)
+        )
+
+    def value_in(self, search: cp_model.CpSolver) -> str | None:
+        """Return the decision's tile in the search's reconstruction."""
+        if self.tiles is None:
+            return None
+        return next(
+            t
+            for t, v in zip(self.tiles, self.variables, strict=True)
+            if search.value(v)
+        )
 
 
 class HandModel:
@@ -295,7 +245,6 @@ class HandModel:
     Add observations and normalized facts before solving. Counts distinguish
     red fives; meld removals and the dealer's starting fourteenth tile are
     represented explicitly rather than repaired during export.
-    Concurrent ``solve`` calls on the same mutable instance are unsupported.
     """
 
     def __init__(
@@ -310,30 +259,24 @@ class HandModel:
         self.dealer = dealer
         self.turns = turns
         self.indicators = indicators
-        self.ura = list(
-            ura or []
-        )  # ura indicators: revealed tiles too, they count against the four
+        # revealed ura indicators count against the four copies too
+        self.ura = list(ura or [])
         self.tsumo_winner = tsumo_winner
         self.hand_ev: list[HandEvidence] = []
         self.draw_ev: list[DrawEvidence] = []
         self.facts = Facts()
-        self.repair = (
-            False  # every discard a choice over all kinds (DESIGN.md 4.8 Repair)
-        )
-        self.forbidden_hands: list[
-            tuple[str, int, list[str]]
-        ] = []  # (seat, j, tiles): hands the next-best solve must avoid
-        self.bound_hands: list[
-            tuple[str, int, list[str]]
-        ] = []  # (seat, j, tiles): hands the site's score requires
+        # every discard a choice over all kinds (DESIGN.md 4.8 Repair)
+        self.repair = False
+        # (seat, j, tiles): hands the next-best solve must avoid
+        self.forbidden_hands: list[tuple[str, int, list[str]]] = []
+        # (seat, j, tiles): hands the site's score requires
+        self.bound_hands: list[tuple[str, int, list[str]]] = []
         # the site's result as a constraint (4.8 "The result as a constraint")
         self.win: WinSpec | None = None
-        self.tenpai: list[
-            tuple[str, int, int]
-        ] = []  # (seat, state j, sets needed) of the seats tenpai at a draw
-        self.result_constraints = (
-            True  # diagnose turns them off to see whether they are what fails
-        )
+        # (seat, state j, sets needed) of the seats tenpai at a draw
+        self.tenpai: list[tuple[str, int, int]] = []
+        # diagnose turns them off to see whether they are what fails
+        self.result_constraints = True
 
     # -- building ------------------------------------------------------------------
     def draw_turns(self, seat: str) -> list[int]:
@@ -343,46 +286,32 @@ class HandModel:
             out.append(len(self.turns[seat]))  # the winning draw, no discard after it
         return out
 
-    def build(
-        self,
-        forbid: tuple[str, int, str] | None = None,
-        forbid_haipai: tuple[str, list[str]] | None = None,
-    ) -> tuple[ReconstructionModel, StartingVariables, DrawVariables, dict]:
-        """Build a fresh model and return its starting-hand, draw, and state variables.
-
-        Optional exclusions support alternative-cost measurement. Solver variable
-        maps are replaced on this instance; margin workers retain their own
-        variable maps and operate on independent models.
-        """
-        state = BuildVariables()
-        state.starting = {
-            s: [state.model.new_int_var(0, 4, f"h0_{s}_{k}") for k in range(NT)]
+    def build(self) -> Program:
+        """Build a fresh CP-SAT model of the current evidence, rules and facts."""
+        program = Program()
+        program.starting = {
+            s: [program.model.new_int_var(0, 4, f"h0_{s}_{k}") for k in range(NT)]
             for s in rules.SEATS
         }
-        self._add_draw_variables(state)
-        self._add_discard_variables(state)
-        self._add_hand_states(state)
-        self._add_inventory_limits(state)
-        self._add_reviewed_facts(state)
-        self._add_exclusions(state, forbid=forbid, forbid_haipai=forbid_haipai)
-        self._add_hand_costs(state)
-        self._add_draw_costs(state)
-        state.terms += state.discard_costs
-        state.model.minimize(sum(state.terms) if state.terms else 0)
-        self._x = state.discards
-        self._d2 = state.rinshan
-        self._y = state.kan_choices
-        self._vr = state.red_kan_choices
-        self._mo = state.meld_choices
-        return state.model, state.starting, state.draws, state.hands
+        self._add_draw_variables(program)
+        self._add_discard_variables(program)
+        self._add_hand_states(program)
+        self._add_inventory_limits(program)
+        self._add_reviewed_facts(program)
+        self._add_exclusions(program)
+        self._add_hand_costs(program)
+        self._add_draw_costs(program)
+        program.terms += program.discard_costs
+        program.model.minimize(sum(program.terms) if program.terms else 0)
+        return program
 
-    def _add_draw_variables(self, state: BuildVariables) -> None:
+    def _add_draw_variables(self, program: Program) -> None:
         """Create each draw and kan choice, then constrain starting sizes."""
-        m = state.model
-        h0 = state.starting
-        d = state.draws
-        d2 = state.rinshan
-        y = state.kan_choices
+        m = program.model
+        h0 = program.starting
+        d = program.draws
+        d2 = program.rinshan
+        y = program.kan_choices
         for s in rules.SEATS:
             for j in self.draw_turns(s):
                 d[(s, j)] = [m.new_bool_var(f"d_{s}_{j}_{k}") for k in range(NT)]
@@ -402,11 +331,11 @@ class HandModel:
         for s in rules.SEATS:
             m.add(sum(h0[s]) == (14 if s == self.dealer else 13))
 
-    def _add_discard_variables(self, state: BuildVariables) -> None:
+    def _add_discard_variables(self, program: Program) -> None:
         """Fix pond identities or add evidence-weighted discard alternatives."""
-        m = state.model
-        x = state.discards
-        disc_cost = state.discard_costs
+        m = program.model
+        x = program.discards
+        disc_cost = program.discard_costs
         for s in rules.SEATS:
             for t in self.turns[s]:
                 if t.discard is None or t.discard not in TI:
@@ -450,41 +379,49 @@ class HandModel:
                         continue
                 x[(s, t.j)] = {TI[t.discard]: 1}
 
-    def _add_hand_states(self, state: BuildVariables) -> None:
-        """Track chronological hand states and apply the authoritative result."""
+    def _add_hand_states(self, program: Program) -> None:
+        """Name each concealed state after a turn and apply the authoritative result.
+
+        A state variable keeps every later constraint short: the alternative is
+        one expression of the starting hand and every acquisition so far,
+        expanded again in each evidence term. The domain 0..4 is implied by the
+        inventory limits.
+        """
+        m = program.model
         for s in rules.SEATS:
-            expr: list[cp_model.LinearExpr] = list(state.starting[s])
-            state.hands[(s, -1)] = list(expr)
+            expr: list[cp_model.LinearExpr] = list(program.starting[s])
+            program.hands[(s, -1)] = list(expr)
             riichi_on = False
             for t in self.turns[s]:
-                self._remove_called_tiles(state, s, t, expr)
-                expr = self._take_draw(state, s, t, expr, riichi_on=riichi_on)
-                expr = self._take_kan(state, s, t, expr, riichi_on=riichi_on)
-                for k, v in state.discards.get((s, t.j), {}).items():
+                self._remove_called_tiles(program, s, t, expr)
+                expr = self._take_draw(program, s, t, expr, riichi_on=riichi_on)
+                expr = self._take_kan(program, s, t, expr, riichi_on=riichi_on)
+                for k, v in program.discards.get((s, t.j), {}).items():
                     expr[k] = expr[k] - v
+                state = [m.new_int_var(0, 4, f"h_{s}_{t.j}_{k}") for k in range(NT)]
                 for k in range(NT):
-                    state.model.add(expr[k] >= 0)
-                state.hands[(s, t.j)] = list(expr)
-                if t.riichi:
-                    riichi_on = True
+                    m.add(state[k] == expr[k])
+                expr = list(state)
+                program.hands[(s, t.j)] = list(expr)
+                riichi_on = riichi_on or t.riichi
             if self.tsumo_winner == s:
                 jw = len(self.turns[s])
-                expr = [expr[k] + state.draws[(s, jw)][k] for k in range(NT)]
-                state.hands[(s, jw)] = list(expr)
+                expr = [expr[k] + program.draws[(s, jw)][k] for k in range(NT)]
+                program.hands[(s, jw)] = list(expr)
         if self.result_constraints:
-            self._result_constraints(state.model, state.hands, state.discards)
+            self._result_constraints(m, program.hands, program.discards)
 
     def _remove_called_tiles(
         self,
-        state: BuildVariables,
+        program: Program,
         s: str,
         t: SeatTurn,
         expr: list[cp_model.LinearExpr],
     ) -> None:
         """Require the chosen call composition to exist before its draw."""
-        m = state.model
-        mo = state.meld_choices
-        disc_cost = state.discard_costs
+        m = program.model
+        mo = program.meld_choices
+        disc_cost = program.discard_costs
         # tiles that went into a chi / pon / daiminkan left the hand before any
         # draw of this turn
         # (a daiminkan is followed by its rinshan draw): they must have been in
@@ -512,7 +449,7 @@ class HandModel:
 
     def _take_draw(
         self,
-        state: BuildVariables,
+        program: Program,
         s: str,
         t: SeatTurn,
         expr: list[cp_model.LinearExpr],
@@ -520,22 +457,21 @@ class HandModel:
         riichi_on: bool,
     ) -> list[cp_model.LinearExpr]:
         """Add a draw and enforce the frozen hand after riichi."""
-        m = state.model
-        d = state.draws
-        y = state.kan_choices
-        xs = state.discards.get((s, t.j), {})
+        m = program.model
+        d = program.draws
+        y = program.kan_choices
+        xs = program.discards.get((s, t.j), {})
         if (s, t.j) in d:
             expr = [expr[k] + d[(s, t.j)][k] for k in range(NT)]
-            if (
-                riichi_on and xs and not t.two_draws
-            ):  # after riichi every draw is discarded at once
+            if riichi_on and xs and not t.two_draws:
+                # after riichi every draw is discarded at once
                 for k in range(NT):
                     m.add(d[(s, t.j)][k] == xs.get(k, 0))
             elif riichi_on and t.two_draws:
                 # after riichi a concealed kan is only of the tile just drawn
                 # (the hand is frozen)
                 if t.kan_tile in TI:
-                    red = {"5m": "0m", "5p": "0p", "5s": "0s"}.get(t.kan_tile)
+                    red = rules.RED_OF.get(t.kan_tile)
                     m.add(
                         d[(s, t.j)][TI[t.kan_tile]]
                         + (d[(s, t.j)][TI[red]] if red else 0)
@@ -548,17 +484,17 @@ class HandModel:
 
     def _remove_kan_tiles(
         self,
-        state: BuildVariables,
+        program: Program,
         s: str,
         t: SeatTurn,
         expr: list[cp_model.LinearExpr],
     ) -> None:
         """Account for known or chosen kan tiles, including the red five."""
-        m = state.model
-        y = state.kan_choices
-        vr = state.red_kan_choices
+        m = program.model
+        y = program.kan_choices
+        vr = program.red_kan_choices
         n_out = 4 if t.kan == "ankan" else 1
-        red = {"5m": "0m", "5p": "0p", "5s": "0s"}.get(t.kan_tile or "")
+        red = rules.RED_OF.get(t.kan_tile or "")
         if t.kan_tile is not None and t.kan_tile in TI and red and t.kan == "ankan":
             # a concealed kan of fives is all four fives: three plain and
             # the red one
@@ -575,16 +511,13 @@ class HandModel:
         elif (s, t.j) in y:
             for k in range(NT):
                 if TILES[k] in ("5m", "5p", "5s", "0m", "0p", "0s"):
-                    m.add(
-                        y[(s, t.j)][k] == 0
-                        # a kan of fives is named by the meld camera, never
-                        # guessed
-                    )
+                    # a kan of fives is named by the meld camera, never guessed
+                    m.add(y[(s, t.j)][k] == 0)
                 expr[k] = expr[k] - n_out * y[(s, t.j)][k]
 
     def _take_kan(
         self,
-        state: BuildVariables,
+        program: Program,
         s: str,
         t: SeatTurn,
         expr: list[cp_model.LinearExpr],
@@ -592,30 +525,27 @@ class HandModel:
         riichi_on: bool,
     ) -> list[cp_model.LinearExpr]:
         """Require kan tiles before adding the replacement draw."""
-        m = state.model
-        d2 = state.rinshan
-        xs = state.discards.get((s, t.j), {})
+        m = program.model
+        d2 = program.rinshan
+        xs = program.discards.get((s, t.j), {})
         if t.kan in ("ankan", "kakan"):
-            self._remove_kan_tiles(state, s, t, expr)
+            self._remove_kan_tiles(program, s, t, expr)
+            # the kan tiles must be in the hand before the rinshan draw
             for k in range(NT):
-                m.add(
-                    expr[k] >= 0
-                )  # the kan tiles must be in the hand before the rinshan draw
+                m.add(expr[k] >= 0)
             if (s, t.j) in d2:
                 expr = [expr[k] + d2[(s, t.j)][k] for k in range(NT)]
-                if (
-                    riichi_on and xs
-                ):  # after riichi the rinshan draw is discarded at once
+                if riichi_on and xs:  # after riichi the rinshan draw is discarded
                     for k in range(NT):
                         m.add(d2[(s, t.j)][k] == xs.get(k, 0))
         return expr
 
-    def _add_inventory_limits(self, state: BuildVariables) -> None:
+    def _add_inventory_limits(self, program: Program) -> None:
         """Count every starting tile, acquisition and revealed indicator together."""
-        m = state.model
-        h0 = state.starting
-        d = state.draws
-        d2 = state.rinshan
+        m = program.model
+        h0 = program.starting
+        d = program.draws
+        d2 = program.rinshan
         ind = np.zeros(NT, int)
         for t in self.indicators + self.ura:
             if t in TI:
@@ -629,12 +559,12 @@ class HandModel:
             )
             m.add(total <= rules.max_count(TILES[k]))
 
-    def _add_reviewed_facts(self, state: BuildVariables) -> None:
+    def _add_reviewed_facts(self, program: Program) -> None:
         """Constrain confirmed starting hands, draws and final hand states."""
-        m = state.model
-        h0 = state.starting
-        d = state.draws
-        hands = state.hands
+        m = program.model
+        h0 = program.starting
+        d = program.draws
+        hands = program.hands
         for s, tiles in self.facts.haipai.items():
             for k in range(NT):
                 m.add(h0[s][k] == sum(1 for t in tiles if t == TILES[k]))
@@ -653,27 +583,10 @@ class HandModel:
                 for k in range(NT):
                     m.add(hands[(s, last)][k] == sum(1 for t in tiles if t == TILES[k]))
 
-    def _add_exclusions(
-        self,
-        state: BuildVariables,
-        *,
-        forbid: tuple[str, int, str] | None,
-        forbid_haipai: tuple[str, list[str]] | None,
-    ) -> None:
-        """Keep alternative constraints at the recorded cloning insertion point."""
-        m = state.model
-        h0 = state.starting
-        d = state.draws
-        hands = state.hands
-        m.draw_forbid_index = len(m.proto.constraints)
-        if forbid is not None:
-            s, j, tile = forbid
-            if (s, j) in d:
-                m.add(d[(s, j)][TI[tile]] == 0)
-        if forbid_haipai is not None:
-            _differs(
-                m, h0[forbid_haipai[0]], forbid_haipai[1], f"h0_{forbid_haipai[0]}"
-            )
+    def _add_exclusions(self, program: Program) -> None:
+        """Forbid the hands a next-best search avoids; bind the site-required ones."""
+        m = program.model
+        hands = program.hands
         for n_, (s, j, tiles) in enumerate(self.forbidden_hands):
             if (s, j) in hands:
                 _differs(m, hands[(s, j)], tiles, f"nb{n_}")
@@ -682,12 +595,12 @@ class HandModel:
                 for k in range(NT):
                     m.add(hands[(s, j)][k] == sum(1 for t in tiles if t == TILES[k]))
 
-    def _add_hand_costs(self, state: BuildVariables) -> None:
+    def _add_hand_costs(self, program: Program) -> None:
         """Penalize differences between visible rows and reconstructed hand states."""
-        m = state.model
-        d = state.draws
-        hands = state.hands
-        terms = state.terms
+        m = program.model
+        d = program.draws
+        hands = program.hands
+        terms = program.terms
         for ev in self.hand_ev:
             key = (ev.seat, ev.j)
             if key not in hands:
@@ -708,30 +621,28 @@ class HandModel:
                     )
                 )
                 continue
-            self._add_row_deviations(state, ev, expr, w)
+            self._add_row_deviations(program, ev, expr, w)
 
     def _add_row_deviations(
         self,
-        state: BuildVariables,
+        program: Program,
         ev: HandEvidence,
         expr: list[cp_model.LinearExpr],
         w: int,
     ) -> None:
         """Penalize visible row differences and any excess beyond hidden tiles."""
-        m = state.model
-        terms = state.terms
+        m = program.model
+        terms = program.terms
         for k in range(NT):
             target = round(ev.e[k] * SCALE)
             if ev.subset and target <= 0:
                 continue
             dev = m.new_int_var(0, 20 * SCALE, f"dev_{ev.seat}_{ev.j}_{k}_{len(terms)}")
             if not ev.subset and not ev.hidden:
-                m.add(
-                    dev >= expr[k] * SCALE - target
-                )  # a full row: no tile more than it shows ...
-            m.add(
-                dev >= target - expr[k] * SCALE
-            )  # ... and every tile it shows is in the hand
+                # a full row: no tile more than it shows ...
+                m.add(dev >= expr[k] * SCALE - target)
+            # ... and every tile it shows is in the hand
+            m.add(dev >= target - expr[k] * SCALE)
             terms.append(w * dev)
         if ev.hidden:
             # all but `hidden` tiles shown: the hand holds at most that many tiles
@@ -749,10 +660,10 @@ class HandModel:
             m.add(excess >= sum(ups) - ev.hidden * SCALE)
             terms.append(w * excess)
 
-    def _add_draw_costs(self, state: BuildVariables) -> None:
+    def _add_draw_costs(self, program: Program) -> None:
         """Add direct draw likelihood costs after the hand evidence terms."""
-        d = state.draws
-        terms = state.terms
+        d = program.draws
+        terms = program.terms
         for ev in self.draw_ev:
             key = (ev.seat, ev.j)
             if key not in d:
@@ -764,11 +675,7 @@ class HandModel:
                     terms.append(w * c * d[key][k])
 
     def _result_constraints(self, m: cp_model.CpModel, hands: dict, x: dict) -> None:
-        """Require a winning final hand or the recorded draw's tenpai states.
-
-        The winner's final hand is a winning hand; the tenpai seats of a draw are
-        tenpai.
-        """
+        """Require a winning final hand, or the tenpai states of a recorded draw."""
         w = self.win
         if w is not None and (w.seat, w.j) in hands:
             expr = list(hands[(w.seat, w.j)])
@@ -785,14 +692,14 @@ class HandModel:
             c34 = _counts34(hands[(seat, j)])
             _complete(m, [c34[k] + wait[k] for k in range(34)], sets, f"tenpai_{seat}")
 
-    def _discard_of(self, key: tuple[str, int]) -> str | None:
+    def _discard_of(self, key: TurnKey) -> str | None:
         s, j = key
         for t in self.turns[s]:
             if t.j == j:
                 return t.discard
         return None
 
-    def _riichi_draw_sources(self) -> dict:
+    def _riichi_draw_sources(self) -> dict[TurnKey, str]:
         """Identify rule-linked draws without a counterfactual search.
 
         The declaration turn is not locked. A winning draw has no discard.
@@ -821,557 +728,307 @@ class HandModel:
         self,
         *,
         time_limit: float = 60.0,
-        margins: bool = True,
         workers: int = 8,
         prior: Solution | None = None,
-        confidence_timeout: float = 10.0,
     ) -> Solution:
-        """Reconstruct the hand and optionally certify alternatives for uncertain tiles.
+        """Find the cheapest legal reconstruction of the current evidence and facts.
 
-        ``prior`` seeds the new search with soft hints, allowing new evidence or facts
-        to replace old choices. It reuses confident margins only when the complete
-        model, baseline objective and selected tile or starting multiset are unchanged.
-        New evidence must be re-evaluated even if it happens to preserve the same
-        preferred tiles.
+        ``prior`` seeds the search with soft hints, never constraints, so new
+        evidence or facts can replace old choices. A search that ends without a
+        candidate is ``unsolved``; only a proof makes it ``infeasible``. The
+        solution is uncertified until ``certify`` runs.
         """
-        m, h0, d, hands = self.build()
-        baseline = (m, h0, d)
-        fingerprint = (
-            hashlib.sha256(str(m.proto).encode("utf-8")).hexdigest()
-            if margins
-            else None
-        )
+        program = self.build()
         if prior is not None and prior.ok:
-            self._add_prior_hints(baseline, prior)
+            self._add_prior_hints(program, prior)
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit
         solver.parameters.num_workers = workers
-        status = solver.solve(m)
+        status = solver.solve(program.model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            # A timeout without a candidate does not prove infeasibility.
             return Solution(
                 "infeasible" if status == cp_model.INFEASIBLE else "unsolved",
-                float("inf"),
+                math.inf,
                 {},
                 {},
                 {},
             )
-        sol = self._read_solution(solver, status, baseline, hands)
-        if margins:
-            sol.model_fingerprint = fingerprint
-        self._read_call_and_discard_choices(solver, sol)
-        if margins:
-            self._certify_alternatives(
-                baseline,
-                solver,
-                sol,
-                prior,
-                ConfidenceBudget(workers, confidence_timeout),
-            )
+        sol = self._read_solution(solver, status, program)
+        self._read_call_and_discard_choices(solver, program, sol)
         return sol
 
-    def _add_prior_hints(self, baseline: Baseline, prior: Solution) -> None:
+    def _add_prior_hints(self, program: Program, prior: Solution) -> None:
         """Seed a useful incumbent without constraining updated evidence."""
-        m, h0, d = baseline
-        for seat, variables in h0.items():
+        m = program.model
+        for seat, variables in program.starting.items():
             if seat in prior.haipai:
                 counts = Counter(prior.haipai[seat])
-                for tile, variable in zip(TILES, variables, strict=False):
+                for tile, variable in zip(TILES, variables, strict=True):
                     m.add_hint(variable, counts[tile])
         for variables, choices in (
-            (d, prior.draws),
-            (self._d2, prior.draws2),
-            (self._y, prior.kans),
+            (program.draws, prior.draws),
+            (program.rinshan, prior.draws2),
+            (program.kan_choices, prior.kans),
         ):
             for key, vs in variables.items():
                 if choices.get(key) in TI:
-                    for tile, variable in zip(TILES, vs, strict=False):
+                    for tile, variable in zip(TILES, vs, strict=True):
                         m.add_hint(variable, int(tile == choices[key]))
-        self._add_prior_call_hints(m, prior)
-        self._add_prior_discard_hints(m, prior)
+        self._add_prior_call_hints(program, prior)
+        self._add_prior_discard_hints(program, prior)
 
-    def _add_prior_call_hints(self, m: cp_model.CpModel, prior: Solution) -> None:
+    @staticmethod
+    def _add_prior_call_hints(program: Program, prior: Solution) -> None:
         """Seed red-five kan and meld composition choices."""
-        for key, variable in self._vr.items():
+        for key, variable in program.red_kan_choices.items():
             if key in prior.kan_added:
-                m.add_hint(variable, int(prior.kan_added[key] in rules.REDS))
-        for key, variables in self._mo.items():
+                program.model.add_hint(
+                    variable, int(prior.kan_added[key] in rules.PLAIN_OF)
+                )
+        for key, variables in program.meld_choices.items():
             if key in prior.melds:
                 for index, variable in enumerate(variables):
-                    m.add_hint(variable, int(index == prior.melds[key]))
+                    program.model.add_hint(variable, int(index == prior.melds[key]))
 
-    def _add_prior_discard_hints(self, m: cp_model.CpModel, prior: Solution) -> None:
+    def _add_prior_discard_hints(self, program: Program, prior: Solution) -> None:
         """Seed variable discards while leaving fixed pond identities untouched."""
-        for key, variables in self._x.items():
+        for key, variables in program.discards.items():
             tile = prior.discards.get(key, self._discard_of(key))
             if tile in TI:
                 for index, variable in variables.items():
-                    if not isinstance(
-                        variable, int
-                    ):  # fixed discards have no decision variable
-                        m.add_hint(variable, int(index == TI[tile]))
+                    if not isinstance(variable, int):  # fixed: no decision variable
+                        program.model.add_hint(variable, int(index == TI[tile]))
 
     def _read_solution(
         self,
         solver: cp_model.CpSolver,
-        st: cp_model.CpSolverStatus,
-        baseline: Baseline,
-        hands: dict,
+        status: cp_model.CpSolverStatus,
+        program: Program,
     ) -> Solution:
         """Read primary hands and acquisitions from a feasible assignment."""
-        _model, h0, d = baseline
-        obj = solver.objective_value / SCALE / SCALE
-        haipai = {
-            s: [TILES[k] for k in range(NT) for _ in range(solver.value(h0[s][k]))]
-            for s in rules.SEATS
-        }
         draws = {
             key: TILES[int(np.argmax([solver.value(v) for v in vs]))]
-            for key, vs in d.items()
+            for key, vs in program.draws.items()
         }
-        hs = {
-            key: [TILES[k] for k in range(NT) for _ in range(solver.value(expr[k]))]
-            for key, expr in hands.items()
-        }
-        sol = Solution(
-            "optimal" if st == cp_model.OPTIMAL else "feasible", obj, haipai, draws, hs
+        return Solution(
+            "optimal" if status == cp_model.OPTIMAL else "feasible",
+            solver.objective_value / SCALE / SCALE,
+            {
+                s: [
+                    TILES[k]
+                    for k in range(NT)
+                    for _ in range(solver.value(program.starting[s][k]))
+                ]
+                for s in rules.SEATS
+            },
+            draws,
+            {
+                key: [TILES[k] for k in range(NT) for _ in range(solver.value(expr[k]))]
+                for key, expr in program.hands.items()
+            },
+            optimal=status == cp_model.OPTIMAL,
+            draw_sources={
+                key: source
+                for key, source in self._riichi_draw_sources().items()
+                if key in draws
+            },
+            program=program,
         )
-        sol.optimal = st == cp_model.OPTIMAL
-        sol.draw_sources = {
-            key: source
-            for key, source in self._riichi_draw_sources().items()
-            if key in draws
-        }
-        return sol
 
     def _read_call_and_discard_choices(
-        self, solver: cp_model.CpSolver, sol: Solution
+        self, solver: cp_model.CpSolver, program: Program, sol: Solution
     ) -> None:
         """Materialize kan, meld and repaired pond choices."""
-        for key, vs in self._d2.items():
+        for key, vs in program.rinshan.items():
             sol.draws2[key] = TILES[int(np.argmax([solver.value(v) for v in vs]))]
-        for key, vs in self._y.items():
+        for key, vs in program.kan_choices.items():
             sol.kans[key] = TILES[int(np.argmax([solver.value(v) for v in vs]))]
-        for key, v in self._vr.items():
+        for key, v in program.red_kan_choices.items():
             tile = next(t.kan_tile for t in self.turns[key[0]] if t.j == key[1])
             if tile is None:
-                msg = "A red-five kan choice must have a known tile kind"
-                raise RuntimeError(msg)
-            sol.kan_added[key] = (
-                {"5m": "0m", "5p": "0p", "5s": "0s"}[tile] if solver.value(v) else tile
-            )
-        for key, bs in self._mo.items():
+                raise RuntimeError("A red-five kan choice must have a known tile kind")
+            sol.kan_added[key] = rules.RED_OF[tile] if solver.value(v) else tile
+        for key, bs in program.meld_choices.items():
             sol.melds[key] = next(i for i, b in enumerate(bs) if solver.value(b))
-        for key, xs in self._x.items():
+        for key, xs in program.discards.items():
             if len(xs) < MIN_DECISION_CHOICES:
                 continue
             for k, v in xs.items():
                 if solver.value(v) == 1 and TILES[k] != self._discard_of(key):
                     sol.discards[key] = TILES[k]
 
-    def _pending_draw_checks(
-        self, sol: Solution, prior: Solution | None
-    ) -> list[tuple[tuple[str, int], str]]:
-        """Reuse valid draw certificates and select the remaining alternatives."""
-        draws, obj = sol.draws, sol.objective
-        draws_todo = []
-        for key, tile in draws.items():
-            if key in sol.draw_sources:
-                continue  # use the source's confidence after checking discards
-            if (
-                prior is not None
-                and prior.model_fingerprint == sol.model_fingerprint
-                and prior.objective == obj
-                and key in prior.margins
-                and prior.draws.get(key) == tile
-                and prior.margins[key] > MARGIN_REVIEW + MARGIN_TOLERANCE
-            ):
-                sol.margins[key] = prior.margins[key]
-                sol.runner_up[key] = prior.runner_up.get(key)
-                sol.alternative_gaps[key] = prior.alternative_gaps.get(
-                    key, prior.margins[key]
-                )
-            elif key in self.facts.draws:
-                sol.margins[key] = float("inf")  # fixed by a fact
-                sol.alternative_gaps[key] = float("inf")
-            else:
-                draws_todo.append((key, tile))
-        return draws_todo
+    # -- certification -------------------------------------------------------------
+    def certify(
+        self, sol: Solution, *, timeout: float = 60.0, workers: int = 8
+    ) -> None:
+        """Bound the cost increase of changing each draw, discard and starting hand.
 
-    def _pending_starting_checks(
-        self, sol: Solution, prior: Solution | None
-    ) -> list[str]:
-        """Reuse starting-hand certificates only for the same multiset and model."""
-        fingerprint, obj, haipai = sol.model_fingerprint, sol.objective, sol.haipai
-        same_model = (
-            prior is not None
-            and prior.model_fingerprint == fingerprint
-            and prior.objective == obj
-        )
-        haipai_todo = []
+        Each search asks for the cheapest reconstruction that changes at least one
+        pending decision. A proven lower bound above the review threshold
+        certifies all of them at once: the group's minimum is at most each
+        decision's own. A reconstruction within the threshold is a close witness
+        for every decision it changes; those are ambiguous, and the search repeats
+        without them. Decisions still pending after ``timeout`` seconds are
+        unresolvable with the last proven bound. Human facts are fixed, and a
+        riichi-locked draw shares its discard's certificate. The searches run in
+        the program ``sol`` was found in; the facts and pond readings must not
+        have changed since.
+        """
+        program = sol.program
+        if program is None:
+            raise ValueError(
+                "Certification needs the program the solution was found in"
+            )
+        base = replace(program, model=program.model.clone())
+        base.model.clear_hints()
+        self._add_prior_hints(base, sol)
+        pending = self._open_decisions(sol, base)
+        deadline = time.monotonic() + timeout
+        margin = 0.0
+        while pending and (seconds := deadline - time.monotonic()) > 0:
+            trial = base.model.clone()
+            trial.add_bool_or([d.differs for d in pending])
+            search, status, margin = _closest_change(
+                trial, sol.objective, seconds, workers
+            )
+            if margin > REVIEW_GAP:
+                gap = math.inf if status == cp_model.INFEASIBLE else None
+                sol.certificates.update(
+                    {d.key: Certificate(margin, gap) for d in pending}
+                )
+                pending = []
+                break
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                break  # out of time before a proof or a candidate
+            gap = max(0.0, search.objective_value / SCALE / SCALE - sol.objective)
+            if gap > REVIEW_GAP:
+                break  # out of time before a proof or a close witness
+            unchanged = []
+            for d in pending:
+                if d.changed_in(search):
+                    sol.certificates[d.key] = Certificate(
+                        margin, gap, d.value_in(search)
+                    )
+                else:
+                    unchanged.append(d)
+            pending = unchanged
+        sol.certificates.update({d.key: Certificate(margin) for d in pending})
+        for (seat, j), source in sol.draw_sources.items():
+            # Excluding a locked draw is excluding its discard: one certificate.
+            sol.certificates["draw", seat, j] = (
+                sol.certificates.get(("discard", seat, j), FIXED)
+                if source == "discard"
+                else FIXED
+            )
+        sol.certified = True
+
+    def _open_decisions(self, sol: Solution, program: Program) -> list[_OpenDecision]:
+        """Fix human-confirmed decisions; list the rest with what changes them."""
+        pending = []
+        for (seat, j), tile in sol.draws.items():
+            if (seat, j) in sol.draw_sources:
+                continue  # the rules derive it from its source
+            if (seat, j) in self.facts.draws:
+                sol.certificates["draw", seat, j] = FIXED
+                continue
+            variables = program.draws[seat, j]
+            pending.append(
+                _OpenDecision(
+                    ("draw", seat, j),
+                    variables,
+                    [int(t == tile) for t in TILES],
+                    variables[TI[tile]].Not(),
+                    TILES,
+                )
+            )
+        for (seat, j), options in program.discards.items():
+            choices = {
+                TILES[k]: v for k, v in options.items() if not isinstance(v, int)
+            }
+            chosen = sol.discards.get((seat, j), self._discard_of((seat, j)))
+            if chosen is None or chosen not in choices:
+                continue  # a fixed pond identity is no decision
+            pending.append(
+                _OpenDecision(
+                    ("discard", seat, j),
+                    list(choices.values()),
+                    [int(t == chosen) for t in choices],
+                    choices[chosen].Not(),
+                    list(choices),
+                )
+            )
         for seat in rules.SEATS:
             if seat in self.facts.haipai:
+                sol.certificates["haipai", seat, -1] = FIXED
                 continue
-            if (
-                same_model
-                and Counter(prior.haipai.get(seat, [])) == Counter(haipai[seat])
-                and prior.haipai_margins.get(seat, 0) > MARGIN_REVIEW + MARGIN_TOLERANCE
-            ):
-                sol.haipai_margins[seat] = prior.haipai_margins[seat]
-                sol.haipai_alternative_gaps[seat] = prior.haipai_alternative_gaps.get(
-                    seat
-                )
-            else:
-                haipai_todo.append(seat)
-        sol.haipai_margins.update(
-            {s_: float("inf") for s_ in rules.SEATS if s_ in self.facts.haipai}
-        )
-        sol.haipai_alternative_gaps.update(
-            {s_: float("inf") for s_ in rules.SEATS if s_ in self.facts.haipai}
-        )
-        return haipai_todo
-
-    def _pending_discard_checks(
-        self, sol: Solution, prior: Solution | None
-    ) -> list[
-        tuple[tuple[str, int], dict[int, cp_model.IntVar | int], cp_model.IntVar | int]
-    ]:
-        """Capture variable maps before alternative workers rebuild the model."""
-        fingerprint, obj = sol.model_fingerprint, sol.objective
-        same_model = (
-            prior is not None
-            and prior.model_fingerprint == fingerprint
-            and prior.objective == obj
-        )
-        discard_todo = []
-        for key, variables in self._x.items():
-            if len(variables) < MIN_DECISION_CHOICES:
-                continue
-            chosen = sol.discards.get(key, self._discard_of(key))
-            if (
-                same_model
-                and prior.discards.get(key, self._discard_of(key)) == chosen
-                and prior.discard_margins.get(key, 0) > MARGIN_REVIEW + MARGIN_TOLERANCE
-            ):
-                sol.discard_margins[key] = prior.discard_margins[key]
-                sol.discard_runner_up[key] = prior.discard_runner_up.get(key)
-                sol.discard_alternative_gaps[key] = prior.discard_alternative_gaps.get(
-                    key
-                )
-            else:
-                discard_todo.append((key, variables, variables[TI[chosen]]))
-        return discard_todo
-
-    def _certify_alternatives(
-        self,
-        baseline: Baseline,
-        solver: cp_model.CpSolver,
-        sol: Solution,
-        prior: Solution | None,
-        budget: ConfidenceBudget,
-    ) -> None:
-        """Bound alternatives under one deadline and a shared CPU allocation."""
-        m, h0, d = baseline
-        obj, haipai = sol.objective, sol.haipai
-        workers, confidence_timeout = budget.workers, budget.seconds
-        hint = (
-            {s_: [solver.value(h0[s_][k]) for k in range(NT)] for s_ in rules.SEATS},
-            {key2: [solver.value(v) for v in vs] for key2, vs in d.items()},
-        )
-        draws_todo = self._pending_draw_checks(sol, prior)
-        haipai_todo = self._pending_starting_checks(sol, prior)
-        discard_todo = self._pending_discard_checks(sol, prior)
-        # Exclude each choice to bound its objective separation. A returned
-        # runner-up is a feasible candidate, not necessarily the closest
-        # alternative when its search hits the deadline or stops on proof.
-        # One budget for this pass, rather than a fresh full budget for
-        # every tile. Share the CPU allocation across concurrent checks.
-        confidence_started = time.monotonic()
-        deadline = confidence_started + confidence_timeout
-        check_workers = max(1, workers // MARGIN_THREADS)
-        with ThreadPoolExecutor(min(MARGIN_THREADS, workers)) as ex:
-            # Starting hands constrain many draws. Establish these first
-            # so a tight budget still finds the most useful questions.
-            fh = {
-                s_: ex.submit(
-                    self._resolve,
-                    hint,
-                    obj,
-                    check_workers,
-                    options=ResolveOptions(
-                        forbid_haipai=(s_, haipai[s_]), deadline=deadline
-                    ),
-                )
-                for s_ in haipai_todo
-            }
-            fx = {
-                key: ex.submit(
-                    self._resolve,
-                    hint,
-                    obj,
-                    check_workers,
-                    options=ResolveOptions(
-                        baseline=(m, h0, d),
-                        forbid_variable=variable,
-                        watch_variables=variables,
-                        deadline=deadline,
-                    ),
-                )
-                for key, variables, variable in discard_todo
-            }
-            fd = {
-                key: ex.submit(
-                    self._resolve,
-                    hint,
-                    obj,
-                    check_workers,
-                    options=ResolveOptions(
-                        forbid=(key[0], key[1], tile),
-                        watch=key,
-                        baseline=(m, h0, d),
-                        deadline=deadline,
-                    ),
-                )
-                for key, tile in sorted(
-                    draws_todo, key=lambda row: (row[0][1], row[0][0])
-                )
-            }
-            for key, f in fd.items():
-                sol.margins[key], sol.runner_up[key], sol.alternative_gaps[key] = (
-                    f.result()
-                )
-            for s_, f in fh.items():
-                sol.haipai_margins[s_], _, sol.haipai_alternative_gaps[s_] = f.result()
-            for key, f in fx.items():
-                (
-                    sol.discard_margins[key],
-                    sol.discard_runner_up[key],
-                    sol.discard_alternative_gaps[key],
-                ) = f.result()
-        self._link_locked_draw_confidence(sol)
-        sol.confidence_seconds = time.monotonic() - confidence_started
-
-    def _link_locked_draw_confidence(self, sol: Solution) -> None:
-        """Share a riichi-locked draw certificate with its corresponding discard."""
-        for key, source in sol.draw_sources.items():
-            # Excluding a locked draw is exactly the same as excluding its
-            # discard. Keep pond ambiguity once, without a second search.
-            sol.margins[key] = (
-                sol.discard_margins.get(key, float("inf"))
-                if source == "discard"
-                else float("inf")
+            differs = program.model.new_bool_var(f"differs_h0_{seat}")
+            starting = program.starting[seat]
+            _differs(
+                program.model, starting, sol.haipai[seat], f"h0_{seat}", when=differs
             )
-            sol.alternative_gaps[key] = (
-                sol.discard_alternative_gaps.get(key, float("inf"))
-                if source == "discard"
-                else float("inf")
+            counts = Counter(sol.haipai[seat])
+            pending.append(
+                _OpenDecision(
+                    ("haipai", seat, -1), starting, [counts[t] for t in TILES], differs
+                )
             )
-            sol.runner_up[key] = (
-                sol.discard_runner_up.get(key) if source == "discard" else None
-            )
-
-    def _alternative_model(
-        self,
-        baseline: Baseline | None,
-        forbid_variable: cp_model.IntVar | int | None,
-        forbid: tuple[str, int, str] | None,
-        forbid_haipai: tuple[str, list[str]] | None,
-    ) -> tuple[cp_model.CpModel, StartingVariables, DrawVariables]:
-        """Clone the baseline where possible and otherwise rebuild the exclusion."""
-        if forbid_variable is not None:
-            if baseline is None:
-                msg = "Excluding a variable requires its baseline model"
-                raise ValueError(msg)
-            return _clone_forbidden_model(*baseline, forbid_variable)
-        if baseline is not None and forbid is not None and forbid_haipai is None:
-            return _clone_draw_model(*baseline, forbid)
-        m2, h0b, db, *_ = self.build(forbid=forbid, forbid_haipai=forbid_haipai)
-        return m2, h0b, db
-
-    def _resolve(
-        self,
-        hint: tuple,
-        obj: float,
-        workers: int,
-        *,
-        options: ResolveOptions | None = None,
-    ) -> tuple[float, str | None, float | None]:
-        """Measure the objective increase after forbidding one solved decision.
-
-        Objective increase of the model with one decision forbidden (warm-started from
-        the solution), and the draw `watch` takes then. A timed-out feasible solve
-        contributes only its certified lower bound: the current candidate's cost is an
-        upper bound and could falsely make an ambiguous draw appear certain. Its draw is
-        still useful as a possible alternative. The third value is its cost gap: a close
-        candidate establishes ambiguity; a distant one cannot certify confidence. It
-        also controls targeted video rereads. The search can stop as soon as its lower
-        bound certifies a gap above the shared review threshold; this does not require
-        optimizing the rejected alternative. A search without a candidate can still
-        supply a certified lower bound; its candidate gap is None because no
-        alternative was found. A close
-        feasible witness also ends the search: proving its exact optimal cost cannot
-        change the decision to ask about it. Each check runs once; unfinished checks
-        remain unresolvable with this processing budget.
-        """
-        options = options or ResolveOptions()
-        baseline = options.baseline
-        forbid_variable = options.forbid_variable
-        stop_when_certified = options.stop_when_certified
-        deadline = options.deadline
-        forbid = options.forbid
-        forbid_haipai = options.forbid_haipai
-        if deadline is not None and time.monotonic() >= deadline:
-            return 0.0, None, None
-        m2, h0b, db = self._alternative_model(
-            baseline, forbid_variable, forbid, forbid_haipai
-        )
-        _hint_alternative((m2, h0b, db), hint, forbid)
-        s2 = cp_model.CpSolver()
-        s2.parameters.max_time_in_seconds = 4.0
-        s2.parameters.num_workers = workers
-        proven_bound = 0.0
-
-        def stop_after_proof(bound: float) -> None:
-            nonlocal proven_bound
-            if math.isfinite(bound):
-                proven_bound = max(proven_bound, bound)
-                if bound / SCALE / SCALE - obj > MARGIN_REVIEW + MARGIN_TOLERANCE:
-                    s2.stop_search()
-
-        if stop_when_certified:
-            # Confidence needs a threshold certificate, not the exact optimum
-            # of a rejected reconstruction. Never stop on an incumbent cost.
-            s2.best_bound_callback = stop_after_proof
-
-        class CloseAlternative(cp_model.CpSolverSolutionCallback):
-            def on_solution_callback(self) -> None:
-                if (
-                    self.objective_value / SCALE / SCALE - obj
-                    <= MARGIN_REVIEW + MARGIN_TOLERANCE
-                ):
-                    self.stop_search()
-
-        remaining = 4.0 if deadline is None else deadline - time.monotonic()
-        if remaining <= 0:
-            return 0.0, None, None
-        s2.parameters.max_time_in_seconds = remaining
-        r = s2.solve(m2, CloseAlternative()) if stop_when_certified else s2.solve(m2)
-        if r == cp_model.MODEL_INVALID:
-            msg = f"Invalid alternative model: {s2.response_stats()}"
-            raise RuntimeError(msg)
-        return self._alternative_result(
-            s2, r, db, options, SearchProof(obj, proven_bound)
-        )
-
-    @staticmethod
-    def _alternative_result(
-        s2: cp_model.CpSolver,
-        r: cp_model.CpSolverStatus,
-        db: DrawVariables,
-        options: ResolveOptions,
-        proof: SearchProof,
-    ) -> tuple[float, str | None, float | None]:
-        watch, watch_variables = options.watch, options.watch_variables
-        obj, proven_bound = proof.reference_cost, proof.lower_bound
-        if r in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            alt = (
-                TILES[int(np.argmax([s2.value(v) for v in db[watch]]))]
-                if watch is not None and watch in db
-                else None
-            )
-            if watch_variables is not None:
-                alt = next(TILES[k] for k, v in watch_variables.items() if s2.value(v))
-            bound = (
-                s2.objective_value
-                if r == cp_model.OPTIMAL
-                else max(proven_bound, s2.best_objective_bound)
-            )
-            return (
-                max(0.0, bound / SCALE / SCALE - obj),
-                alt,
-                max(0.0, s2.objective_value / SCALE / SCALE - obj),
-            )
-        if r == cp_model.UNKNOWN:
-            # A proof bound does not require an incumbent. Discarding it turns
-            # already-certified choices into needless review and video work.
-            # All model costs are nonnegative, so the default zero bound from
-            # a search stopped before initialization is conservative as well.
-            bound = max(proven_bound, s2.best_objective_bound)
-            margin = (
-                max(0.0, bound / SCALE / SCALE - obj) if math.isfinite(bound) else 0.0
-            )
-            return margin, None, None
-        return (
-            (float("inf"), None, float("inf"))
-            if r == cp_model.INFEASIBLE
-            else (0.0, None, None)
-        )
+        return pending
 
 
-def _hint_alternative(
-    model: tuple[cp_model.CpModel, StartingVariables, DrawVariables],
-    hint: tuple,
-    forbid: tuple[str, int, str] | None,
-) -> None:
-    """Replace prior hints without hinting the explicitly forbidden draw."""
-    m2, h0b, db = model
-    # A cloned main model may already contain prior-assignment hints.
-    # Duplicate variable hints invalidate CP-SAT's input.
-    m2.clear_hints()
-    h0v, dv = hint
-    for s_ in rules.SEATS:
-        for k in range(NT):
-            m2.add_hint(h0b[s_][k], h0v[s_][k])
-    for key2, vs in db.items():
-        if forbid is not None and key2 == (forbid[0], forbid[1]):
-            continue
-        for k, v in enumerate(vs):
-            m2.add_hint(v, dv[key2][k])
+def _closest_change(
+    model: cp_model.CpModel, objective: float, seconds: float, workers: int
+) -> tuple[cp_model.CpSolver, cp_model.CpSolverStatus, float]:
+    """Search until the cost increase over ``objective`` is decided for review.
 
-
-def _clone_draw_model(
-    base: ReconstructionModel,
-    h0: StartingVariables,
-    draws: DrawVariables,
-    forbid: tuple[str, int, str],
-) -> tuple[cp_model.CpModel, StartingVariables, DrawVariables]:
-    """Copy a draw alternative with exactly the original CP-SAT input ordering.
-
-    Variable indices, objective terms and constraint ordering stay identical.
-    Variable handles can be shared because CP-SAT uses their unchanged indices.
-    Starting-hand alternatives still rebuild: those introduce extra variables.
+    Returns the search, its status and a certified lower bound on the increase.
+    The search stops at a bound above the review threshold or at a reconstruction
+    within it: the exact optimum of either is never needed. A candidate's cost
+    never certifies anything. Model costs are nonnegative, so a zero bound is
+    conservative; an infeasible model has an infinite bound.
     """
-    seat, turn, tile = forbid
-    variable = draws[(seat, turn)][TI[tile]] if (seat, turn) in draws else None
-    return _clone_forbidden_model(base, h0, draws, variable)
+    search = cp_model.CpSolver()
+    search.parameters.max_time_in_seconds = seconds
+    search.parameters.num_workers = workers
+    proven = 0.0
+
+    def increase(value: float) -> float:
+        return value / SCALE / SCALE - objective
+
+    def on_bound(bound: float) -> None:
+        nonlocal proven
+        if math.isfinite(bound):
+            proven = max(proven, increase(bound))
+            if proven > REVIEW_GAP:
+                search.stop_search()
+
+    class CloseWitness(cp_model.CpSolverSolutionCallback):
+        def on_solution_callback(self) -> None:
+            if increase(self.objective_value) <= REVIEW_GAP:
+                self.stop_search()
+
+    search.best_bound_callback = on_bound
+    status = search.solve(model, CloseWitness())
+    if status == cp_model.MODEL_INVALID:
+        raise RuntimeError(f"Invalid certification model: {search.response_stats()}")
+    if status == cp_model.INFEASIBLE:
+        return search, status, math.inf
+    if math.isfinite(search.best_objective_bound):
+        proven = max(proven, increase(search.best_objective_bound))
+    return search, status, proven
 
 
-def _clone_forbidden_model(
-    base: ReconstructionModel,
-    h0: StartingVariables,
-    draws: DrawVariables,
-    variable: cp_model.IntVar | int | None,
-) -> tuple[cp_model.CpModel, StartingVariables, DrawVariables]:
-    """Exclude one selected Boolean while preserving baseline ordering and maps."""
-    cloned = base.clone()
-    if variable is not None:
-        constraint = cloned.add(variable == 0)
-        exclusion = type(constraint.proto)()
-        exclusion.copy_from(constraint.proto)
-        constraints = list(base.proto.constraints)
-        offset = base.draw_forbid_index
-        cloned.proto.constraints.clear()
-        cloned.proto.constraints.extend(constraints[:offset])
-        cloned.proto.constraints.append(exclusion)
-        cloned.proto.constraints.extend(constraints[offset:])
-    return cloned, h0, draws
+def _differs(
+    m: cp_model.CpModel,
+    expr: list,
+    tiles: list[str],
+    name: str,
+    *,
+    when: cp_model.LiteralT | None = None,
+) -> None:
+    """Constrain tile counts to differ from a hand of the same size.
 
-
-def _differs(m: cp_model.CpModel, expr: list, tiles: list[str], name: str) -> None:
-    """Constrain tile counts to differ from a specified fixed-size hand.
-
-    The counts `expr` hold at least one kind fewer than `tiles` (the sizes are fixed, so
-    the hand differs).
+    The counts `expr` hold at least one kind fewer than `tiles` (the sizes are
+    fixed, so the hand differs), unconditionally or only where ``when`` holds.
     """
     fewer = []
     for k in range(NT):
@@ -1380,16 +1037,17 @@ def _differs(m: cp_model.CpModel, expr: list, tiles: list[str], name: str) -> No
             b = m.new_bool_var(f"fewer_{name}_{k}")
             m.add(expr[k] <= v - 1).only_enforce_if(b)
             fewer.append(b)
-    m.add_bool_or(fewer)
+    clause = m.add_bool_or(fewer)
+    if when is not None:
+        clause.only_enforce_if(when)
 
 
 @dataclass
 class WinSpec:
-    """Location of the winner's complete hand within the solver state.
+    """Where the winner's complete hand is in the model.
 
-    Where the winner's winning hand is in the model: the state after its turn j (a
-    tsumo: after the winning draw), plus the loser's discard of turn j_loser for a ron;
-    `sets` the sets the concealed part must hold.
+    The state after its turn j (a tsumo: after the winning draw), plus the loser's
+    discard of turn j_loser for a ron; `sets` the sets the concealed part must hold.
     """
 
     seat: str
@@ -1404,18 +1062,17 @@ TERMINALS = [k for k in range(34) if k >= FIRST_HONOR_INDEX or k % 9 in (0, 8)]
 def _counts34(expr: list) -> list:
     """37-kind counts -> 34 kinds (a red five is a five)."""
     out = [expr[TI[t]] for t in rules.KINDS]
-    for red, plain in rules.REDS.items():
+    for red, plain in rules.PLAIN_OF.items():
         k = rules.KINDS.index(plain)
         out[k] = out[k] + expr[TI[red]]
     return out
 
 
 def _complete(m: cp_model.CpModel, c34: list, sets: int, name: str) -> None:
-    """Constrain tile counts to a complete hand under the allowed patterns.
+    """Constrain 34-kind counts to a complete hand.
 
-    Constrain 34-kind counts to a complete hand with `sets` sets besides the melds and
-    one pair — or, closed, seven pairs or the thirteen orphans. Integer decomposition:
-    pons per kind, chis per start, the pair.
+    `sets` sets besides the melds and one pair, or, closed, seven pairs or the
+    thirteen orphans. Integer decomposition: pons per kind, chis per start, the pair.
     """
     std = m.new_bool_var(f"{name}_std")
     forms = [std]
@@ -1455,10 +1112,9 @@ def _complete(m: cp_model.CpModel, c34: list, sets: int, name: str) -> None:
 
 
 def state_of(seat_turns: list[SeatTurn], t0: float, t1: float) -> int | None:
-    """Find the hand state belonging to a calm observation interval.
+    """Return the state j a calm interval [t0, t1] of the hand band belongs to.
 
-    Index j of the state a calm interval [t0, t1] of the hand band belongs to (-1 =
-    haipai state), or None when the interval straddles a turn of this seat.
+    -1 is the haipai state; None when the interval straddles a turn of this seat.
     """
     j = -1
     for t in seat_turns:
@@ -1470,20 +1126,18 @@ def state_of(seat_turns: list[SeatTurn], t0: float, t1: float) -> int | None:
 
 
 def open_turn(seat_turns: list[SeatTurn], t1: float) -> SeatTurn | None:
-    """Find the unfinished turn overlapped by an observation interval.
+    """Find the turn whose window holds an interval's end t1 before its discard.
 
-    The turn whose window [t_pre, t_discard] contains the interval's end t1 without
-    reaching the discard's first sighting: the discard may already have happened inside
-    the interval, so a row with the resting count there is ambiguous (before the draw or
-    after the discard); only the row with one tile more is a state, the one after the
-    draw.
+    Its window [t_pre, t_discard] contains t1 without reaching the discard's first
+    sighting: the discard may already have happened inside the interval, so a row
+    with the resting count there is ambiguous (before the draw or after the
+    discard); only the row with one tile more is a state, the one after the draw.
     """
     for t in seat_turns:
         if t.t_discard - 0.6 > t1:
             # the pond may first show a discard several seconds after it was made (an
-            # arm over the pond), but
-            # not much longer: a row at rest that ends more than 8 s before the sighting
-            # was still waiting to draw
+            # arm over the pond), but not much longer: a row at rest that ends more
+            # than 8 s before the sighting was still waiting to draw
             return t if t.t_pre <= t1 and t1 >= t.t_discard - 8.0 else None
     return None
 
@@ -1537,10 +1191,9 @@ def _tops(slots: list[dict]) -> list[str]:
 def drawn_end(
     slots: list[dict], ref: list | None, prior: tuple[int, int] | None
 ) -> list[tuple[str, float]]:
-    """Find the extra drawn tile at either end of an observed hand row.
+    """Weigh which end of a row one tile over the resting count holds the draw.
 
-    Which end of a row with one tile more than the resting count holds the drawn tile:
-    [(end, weight)].
+    Returns [(end, weight)].
 
     The end whose removal leaves the previous resting row `ref` (posteriors), compared
     as multisets (the player may not have sorted), names it, strongly — if the rest
@@ -1597,26 +1250,22 @@ def hand_evidence(
     *,
     role: HandRole,
 ) -> tuple[list[HandEvidence], list[DrawEvidence], tuple[int, int]]:
-    """Associate a seat's observed hand rows with solver states.
+    """Map a seat's observed hand rows to solver states (DESIGN.md 4.8, evidence 1-3).
 
-    Map the hand observations of one seat to states (DESIGN.md 4.8, evidence 1-3).
-    Returns the hand evidence, the direct draw evidence, and the seat's end habit (draws
-    seen at the left end, at the right end).
+    Returns the hand evidence, the direct draw evidence, and the seat's end habit
+    (draws seen at the left end, at the right end).
 
-    - a row with one tile more than the resting count, inside the turn: the state after
-      the draw, and the drawn
-      tile at an end of the row;
+    - a row with one tile more than the resting count, inside the turn: the state
+      after the draw, and the drawn tile at an end of the row;
     - a row with the resting count between turns, calm or read-floor: the state (it
       shows every tile);
-    - a calm row between turns one or two tiles short of it: every tile it shows is in
-      the state, which holds at
-      most that many more (a hand resting over an end of the row), at full weight;
-    - anything else — a partial view, fewer tiles, a row inside a turn's window (before
-      the draw or already after
-      the discard), a view across a discard — shows part of the hand at some moment of
-      the turn, and every such
-      moment's tiles are in the hand after the turn's draw: the tiles seen are a
-      sub-multiset of it.
+    - a calm row between turns one or two tiles short of it: every tile it shows is
+      in the state, which holds at most that many more (a hand resting over an end of
+      the row), at full weight;
+    - anything else (a partial view, fewer tiles, a row inside a turn's window before
+      the draw or already after the discard, a view across a discard) shows part of
+      the hand at some moment of the turn, and every such moment's tiles are in the
+      hand after the turn's draw: the tiles seen are a sub-multiset of it.
     """
     dealer, wins_by_tsumo = (role.dealer, role.wins_by_tsumo)
     hev: list[HandEvidence] = []
@@ -1724,28 +1373,27 @@ def hand_evidence(
     return hev, dev, habit
 
 
-@dataclass
+@dataclass(frozen=True)
 class Culprit:
-    """Decision whose removal restores a conflicting hand's feasibility.
+    """One decision without which an infeasible hand becomes legal.
 
-    One decision without which an infeasible hand becomes legal: what a conflict
-    question asks about.
+    A conflict question asks about it; ``text`` is the developer's diagnosis.
     """
 
-    kind: str  # fact | result | riichi | meld | discard
+    kind: str  # fact | result | riichi | meld
     seat: str | None
-    j: int | None  # the seat's turn (meld, discard, riichi)
+    j: int | None  # the seat's turn (meld, riichi, a draw fact)
     text: str
     fact: str | None = None  # fact: haipai | draw | final
+    t: float | None = None  # the discard time of the turn (meld, riichi)
 
 
 def diagnose(model: HandModel, time_limit: float = 5.0) -> list[Culprit]:
-    """Find single decisions whose removal restores model feasibility.
+    """Find the single decisions whose removal makes an infeasible model legal.
 
-    When the model is infeasible (even after repair): the single decisions whose removal
-    makes it legal, the most specific first — a reviewer's fact that contradicts the
-    video, the result constraint (the winner's hand as reconstructed cannot win), a
-    riichi turn, one call. Empty when no single decision does.
+    The most specific first: a reviewer's fact that contradicts the video, the result
+    constraint (the winner's hand as reconstructed cannot win), a riichi turn, one
+    call. Empty when no single decision does.
     """
     return [
         *_fact_conflicts(model, time_limit),
@@ -1756,40 +1404,63 @@ def diagnose(model: HandModel, time_limit: float = 5.0) -> list[Culprit]:
 
 
 def _feasible(model: HandModel, time_limit: float) -> bool:
-    program, *_ = model.build()
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
     solver.parameters.num_workers = 8
-    return solver.solve(program) in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+    return solver.solve(model.build().model) in (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
 
 def _fact_conflicts(model: HandModel, time_limit: float) -> Iterator[Culprit]:
     full = model.facts
-    singles = (
-        [("haipai", seat, seat, value) for seat, value in full.haipai.items()]
-        + [("draw", key[0], key, value) for key, value in full.draws.items()]
-        + [("final", seat, seat, value) for seat, value in full.final.items()]
-    )
-    for kind, seat, key, value in singles:
+    # (kind, seat, turn, the fact as shown, every fact but that one)
+    singles: list[tuple[str, str, int | None, str, Facts]] = [
+        *(
+            (
+                "haipai",
+                seat,
+                None,
+                " ".join(tiles),
+                replace(full, haipai=_without(full.haipai, seat)),
+            )
+            for seat, tiles in full.haipai.items()
+        ),
+        *(
+            (
+                "draw",
+                key[0],
+                key[1],
+                tile,
+                replace(full, draws=_without(full.draws, key)),
+            )
+            for key, tile in full.draws.items()
+        ),
+        *(
+            (
+                "final",
+                seat,
+                None,
+                " ".join(tiles),
+                replace(full, final=_without(full.final, seat)),
+            )
+            for seat, tiles in full.final.items()
+        ),
+    ]
+    for kind, seat, j, shown, facts in singles:
         trial = copy(model)
-        trial.facts = Facts(
-            **{name: dict(values) for name, values in full.__dict__.items()}
-        )
-        {
-            "haipai": trial.facts.haipai,
-            "draw": trial.facts.draws,
-            "final": trial.facts.final,
-        }[kind].pop(key)
+        trial.facts = facts
         if _feasible(trial, time_limit):
-            shown = " ".join(value) if isinstance(value, list) else value
             yield Culprit(
                 "fact",
                 seat,
-                key[1] if kind == "draw" else None,
+                j,
                 f"your {kind} fact for {seat} ({shown}) contradicts "
                 "what the video shows",
                 fact=kind,
             )
+
+
+def _without[K, V](facts: dict[K, V], key: K) -> dict[K, V]:
+    return {k: v for k, v in facts.items() if k != key}
 
 
 def _result_conflicts(model: HandModel, time_limit: float) -> Iterator[Culprit]:
@@ -1829,9 +1500,9 @@ def _riichi_conflicts(model: HandModel, time_limit: float) -> Iterator[Culprit]:
                     "riichi",
                     seat,
                     turn.j,
-                    f"{seat}'s riichi at its turn {turn.j} "
-                    f"({turn.t_discard:.0f}s) cannot be: "
-                    "after it the hand would have to change",
+                    f"{seat}'s riichi with the discard at {turn.t_discard:.0f}s "
+                    "cannot be: after it the hand would have to change",
+                    t=turn.t_discard,
                 )
 
 
@@ -1855,4 +1526,5 @@ def _meld_conflicts(model: HandModel, time_limit: float) -> Iterator[Culprit]:
                     turn.j,
                     f"{seat}'s call before its discard at {turn.t_discard:.0f}s "
                     f"cannot be: its hand never holds {shown}",
+                    t=turn.t_discard,
                 )

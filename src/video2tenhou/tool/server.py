@@ -29,6 +29,7 @@ from starlette.routing import Route
 from video2tenhou.logging_setup import command_logging
 
 from .http import (
+    IMMUTABLE,
     PROJECT_BODY_LIMIT,
     STATIC,
     UPLOAD_BODY_LIMIT,
@@ -76,21 +77,30 @@ class WorkspaceRoutes:
     def status(self, _request: Request) -> Response:
         """Return setup status and current project snapshots."""
         with self.workspace.lock:
-            return json_response(
-                {
-                    "setup": self.workspace.setup(),
-                    "projects": [
-                        self.workspace.snapshot(key) for key in self.workspace.projects
-                    ],
-                }
-            )
+            keys = list(self.workspace.projects)
+        projects = [
+            self.workspace.snapshot(key)
+            for key in keys
+            if key in self.workspace.projects
+        ]
+        return json_response({"setup": self.workspace.setup(), "projects": projects})
+
+    def job(self, request: Request) -> Response:
+        """Return the workspace job and the open project's review revision."""
+        return json_response(
+            self.workspace.job_status(request.query_params.get("project"))
+        )
 
     def project(self, request: Request) -> Response:
         """Return one recording's current workflow state."""
         return json_response(self.workspace.snapshot(request.path_params["key"]))
 
+    def log(self, request: Request) -> Response:
+        """Return the developer log of the project's latest job."""
+        return json_response({"log": self.workspace.log(request.path_params["key"])})
+
     def results(self, request: Request) -> Response:
-        """List current validated exports and pending corrections."""
+        """List current validated exports and games awaiting updated answers."""
         return json_response(self.workspace.results(request.path_params["key"]))
 
     def export(self, request: Request) -> Response:
@@ -157,12 +167,10 @@ class WorkspaceRoutes:
                 "Choose a nonempty recording smaller than 100 GB.",
             )
         if Path(filename).name != filename or "\\" in filename or "/" in filename:
-            message = "Invalid upload filename."
-            raise ValueError(message)
+            raise ValueError("Invalid upload filename.")
         suffix = Path(filename).suffix.lower()
         if suffix not in VIDEO_SUFFIXES:
-            message = "Choose an MP4, MKV, MOV, WebM, AVI or M4V recording."
-            raise ValueError(message)
+            raise ValueError("Choose an MP4, MKV, MOV, WebM, AVI or M4V recording.")
         stem = (
             re.sub(r"[^\w .-]", "_", Path(filename).stem).strip(" .")[:80]
             or "recording"
@@ -185,15 +193,19 @@ async def receive_video(request: Request, partial: Path, remaining: int) -> None
                     )
                 await output.write(chunk)
     except ClientDisconnect as error:
-        message = "The upload was interrupted. Choose the file again to retry."
-        raise ValueError(message) from error
+        raise ValueError(
+            "The upload was interrupted. Choose the file again to retry."
+        ) from error
     if remaining:
-        message = "The upload was interrupted. Choose the file again to retry."
-        raise ValueError(message)
+        raise ValueError("The upload was interrupted. Choose the file again to retry.")
 
 
 def static_file(request: Request) -> Response:
-    """Serve only the packaged application and explicitly supported static assets."""
+    """Serve only the packaged application and explicitly supported static assets.
+
+    Content-hashed bundles and the pinned tile artwork are cacheable; the page
+    itself is always fetched again so a new build takes effect.
+    """
     path = request.url.path
     if path in ("/", "/index.html"):
         path = "/index.html"
@@ -204,7 +216,10 @@ def static_file(request: Request) -> Response:
     file = STATIC / path.lstrip("/")
     if not file.is_file():
         return json_response({"error": "Page not found."}, HTTPStatus.NOT_FOUND)
-    return FileResponse(file)
+    cacheable = path.startswith("/assets/") or path.endswith(".svg")
+    return FileResponse(
+        file, headers={"Cache-Control": IMMUTABLE if cacheable else "no-store"}
+    )
 
 
 def create_app(workspace: Workspace) -> ASGIApp:
@@ -220,9 +235,11 @@ def create_app(workspace: Workspace) -> ASGIApp:
 
     routes = [
         Route("/api/workspace", endpoints.status),
+        Route("/api/job", endpoints.job),
         Route("/api/projects", endpoints.create, methods=["POST"]),
         Route("/api/projects/{key}", endpoints.project),
         Route("/api/projects/{key}/results", endpoints.results),
+        Route("/api/projects/{key}/log", endpoints.log),
         Route("/api/projects/{key}/{action}", endpoints.action, methods=["POST"]),
         Route("/api/upload", endpoints.upload, methods=["POST"]),
         Route("/exports/{key}/{name:path}", endpoints.export),
@@ -253,11 +270,10 @@ def serve_workspace(root: Path, port: int = 8765, *, open_browser: bool = True) 
         try:
             listener.bind(("127.0.0.1", port))
         except OSError as error:
-            message = (
+            raise SystemExit(
                 f"Cannot start the app on port {port}: {error}. "
                 "Try --port with another number."
-            )
-            raise SystemExit(message) from error
+            ) from error
         workspace = Workspace(root)
         server = uvicorn.Server(
             uvicorn.Config(

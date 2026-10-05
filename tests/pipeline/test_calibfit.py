@@ -7,6 +7,9 @@ The tests use synthetic pictures for the geometry and the real reference plate, 
 has been built, for the fit that must come back as the calibration it was cut from.
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
 from argparse import Namespace
 from pathlib import Path
@@ -17,20 +20,19 @@ import cv2
 import numpy as np
 import pytest
 
-from tests.paths import DATA, ROOT
+from tests.paths import DATA
 from tests.recognition import RecognitionStub
-from video2tenhou import calibfit, cli
+from video2tenhou import calibfit, cli, read
 from video2tenhou.layout import Calibration, Rect, apply_fit
-from video2tenhou.perception import detector
+from video2tenhou.paths import DATA_DIR
 from video2tenhou.perception.detector import Det
 
-REF_PLATE = ROOT / "work" / "full_1080p" / "plate.png"
+REF_PLATE = DATA_DIR / "work" / "full_1080p" / "plate.png"
 
 
 def test_geometry_samples_visible_tiles_without_overlay_or_hand_metadata(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify geometry samples visible tiles without overlay or hand metadata."""
     cal = Calibration.load("pml")
     monkeypatch.setattr(
         calibfit.videomod, "probe", lambda _path: SimpleNamespace(duration=100)
@@ -45,12 +47,12 @@ def test_geometry_samples_visible_tiles_without_overlay_or_hand_metadata(
     monkeypatch.setattr(
         detector,
         "predict",
-        lambda image: (
-            [Det((0, 0, 1, 1), 0.9, back=False)] * (4 if image[0, 0, 0] > 20 else 0)
-        ),
+        lambda image: [Det((0, 0, 1, 1), 0.9)] * (4 if image[0, 0, 0] > 20 else 0),
     )
     (tmp_path / "hands.json").write_text('[{"t_start":999,"t_end":1000}]')
-    samples = calibfit.prepare_table_samples(Path("v.mp4"), cal, detector, k=3)
+    samples = calibfit.prepare_table_samples(
+        calibfit.Recording(Path("v.mp4"), detector), cal, k=3
+    )
     assert samples == [
         {"t_start": 52.5, "t_end": 52.5},
         {"t_start": 90.0, "t_end": 90.0},
@@ -58,9 +60,8 @@ def test_geometry_samples_visible_tiles_without_overlay_or_hand_metadata(
 
 
 def test_geometry_gate_rejects_missing_tiles_and_retains_border_failure(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify geometry gate rejects missing tiles and retains border failure."""
     cal = Calibration.load("pml")
     monkeypatch.setattr(
         calibfit.videomod, "probe", lambda _path: SimpleNamespace(duration=100)
@@ -73,21 +74,22 @@ def test_geometry_gate_rejects_missing_tiles_and_retains_border_failure(
     empty = RecognitionStub("empty")
     monkeypatch.setattr(empty, "predict", lambda _image: [])
     with pytest.raises(RuntimeError, match="No table tiles"):
-        calibfit.prepare_table_samples(Path("v.mp4"), cal, empty, k=1)
+        calibfit.prepare_table_samples(
+            calibfit.Recording(Path("v.mp4"), empty), cal, k=1
+        )
     failure = calibfit.RegionCheck("pond:BR", held=43, cut=6)
     failure.verdict()
     assert not failure.ok
     monkeypatch.setattr(calibfit, "check_all", lambda *_unused_a: [failure])
-    monkeypatch.setattr(detector, "Detector", object)
     cal.fit = {"overhead": {}}
+    context = read.ReadContext("v.mp4", cal, tmp_path, empty, empty)
     with pytest.raises(SystemExit, match="pond:BR"):
-        cli._gate(Namespace(skip_fit_check=False, video="v.mp4"), cal, tmp_path)
+        cli._gate(Namespace(skip_fit_check=False, video="v.mp4"), context)
 
 
 def test_plate_cache_tracks_source_and_sampling_recipe(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify plate cache tracks source and sampling recipe."""
     source = tmp_path / "v.mp4"
     source.write_bytes(b"first")
     calls = []
@@ -95,7 +97,7 @@ def test_plate_cache_tracks_source_and_sampling_recipe(
         calibfit.videomod, "probe", lambda _path: SimpleNamespace(duration=10.0)
     )
 
-    def frame(path: "Path", t: "float") -> "np.ndarray":
+    def frame(path: Path, t: float) -> np.ndarray:
         calls.append(t)
         return np.full(
             (4, 4, 3), 10 if source.read_bytes() == b"first" else 20, np.uint8
@@ -113,10 +115,84 @@ def test_plate_cache_tracks_source_and_sampling_recipe(
     assert len(calls) == 10
 
 
-def test_meld_refinement_uses_crossing_boxes_not_neighbouring_tiles(
-    monkeypatch: "pytest.MonkeyPatch",
+def test_plate_status_is_read_only_and_keyed_by_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify meld refinement uses crossing boxes not neighbouring tiles."""
+    """Status checks never build; a plate is reused wherever its recording moves."""
+    source = tmp_path / "v.mp4"
+    source.write_bytes(b"video")
+    work = tmp_path / "work"
+    assert not calibfit.plate_current(source, work)
+    assert not work.exists()
+    work.mkdir()
+    cv2.imwrite(str(calibfit.plate_path(work)), np.full((4, 4, 3), 7, np.uint8))
+    recorded = {
+        "sha256": hashlib.sha256(b"video").hexdigest(),
+        "samples": calibfit.PLATE_FRAMES,
+        "frame": [1920, 1080],
+        "source": "a path the recording no longer has",
+        "start": None,
+    }
+    (work / "plate.meta.json").write_text(json.dumps(recorded))
+    moved = tmp_path / "moved.mp4"
+    source.replace(moved)
+    assert calibfit.plate_current(moved, work)
+    monkeypatch.setattr(
+        calibfit.videomod,
+        "probe",
+        lambda _path: pytest.fail("A current plate must not be rebuilt"),
+    )
+    assert np.all(calibfit.table_plate(moved, work) == 7)
+    moved.write_bytes(b"other")
+    assert not calibfit.plate_current(moved, work)
+
+
+def test_fit_and_check_decode_each_sample_once_and_share_table_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One preparation run decodes every timestamp once and samples the table once."""
+    cal = Calibration.load("pml")
+    decoded = []
+    monkeypatch.setattr(
+        calibfit.videomod, "probe", lambda _path: SimpleNamespace(duration=100.0)
+    )
+    monkeypatch.setattr(
+        calibfit.videomod,
+        "frame_at",
+        lambda _path, t: decoded.append(t) or np.zeros((1080, 1920, 3), np.uint8),
+    )
+    plate = np.zeros((1080, 1920, 3), np.uint8)
+    monkeypatch.setattr(calibfit, "table_plate", lambda *_unused_a, **_unused_k: plate)
+    monkeypatch.setattr(
+        calibfit,
+        "fit_overhead",
+        lambda *_unused_a: {"center": [960, 540], "angle": 45.0, "scale": 1.0},
+    )
+    monkeypatch.setattr(
+        calibfit, "fit_panel", lambda _plate, rect: (rect.x, rect.y, rect.w, rect.h)
+    )
+    monkeypatch.setattr(calibfit, "fit_path", lambda _path: tmp_path / "calib.json")
+    overheads = []
+    det = RecognitionStub("fit")
+
+    def predict(image: np.ndarray) -> list[Det]:
+        if image.shape[:2] == (cal.side, cal.side):
+            overheads.append(image.shape)
+        return [Det((10 + 30 * i, 10, 30 + 30 * i, 40), 0.9) for i in range(6)]
+
+    monkeypatch.setattr(det, "predict", predict)
+    recording = calibfit.Recording(Path("v.mp4"), det)
+    fit = calibfit.run_fit(recording, cal, tmp_path)
+    fitted = Calibration(apply_fit(cal.data, fit))
+    calibfit.check_all(Path("v.mp4"), fitted, det, tmp_path, recording=recording)
+    assert sorted(decoded) == sorted(set(decoded))
+    assert len(decoded) == 24
+    assert len(overheads) == 24
+
+
+def test_meld_refinement_uses_crossing_boxes_not_neighbouring_tiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     cal = Calibration.load("pml")
     data = json.loads(json.dumps(cal.data))
     data["meld"]["TL"] = {"rect": [100, 100, 100, 100], "scale": 1.0}
@@ -129,14 +205,14 @@ def test_meld_refinement_uses_crossing_boxes_not_neighbouring_tiles(
     )
 
     class Detector(RecognitionStub):
-        def predict(self, image: "np.ndarray") -> list:
+        def predict(self, image: np.ndarray) -> list:
             return [
-                Det((60, 125, 100, 155), 0.9, back=False),  # cut by the bottom border
-                Det((0, 0, 20, 20), 0.99, back=False),
-            ]  # outside: must not expand top/left
+                Det((60, 125, 100, 155), 0.9),  # cut by the bottom border
+                Det((0, 0, 20, 20), 0.99),  # outside: must not expand
+            ]
 
     assert calibfit._expand_cut_meld(
-        Path("v.mp4"), cal, "TL", Detector("meld"), []
+        calibfit.Recording(Path("v.mp4"), Detector("meld")), cal, "TL", []
     ) == [
         100,
         100,
@@ -147,9 +223,8 @@ def test_meld_refinement_uses_crossing_boxes_not_neighbouring_tiles(
 
 @pytest.mark.parametrize("improves", [True, False])
 def test_automatic_meld_refinement_requires_a_better_border_check(
-    *, tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", improves: bool
+    *, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, improves: bool
 ) -> None:
-    """Verify automatic meld refinement requires a better border check."""
     cal = Calibration.load("pml")
     monkeypatch.setattr(
         calibfit, "table_plate", lambda *_unused_args, **_unused_kwargs: object()
@@ -182,8 +257,8 @@ def test_automatic_meld_refinement_requires_a_better_border_check(
     )
 
     def check(
-        video: "Path",
-        candidate: "Calibration",
+        video: Path,
+        candidate: Calibration,
         *_unused_args: object,
         **_unused_kwargs: object,
     ) -> list:
@@ -199,19 +274,17 @@ def test_automatic_meld_refinement_requires_a_better_border_check(
 
     monkeypatch.setattr(calibfit, "check_regions", check)
     fitted = calibfit.run_fit(
-        Path("v.mp4"),
+        calibfit.Recording(Path("v.mp4"), RecognitionStub("fit")),
         cal,
         tmp_path,
-        det=RecognitionStub("fit"),
-        options=calibfit.FitOptions(keep={"hand"}),
+        keep={"hand"},
     )
     assert fitted["meld"]["TL"]["rect"] == [100, 100, 100, 119 if improves else 100]
 
 
 def test_human_meld_fit_is_never_expanded(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify human meld fit is never expanded."""
     cal = Calibration.load("pml")
     cal.fit = {
         "overhead": {"center": [960, 540], "angle": 45.0, "scale": 1.0},
@@ -231,19 +304,17 @@ def test_human_meld_fit_is_never_expanded(
     )
     monkeypatch.setattr(calibfit, "fit_path", lambda _path: tmp_path / "calib.json")
     fitted = calibfit.run_fit(
-        Path("v.mp4"),
+        calibfit.Recording(Path("v.mp4"), RecognitionStub("fit")),
         cal,
         tmp_path,
-        det=RecognitionStub("fit"),
-        options=calibfit.FitOptions(keep={"hand", "overhead"}),
+        keep={"hand", "overhead"},
     )
     assert fitted["meld"] == cal.fit["meld"]
 
 
 def test_retry_preserves_manual_overhead(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify retry preserves manual overhead."""
     cal = Calibration.load("pml")
     cal.fit = {
         "overhead": {"center": [981, 543], "angle": 46, "scale": 1, "source": "human"},
@@ -258,7 +329,7 @@ def test_retry_preserves_manual_overhead(
     )
     monkeypatch.setattr(calibfit, "fit_path", lambda _path: tmp_path / "calib.json")
     fitted = calibfit.run_fit(
-        Path("v.mp4"), cal, tmp_path, options=calibfit.FitOptions(keep={"hand", "meld"})
+        calibfit.Recording(Path("v.mp4")), cal, tmp_path, keep={"hand", "meld"}
     )
     assert fitted["overhead"] == cal.fit["overhead"]
     applied = Calibration(apply_fit(cal.data, fitted))
@@ -294,23 +365,22 @@ def test_fit_publication_keeps_previous_calibration_readable(
         )
         stream.flush()
         assert path.read_bytes() == original
-        message = "interrupted calibration publication"
-        raise OSError(message)
+        raise OSError("interrupted calibration publication")
 
     monkeypatch.setattr(json, "dump", interrupted)
     with pytest.raises(OSError, match="interrupted calibration"):
         calibfit.run_fit(
-            Path("v.mp4"),
+            calibfit.Recording(Path("v.mp4")),
             cal,
             tmp_path,
-            options=calibfit.FitOptions(keep={"hand", "meld"}),
+            keep={"hand", "meld"},
         )
     assert path.read_bytes() == original
     assert not list(tmp_path.glob(".*.tmp"))
 
 
 @pytest.fixture(scope="module")
-def cal() -> "Calibration":
+def cal() -> Calibration:
     """Load the packaged reference calibration."""
     return Calibration.load("pml")
 
@@ -319,8 +389,7 @@ def cal() -> "Calibration":
 # -------------------------------
 
 
-def test_apply_fit_replaces_only_what_it_names(cal: "Calibration") -> None:
-    """Verify apply fit replaces only what it names."""
+def test_apply_fit_replaces_only_what_it_names(cal: Calibration) -> None:
     fit = {
         "overhead": {"center": [1000.0, 500.0], "angle": 46.5, "scale": 0.97},
         "meld": {"TL": {"rect": [10, 20, 100, 110]}},
@@ -338,10 +407,8 @@ def test_apply_fit_replaces_only_what_it_names(cal: "Calibration") -> None:
     assert cal.center == (960.0, 540.0)  # the layout itself is never edited in place
 
 
-def test_pond_rects_are_the_table_not_the_fit(cal: "Calibration") -> None:
-    """Verify pond rects are the table not the fit.
-
-    Pond rectangles are a property of the table, so a fit may not carry them: they
+def test_pond_rects_are_the_table_not_the_fit(cal: Calibration) -> None:
+    """Pond rectangles are a property of the table, so a fit may not carry them: they
     follow the overhead.
     """
     fit = {
@@ -352,10 +419,8 @@ def test_pond_rects_are_the_table_not_the_fit(cal: "Calibration") -> None:
     assert c2.pond["TL"][0] == cal.pond["TL"][0]
 
 
-def test_overhead_scale_moves_the_pond_in_the_frame(cal: "Calibration") -> None:
-    """Verify overhead scale moves the pond in the frame.
-
-    The whole point of the fit: a different overhead puts the same pond rectangle
+def test_overhead_scale_moves_the_pond_in_the_frame(cal: Calibration) -> None:
+    """The whole point of the fit: a different overhead puts the same pond rectangle
     somewhere else.
     """
     a, _ = cal.transform("pond:TL")
@@ -374,17 +439,14 @@ def test_overhead_scale_moves_the_pond_in_the_frame(cal: "Calibration") -> None:
 
 
 def test_cut_classifies_a_box_against_a_border() -> None:
-    """Verify cut classifies a box against a border."""
     inner = (100.0, 100.0, 300.0, 300.0)
     assert calibfit._cut((120, 120, 180, 200), inner) is False  # wholly inside
     assert calibfit._cut((10, 120, 60, 200), inner) is None  # wholly outside
-    assert (
-        calibfit._cut((60, 120, 160, 200), inner) is True
-    )  # half on each side of the left border
+    # half on each side of the left border
+    assert calibfit._cut((60, 120, 160, 200), inner) is True
 
 
-def test_grown_region_holds_the_true_region_with_a_margin(cal: "Calibration") -> None:
-    """Verify grown region holds the true region with a margin."""
+def test_grown_region_holds_the_true_region_with_a_margin(cal: Calibration) -> None:
     for name in ("pond:TL", "pond:BR", "meld:TR", "hand:BL"):
         kind = name.partition(":")[0]
         _transform, inner, size = calibfit.grown(cal, name, calibfit.GROW[kind])
@@ -396,9 +458,7 @@ def test_grown_region_holds_the_true_region_with_a_margin(cal: "Calibration") ->
 
 
 def test_verdicts_follow_the_counts() -> None:
-    """Verify verdicts follow the counts."""
-
-    def rc(held: "int", cut: "int", region: str = "pond:TL") -> "str":
+    def rc(held: int, cut: int, region: str = "pond:TL") -> str:
         c = calibfit.RegionCheck(region, held=held, cut=cut, frames=8)
         c.verdict()
         return c.level
@@ -407,28 +467,23 @@ def test_verdicts_follow_the_counts() -> None:
     assert rc(60, 1) == "ok"  # one stray box in a busy region is not a misplaced region
     assert rc(60, 5) == "warn"  # a few: worth a look, not a reason to stop the run
     assert rc(60, 10) == "fail"
-    assert (
-        rc(3, 3) == "fail"
-    )  # every tile at the border cut: the region is in the wrong place
-    assert (
-        rc(0, 0) == "fail"
-    )  # a pond that never holds a tile is not looking at the table
-    assert (
-        rc(0, 0, "meld:TL") == "warn"
-    )  # a meld camera may see no call in eight frames: look at it
+    # every tile at the border cut: the region is in the wrong place
+    assert rc(3, 3) == "fail"
+    # a pond that never holds a tile is not looking at the table
+    assert rc(0, 0) == "fail"
+    # a meld camera may see no call in eight frames: look at it
+    assert rc(0, 0, "meld:TL") == "warn"
     c = calibfit.RegionCheck("pond:TL", held=60, cut=0, frames=8, foreign=2)
     c.verdict()
-    assert (
-        c.level == "fail"
-    )  # a pond holding a neighbour's discards reads the wrong pond
+    # a pond holding a neighbour's discards reads the wrong pond
+    assert c.level == "fail"
 
 
 # -- the overhead fit
 # -------------------------------------------------------------------
 
 
-def test_unit_template_is_in_overhead_coordinates(cal: "Calibration") -> None:
-    """Verify unit template is in overhead coordinates."""
+def test_unit_template_is_in_overhead_coordinates(cal: Calibration) -> None:
     t = calibfit.unit_template(cal)
     assert t.shape == (cal.side, cal.side)
     ys, xs = np.nonzero(t)
@@ -438,7 +493,6 @@ def test_unit_template_is_in_overhead_coordinates(cal: "Calibration") -> None:
 
 
 def test_unit_mask_finds_a_dark_square_on_felt() -> None:
-    """Verify unit mask finds a dark square on felt."""
     plate = np.zeros((1080, 1920, 3), np.uint8)
     plate[:, :] = (120, 110, 40)  # teal felt: saturated
     cv2.fillPoly(
@@ -453,20 +507,38 @@ def test_unit_mask_finds_a_dark_square_on_felt() -> None:
 
 
 def test_unit_mask_without_a_unit_says_so() -> None:
-    """Verify unit mask without a unit says so."""
     plate = np.zeros((1080, 1920, 3), np.uint8)
     plate[:, :] = (120, 110, 40)
     with pytest.raises(RuntimeError):
         calibfit.unit_mask(plate)
 
 
-@pytest.mark.skipif(
-    not REF_PLATE.exists(), reason="the reference plate has not been built"
-)
-def test_reference_video_fits_back_to_its_own_calibration(cal: "Calibration") -> None:
-    """Verify the reference recording recovers its original geometry.
+def test_a_plate_drawn_with_the_layout_fits_back_to_it(cal: Calibration) -> None:
+    """A synthetic plate shows the shipped unit template where the layout puts it."""
+    overhead_to_frame = np.linalg.inv(cal.derotation())[:2]
+    unit = cv2.warpAffine(
+        calibfit.unit_template(cal),
+        overhead_to_frame,
+        (1920, 1080),
+        flags=cv2.INTER_NEAREST,
+    )
+    plate = np.full((1080, 1920, 3), (120, 110, 40), np.uint8)  # teal felt
+    plate[unit > 0] = (60, 60, 60)
+    fit = calibfit.fit_overhead(plate, cal)
+    assert fit["iou"] > 0.95
+    assert abs(fit["center"][0] - cal.center[0]) < 1.5
+    assert abs(fit["center"][1] - cal.center[1]) < 1.5
+    assert abs(fit["angle"] - cal.angle) < 0.5
+    assert abs(fit["scale"] - 1.0) < 0.02
 
-    The layout was drawn on the reference VOD, so fitting that video must return that
+
+@pytest.mark.skipif(
+    not REF_PLATE.exists(),
+    reason="needs the local reference plate work/full_1080p/plate.png in the data "
+    "directory (VIDEO2TENHOU_HOME)",
+)
+def test_reference_video_fits_back_to_its_own_calibration(cal: Calibration) -> None:
+    """The layout was drawn on the reference VOD, so fitting that video must return that
     layout.
     """
     plate = cv2.imread(str(REF_PLATE))
@@ -480,13 +552,30 @@ def test_reference_video_fits_back_to_its_own_calibration(cal: "Calibration") ->
 
 
 def test_second_video_fit_is_not_the_layout() -> None:
-    """Verify second video fit is not the layout.
-
-    A second broadcast of the same layout does not have the same table geometry: if it
-    did, stage 0 would be pointless. This guards against a fit that silently falls back
-    to the layout's numbers.
+    """A second broadcast of the same layout does not have the same table geometry: if
+    it did, stage 0 would be pointless. This guards against a fit that silently falls
+    back to the layout's numbers.
     """
     fit = json.loads((DATA / "week_11_calib.json").read_text(encoding="utf-8"))
     cal = Calibration.load("pml")
     oh = fit["overhead"]
     assert abs(oh["center"][0] - cal.center[0]) > 10  # the overhead really did move
+
+
+def test_unit_template_is_cut_from_a_trusted_plate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new layout's template holds the plate's centre unit in overhead pixels."""
+    cal = Calibration.load("pml")
+    plate = np.full((1080, 1920, 3), (90, 120, 40), np.uint8)
+    cv2.rectangle(plate, (880, 460), (1040, 620), (20, 20, 20), thickness=-1)
+    monkeypatch.setattr(calibfit, "table_plate", lambda *_unused: plate)
+    out = calibfit.write_unit_template(
+        tmp_path / "v.mp4", cal, tmp_path, tmp_path / "unit.png"
+    )
+    template = cv2.imread(str(out), cv2.IMREAD_GRAYSCALE)
+    assert template is not None
+    assert template.shape == (cal.side, cal.side)
+    centre = template[cal.side // 2 - 20 : cal.side // 2 + 20] > 0
+    assert centre[:, cal.side // 2 - 20 : cal.side // 2 + 20].all()
+    assert 0 < (template > 0).mean() < 0.5

@@ -3,13 +3,15 @@
 
 """Uncertain hand annotations guide evidence without becoming human constraints."""
 
+from __future__ import annotations
+
 from collections import Counter
 
 import pytest
 
-from tests.engine.factories import hand_decoder
 from video2tenhou.engine import rules
-from video2tenhou.engine.decode import HandDecoder
+from video2tenhou.engine.questions import Report
+from video2tenhou.engine.reconstruct import apply_hand_facts
 from video2tenhou.engine.review import facts_for_hand
 from video2tenhou.engine.solver import TILES, HandModel
 
@@ -22,7 +24,7 @@ ENTRY = {
 HAND = ["1m", "2m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "1z", "1z", "3z", "6z"]
 
 
-def annotation(kind: "str", **fields: "object") -> "dict":
+def annotation(kind: str, **fields: object) -> dict:
     """Create a hand-scoped annotation with explicitly supplied evidence fields."""
     return {
         "game": 0,
@@ -38,14 +40,12 @@ def annotation(kind: "str", **fields: "object") -> "dict":
 @pytest.mark.parametrize("kind", ["haipai", "final_hand"])
 @pytest.mark.parametrize("source", ["legacy-import", "camera-import"])
 def test_sourced_hand_requires_explicit_strength(kind: str, source: str) -> None:
-    """Verify sourced hand requires explicit strength."""
     with pytest.raises(ValueError, match="must explicitly set soft"):
         facts_for_hand([annotation(kind, source=source)], ENTRY)
 
 
 @pytest.mark.parametrize("soft", ["false", "true", 0, 1, None])
 def test_strength_rejects_non_boolean_values(soft: int | str | None) -> None:
-    """Verify strength rejects non boolean values."""
     with pytest.raises(ValueError, match="soft must be a boolean"):
         facts_for_hand([annotation("final_hand", soft=soft)], ENTRY)
 
@@ -60,17 +60,14 @@ def test_strength_rejects_non_boolean_values(soft: int | str | None) -> None:
     ],
 )
 def test_explicit_hand_strength_controls_constraint_and_evidence(
-    *, kind: str, fields: "dict", soft: bool
+    *, kind: str, fields: dict, soft: bool
 ) -> None:
-    """Verify explicit hand strength controls constraint and evidence."""
     facts = facts_for_hand([annotation(kind, **fields)], ENTRY)
     model = HandModel("E", {seat: [] for seat in rules.SEATS}, [])
-    decoder = hand_decoder(
-        facts=facts, live_calls=[], tsumo_winner=None, t0=10, t1=20, problems=[]
-    )
-    HandDecoder._apply_hand_facts(decoder, model)
+    report = Report()
+    apply_hand_facts(model, facts, calls=[], window=(10, 20), report=report)
     constraints = model.facts.haipai if kind == "haipai" else model.facts.final
-    assert decoder.problems == []
+    assert report == Report()
     if soft:
         assert "S" not in constraints
         (evidence,) = model.hand_ev
@@ -84,31 +81,22 @@ def test_explicit_hand_strength_controls_constraint_and_evidence(
 
 
 def test_soft_winning_hand_without_winning_tile_targets_pre_draw_state() -> None:
-    """Verify soft winning hand without winning tile targets pre draw state."""
     facts = facts_for_hand([annotation("final_hand", soft=True)], ENTRY)
     model = HandModel("E", {seat: [] for seat in rules.SEATS}, [], tsumo_winner="S")
-    decoder = hand_decoder(
-        facts=facts, live_calls=[], tsumo_winner="S", t0=10, t1=20, problems=[]
-    )
-    HandDecoder._apply_hand_facts(decoder, model)
+    apply_hand_facts(model, facts, calls=[], window=(10, 20), report=Report())
     assert model.facts.final == model.facts.final_excl == {}
     assert model.hand_ev[0].j == -1
 
 
 @pytest.mark.parametrize("kind", ["haipai", "final_hand"])
 def test_incorrect_soft_hand_cannot_override_confirmed_tiles(kind: str) -> None:
-    """Verify incorrect soft hand cannot override confirmed tiles."""
     fact = annotation(kind, soft=True)
-    fact["tiles"] = [
-        "1m"
-    ] * 13  # Impossible as a hard constraint, but a permissible mistaken observation.
+    # Impossible as a hard constraint, but a permissible mistaken observation.
+    fact["tiles"] = ["1m"] * 13
     facts = facts_for_hand([fact], ENTRY)
     model = HandModel("E", {seat: [] for seat in rules.SEATS}, [])
     model.facts.haipai["S"] = HAND
-    decoder = hand_decoder(
-        facts=facts, live_calls=[], tsumo_winner=None, t0=10, t1=20, problems=[]
-    )
-    HandDecoder._apply_hand_facts(decoder, model)
-    solution = model.solve(margins=False, workers=1, time_limit=3)
+    apply_hand_facts(model, facts, calls=[], window=(10, 20), report=Report())
+    solution = model.solve(workers=1, time_limit=3)
     assert solution.ok
     assert Counter(solution.haipai["S"]) == Counter(HAND)

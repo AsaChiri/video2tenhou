@@ -3,12 +3,14 @@
 
 """Retention changes derived evidence without rewriting raw recognition."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import sys
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -19,30 +21,24 @@ from video2tenhou.perception import detector
 from video2tenhou.perception.detector_metadata import InferenceOptions
 from video2tenhou.perception.evidence_policy import (
     DEFAULT_POLICY,
+    EvidencePolicy,
     load_policy,
     prepare_reading,
     resolve_policy,
 )
-from video2tenhou.train.data import CLASSES
+from video2tenhou.perception.tiles import CLASSES
 from video2tenhou.train.export_detector import write_runtime_metadata
-
-if TYPE_CHECKING:
-    from video2tenhou.perception.evidence_policy import EvidencePolicy
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _policy(
     stage: str = "sparse", kind: str = "hand", value: float = 0.1
-) -> "EvidencePolicy":
+) -> EvidencePolicy:
     data = DEFAULT_POLICY.to_dict()
     data[stage][kind] = value
     return resolve_policy(data)
 
 
-def _box(x: "float", confidence: "float", *, none: float = 0.0) -> dict:
+def _box(x: float, confidence: float, *, none: float = 0.0) -> dict:
     posterior = [0.0] * len(CLASSES)
     posterior[CLASSES.index("1s")] = 1 - none
     posterior[CLASSES.index("none")] = none
@@ -56,7 +52,6 @@ def _box(x: "float", confidence: "float", *, none: float = 0.0) -> dict:
 
 
 def test_default_stage_boundaries_and_none_filter_preserve_raw_input() -> None:
-    """Verify default stage boundaries and none filter preserve raw input."""
     reading = {
         "t": 1.0,
         "region": "meld:TL",
@@ -65,9 +60,7 @@ def test_default_stage_boundaries_and_none_filter_preserve_raw_input() -> None:
         "boxes": [_box(10.0, 0.2), _box(21.0, 0.35), _box(32.0, 0.5, none=0.5)],
     }
     before = deepcopy(reading)
-    sparse = prepare_reading(
-        "meld", reading, stage="sparse", none_index=CLASSES.index("none")
-    )
+    sparse = prepare_reading("meld", reading, stage="sparse")
     dense = prepare_reading("meld", reading, stage="dense")
     assert [box["conf"] for box in sparse["boxes"]] == [0.35]
     assert [box["conf"] for box in dense["boxes"]] == [0.2, 0.35, 0.5]
@@ -78,8 +71,7 @@ def test_default_stage_boundaries_and_none_filter_preserve_raw_input() -> None:
 
 
 @pytest.mark.parametrize("bad", [True, float("nan"), float("inf"), -0.1, 1.1, "0.2"])
-def test_invalid_numeric_policy_never_silently_falls_back(bad: "float") -> None:
-    """Verify invalid numeric policy never silently falls back."""
+def test_invalid_numeric_policy_never_silently_falls_back(bad: float) -> None:
     data = DEFAULT_POLICY.to_dict()
     data["sparse"]["hand"] = bad
     with pytest.raises(ValueError, match="Evidence floors must be finite numbers"):
@@ -87,17 +79,24 @@ def test_invalid_numeric_policy_never_silently_falls_back(bad: "float") -> None:
 
 
 def test_metadata_schema_and_stage_identity_are_complete_and_independent(
-    tmp_path: "Path",
+    tmp_path: Path,
 ) -> None:
-    """Verify metadata schema and stage identity are complete and independent."""
     sparse = _policy()
     dense = _policy("dense")
+    # Saved observations and dense reads are bound to these exact identities.
+    assert DEFAULT_POLICY.fingerprint_for("sparse") == (
+        "95198c86190280a0e0e24040d252fbaf2604a957b817d6eaa6fb51eb69e6a169"
+    )
+    assert DEFAULT_POLICY.fingerprint_for("dense") == (
+        "6707b09e40172d44b0c12c2e74683dfbccf0b0bff7b31b7553846e70e89317e9"
+    )
     assert sparse.fingerprint_for("dense") == DEFAULT_POLICY.fingerprint_for("dense")
     assert dense.fingerprint_for("sparse") == DEFAULT_POLICY.fingerprint_for("sparse")
-    assert sparse.fingerprint != DEFAULT_POLICY.fingerprint != dense.fingerprint
+    assert sparse.fingerprint_for("sparse") != DEFAULT_POLICY.fingerprint_for("sparse")
+    assert dense.fingerprint_for("dense") != DEFAULT_POLICY.fingerprint_for("dense")
     data = sparse.to_dict()
     data["sparse"]["hand"] = 0.9
-    assert sparse.minimum("sparse", "hand") == 0.1
+    assert sparse.sparse.hand == 0.1
     for bad in (
         {},
         dict(DEFAULT_POLICY.to_dict(), schema_version=True),
@@ -126,7 +125,6 @@ def test_metadata_schema_and_stage_identity_are_complete_and_independent(
 
 
 def test_known_human_1s_exposes_reader_vs_retained_loss_without_raw_mutation() -> None:
-    """Verify known human 1s exposes reader vs retained loss without raw mutation."""
     fixture = json.loads((DATA / "retention_known_1s.json").read_text())
     reading, ground_truth = fixture["reading"], fixture["ground_truth"]
     original = deepcopy(reading)
@@ -144,7 +142,6 @@ def test_known_human_1s_exposes_reader_vs_retained_loss_without_raw_mutation() -
 
 
 def test_restructure_changes_role_before_evaluation_matches() -> None:
-    """Verify restructure changes role before evaluation matches."""
     reading = {
         "t": 1.0,
         "region": "hand:TR",
@@ -164,9 +161,8 @@ def test_restructure_changes_role_before_evaluation_matches() -> None:
 
 
 def test_policy_only_metadata_change_keeps_detector_recognition_identity(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify policy only metadata change keeps detector recognition identity."""
     model = SimpleNamespace(names={0: "face"}, family="yolo9", size="s")
     monkeypatch.setitem(
         sys.modules,
@@ -196,8 +192,7 @@ def test_policy_only_metadata_change_keeps_detector_recognition_identity(
     ) != second.evidence_policy.fingerprint_for("sparse")
 
 
-def test_export_records_explicit_policy_with_checkpoint_hash(tmp_path: "Path") -> None:
-    """Verify export records explicit policy with checkpoint hash."""
+def test_export_records_explicit_policy_with_checkpoint_hash(tmp_path: Path) -> None:
     weights = tmp_path / "weights.pt"
     torch.save(
         {

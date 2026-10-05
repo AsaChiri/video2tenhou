@@ -16,28 +16,30 @@ section for the GitHub release notes; do not commit separate per-version notes.
    Build the frontend before packaging; its generated assets belong in release
    archives but are excluded from Git.
 3. Run the [validation commands](MAINTENANCE.md#tests), including coverage,
-   wheel resource checks and the source archive's isolated test suite. Inspect
-   the resulting wheel and source archive for unintended local data.
-4. Build the model bundle with `uv run python tools/package_models.py`.
+   wheel resource checks and the source archive's inventory and smoke tests.
+   Inspect the resulting wheel and source archive for unintended local data.
+4. Build the model bundle with `uv run python tools/package_release.py models`.
    The ignored ZIP contains per-file SHA-256 metadata and has a separate ZIP
    checksum. Retain the base checkpoint identity, training configuration,
    dataset provenance, classifier class ordering and calibration metadata.
-   Detector metadata must match its weights digest. The bundle preserves
-   adjacent model provenance and license files; LibreYOLO bundles require
-   both `detector/provenance.json` and the upstream `detector/LICENSE` notice.
-   Identical model files produce the same ZIP checksum.
-   Build the starter download from that model bundle and the source distribution:
+   Detector metadata must match its weights digest and settings. The bundle
+   preserves adjacent model provenance and license files; it requires
+   `detector/provenance.json`, the upstream `detector/LICENSE` notice and
+   `classifier/provenance.json`. Identical model files produce the same ZIP
+   checksum. Build the starter download from that model bundle and the source
+   distribution:
 
    ```console
-   uv run python tools/package_starter.py --source dist/video2tenhou-0.2.0.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.2.0-starter.zip
+   uv run python tools/package_release.py starter --source dist/video2tenhou-0.2.0.tar.gz --models dist/video2tenhou-pml-models.zip --out dist/video2tenhou-0.2.0-starter.zip
    ```
 
    Use the matching version in the filenames. The starter contains the application,
-   launchers, adaptive runtime setup and trained models in one folder.
-   Its checksum accompanies the ZIP. Extract it into a new directory and verify
-   that the launcher selects a compatible runtime and opens the browser studio.
-   Check NVIDIA and CPU-only machines, an existing installation, and a repair
-   launch. Record the versions selected on each machine; runtime selection is
+   launchers, adaptive runtime setup and trained models in one folder; it accepts
+   only models matching their manifest. Its checksum accompanies the ZIP. Extract
+   it into a new directory and verify that the launcher selects a compatible
+   runtime and opens the browser studio. Check NVIDIA and CPU-only machines, an
+   existing installation, an offline relaunch and a `Start.cmd --update` launch.
+   Record the versions selected on each machine; runtime selection is
    intentionally independent of the development lockfile.
 5. Install from the artifacts in a fresh environment. Convert a representative
    full recording, inspect review questions, replay every exported hand and

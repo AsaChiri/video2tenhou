@@ -2,8 +2,16 @@
 import { ref, watch } from "vue";
 import type { HandData, Turn } from "../types";
 import { useReview } from "./context";
-import { isAnswered } from "./decisions";
-import { cornerOf, roundName, seats, seatName, time } from "./format";
+import {
+  cornerOf,
+  handStatusLabel,
+  roundName,
+  seats,
+  seatName,
+  time,
+} from "./format";
+import { drawWindow } from "./evidence";
+import { errorText } from "../shared/useAction";
 import TileFace from "./TileFace.vue";
 import TileListEditor from "./TileListEditor.vue";
 import EvidencePlayer from "./EvidencePlayer.vue";
@@ -18,21 +26,21 @@ const review = useReview(),
   editing = ref<string | null>(null),
   tiles = ref<string[]>([]);
 watch(
-  () => props.hand,
-  async (hand, _, cleanup) => {
+  [() => props.hand, review.loads],
+  async ([hand], previous, cleanup) => {
     let current = true;
     cleanup(() => (current = false));
-    data.value = null;
-    selectedTurn.value = null;
-    editing.value = null;
+    if (hand !== previous?.[0]) {
+      data.value = null;
+      selectedTurn.value = null;
+      editing.value = null;
+    }
     if (hand == null) return;
     try {
       const result = await review.api<HandData>(`hand/${hand}`);
       if (current) data.value = result;
     } catch (error) {
-      if (current)
-        review.error.value =
-          error instanceof Error ? error.message : String(error);
+      if (current) review.error.value = errorText(error);
     }
   },
   { immediate: true },
@@ -41,19 +49,13 @@ function needsReview(turn: Turn) {
   return review.items.value.some(
     (item) =>
       item.hand === props.hand &&
-      !isAnswered(item, review.hands.value, review.facts.value) &&
       ((item.kind === "draw" && item.seat === turn.seat && item.j === turn.j) ||
         (item.kind === "uncertain_tiles" &&
           item.choices?.some(
             (choice) =>
               choice.field === "draw" &&
               choice.seat === turn.seat &&
-              choice.j === turn.j &&
-              !isAnswered(
-                { ...choice, hand: item.hand, kind: choice.field },
-                review.hands.value,
-                review.facts.value,
-              ),
+              choice.j === turn.j,
           ))),
   );
 }
@@ -68,13 +70,12 @@ async function save() {
     });
     editing.value = null;
   } catch (error) {
-    review.error.value = error instanceof Error ? error.message : String(error);
+    review.error.value = errorText(error);
   }
 }
 </script>
 <template>
   <section v-if="hand == null">
-    <h2>Hands</h2>
     <table>
       <thead>
         <tr>
@@ -97,7 +98,7 @@ async function save() {
             </button>
           </td>
           <td>{{ time(entry.t_start) }}–{{ time(entry.t_end) }}</td>
-          <td>{{ entry.status }}</td>
+          <td>{{ handStatusLabel(entry.status, entry.pending) }}</td>
           <td>{{ entry.turns }}</td>
           <td>
             {{ entry.score == null ? "" : entry.score ? "Matches" : "Differs" }}
@@ -110,16 +111,22 @@ async function save() {
     <button @click="emit('select', null)">All hands</button>
     <p v-if="!data" role="status">Loading hand…</p>
     <template v-else
-      ><h2>Hanchan {{ data.entry.game + 1 }} · {{ roundName(data.entry) }}</h2>
-      <details v-if="data.decode?.notes?.length" class="review-details">
-        <summary aria-label="Processing notes" title="Processing notes">
-          ⓘ
-        </summary>
-        <p v-for="note in data.decode.notes" :key="note">{{ note }}</p>
-      </details>
-      <p v-if="!data.decode">Hand {{ hand + 1 }} has not been analyzed yet.</p>
+      ><h2>
+        Hand {{ hand + 1 }} · Hanchan {{ data.entry.game + 1 }} ·
+        {{ roundName(data.entry) }}
+      </h2>
+      <p v-if="!data.decode">
+        {{
+          review.pending.value.includes(hand)
+            ? "This hand is waiting for an update."
+            : "This hand has not been analyzed yet."
+        }}
+      </p>
       <template v-else
-        ><p>
+        ><ul v-if="data.decode.notes?.length" class="notes">
+          <li v-for="note in data.decode.notes" :key="note">{{ note }}</li>
+        </ul>
+        <p>
           Dealer {{ seatName(data.entry, data.decode.dealer) }} · Dora
           {{ data.decode.dora?.join(" ") }} · {{ data.decode.result?.outcome }}
           {{
@@ -131,8 +138,8 @@ async function save() {
         <div class="actions">
           <button
             v-if="!review.pending.value.length"
-            :disabled="review.updating.value"
-            @click="review.rebuild(`decode/${hand}`)"
+            :disabled="review.busy.value"
+            @click="review.rebuild([hand])"
           >
             Rebuild hand {{ hand + 1 }}
           </button>
@@ -145,16 +152,8 @@ async function save() {
           </h3>
           <EvidencePlayer
             :key="selectedTurn.i"
-            :start="
-              Math.max(
-                data.entry.t_start || 0,
-                (selectedTurn.t_prev ?? selectedTurn.t - 15) - 6,
-              )
-            "
-            :end="
-              selectedTurn.t +
-              (selectedTurn.t >= (data.decode.t_last ?? 0) - 1 ? 30 : 4)
-            "
+            :start="drawWindow(selectedTurn, data.entry, data.decode)[0]"
+            :end="drawWindow(selectedTurn, data.entry, data.decode)[1]"
           />
           <details class="review-details">
             <summary>Additional evidence</summary>
@@ -233,20 +232,13 @@ async function save() {
           </tbody>
         </table>
         <details>
-          <summary>Advanced reconstruction confidence</summary>
-          <p>
-            Certified margin: a lower bound on the cost of changing a decision.
-            A low bound can mean unfinished search. An alternative's cost gap
-            does not prove the chosen tile correct.
-          </p>
+          <summary>All decisions</summary>
           <table>
             <thead>
               <tr>
                 <th>Choice</th>
                 <th>Seat</th>
                 <th>Value</th>
-                <th>Certified margin</th>
-                <th>Alternative cost gap</th>
               </tr>
             </thead>
             <tbody>
@@ -270,22 +262,6 @@ async function save() {
                       : choice.value
                   }}
                 </td>
-                <td>
-                  {{
-                    choice.margin == null
-                      ? "Unavailable"
-                      : choice.margin >= 1e8
-                        ? "No close alternative"
-                        : choice.margin.toFixed(2)
-                  }}
-                </td>
-                <td>
-                  {{
-                    choice.alternative_gap == null
-                      ? "Unavailable"
-                      : choice.alternative_gap.toFixed(2)
-                  }}
-                </td>
               </tr>
             </tbody>
           </table>
@@ -293,7 +269,7 @@ async function save() {
         <FactsPanel
           :hand="hand"
           :entry="data.entry"
-          :notes="data.decode.problems"
+          :ignored="data.ignored"
         /> </template
     ></template>
   </section>

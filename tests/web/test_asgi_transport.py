@@ -11,7 +11,7 @@ import time
 from contextlib import closing
 from http import HTTPStatus
 from http.client import HTTPConnection
-from typing import TYPE_CHECKING
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
@@ -19,9 +19,7 @@ import pytest
 from tests.web.server import studio_server
 from video2tenhou.tool.http import PROJECT_BODY_LIMIT
 from video2tenhou.tool.review_routes import ReviewRoutes
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from video2tenhou.tool.workflow import Job
 
 
 def connection(url: str) -> HTTPConnection:
@@ -150,14 +148,16 @@ def test_review_write_rechecks_jobs_after_receiving_body(
         client.putheader("Content-Length", "2")
         client.endheaders(b"{")
         assert checked.wait(timeout=2), "Initial job exclusion check never ran"
+        job = Job(kind="analyze", project=key, stage="Reading tiles")
         with studio.workspace.lock:
-            studio.workspace.project(key)["job"] = {"running": True}
+            studio.workspace.job = job
         try:
             client.send(b"}")
             response = client.getresponse()
             assert response.status == HTTPStatus.CONFLICT
-            assert "Analysis is running" in json.loads(response.read())["error"]
+            assert json.loads(response.read())["error"] == (
+                "Analysis is running. Wait for it to finish."
+            )
             assert studio.workspace.states == {}
         finally:
-            with studio.workspace.lock:
-                studio.workspace.project(key)["job"]["running"] = False
+            job.running = False

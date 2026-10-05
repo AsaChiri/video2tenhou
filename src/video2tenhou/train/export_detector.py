@@ -80,25 +80,21 @@ def export_inference_checkpoint(source: Path, target: Path) -> dict:
 def _model_state(checkpoint: dict) -> dict[str, torch.Tensor]:
     """Require a face-only YOLO9 detection checkpoint with a nonempty tensor state."""
     if not isinstance(checkpoint, dict) or checkpoint.get("model_family") != "yolo9":
-        msg = "Expected a standard LibreYOLO9 checkpoint"
-        raise ValueError(msg)
+        raise ValueError("Expected a standard LibreYOLO9 checkpoint")
     if (
         checkpoint.get("names") not in ({0: "face"}, {"0": "face"})
         or checkpoint.get("nc") != 1
     ):
-        msg = "Expected the single face class"
-        raise ValueError(msg)
+        raise ValueError("Expected the single face class")
     if checkpoint.get("task") != "detect":
-        msg = "Expected a detection checkpoint"
-        raise ValueError(msg)
+        raise ValueError("Expected a detection checkpoint")
     state = checkpoint.get("model")
     if (
         not isinstance(state, dict)
         or not state
         or not all(isinstance(value, torch.Tensor) for value in state.values())
     ):
-        msg = "Checkpoint must contain a tensor model state"
-        raise ValueError(msg)
+        raise ValueError("Checkpoint must contain a tensor model state")
     return state
 
 
@@ -108,8 +104,7 @@ def _verify_export(
     """Verify tensor identity and ensure the source did not change during export."""
     verified = torch.load(target, map_location="cpu", weights_only=True)
     if set(verified["model"]) != set(state):
-        msg = "Export changed model state keys"
-        raise RuntimeError(msg)
+        raise RuntimeError("Export changed model state keys")
     for name, value in state.items():
         other = verified["model"][name]
         if (
@@ -117,11 +112,9 @@ def _verify_export(
             or other.shape != value.shape
             or not torch.equal(other, value)
         ):
-            msg = f"Export changed model tensor: {name}"
-            raise RuntimeError(msg)
+            raise RuntimeError(f"Export changed model tensor: {name}")
     if file_hash(source) != source_digest:
-        msg = "Source checkpoint changed during export"
-        raise RuntimeError(msg)
+        raise RuntimeError("Source checkpoint changed during export")
 
 
 def write_runtime_metadata(
@@ -155,8 +148,9 @@ def write_runtime_metadata(
         or checkpoint.get("task") != "detect"
         or checkpoint.get("names") not in ({0: "face"}, {"0": "face"})
     ):
-        msg = "Metadata requires a standard YOLO9 face checkpoint with a known size"
-        raise ValueError(msg)
+        raise ValueError(
+            "Metadata requires a standard YOLO9 face checkpoint with a known size"
+        )
     metadata = {
         "schema_version": 1,
         "backend": "libreyolo",

@@ -17,14 +17,15 @@ Analysis runs locally. The included layout supports Pacific Mahjong League
 
 The launcher installs Python and selects a compatible PyTorch/torchvision build
 for your hardware and driver, checks that inference works, then opens the browser
-studio. uv checks the runtime on each launch and reuses installed packages and
-cached downloads where possible. CPU mode is available when GPU acceleration cannot run.
+studio. Later launches reuse that runtime without network access; run the
+launcher with `--update` to select a newer build. CPU mode is available when GPU
+acceleration cannot run.
 No Git checkout or separate Python installation is
 needed. Leave the launcher running while processing recordings. An NVIDIA
 CUDA GPU is recommended for practical analysis times.
 
 The browser studio covers Video, Calibrate, Analyze, Review and Results.
-Choose a **Local file** from your computer or paste a **Remote URL** supported by yt-dlp.
+Choose a **Video file** from your computer or paste a **Video URL** supported by yt-dlp.
 Supply the scoremj game IDs in broadcast order. Calibration, progress,
 review questions, replay links and file downloads stay in the browser.
 
@@ -61,8 +62,8 @@ the UI from source; releases include the built assets. Generated frontend files
 are ignored by Git. `video2tenhou web` is the single browser command.
 
 The CLI remains available for scripts (`uv run video2tenhou --help`). Development
-uses the lockfile; the starter uses its own `.venv-runtime` environment and selects
-PyTorch dynamically within the supported package ranges.
+uses the lockfile; the starter uses its own `.venv-runtime` environment and
+selects PyTorch within the supported package ranges at setup or on `--update`.
 Generated recordings, labels, work caches and outputs stay local and ignored.
 Set `VIDEO2TENHOU_HOME` before launch to use another data directory.
 

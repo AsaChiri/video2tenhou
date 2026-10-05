@@ -1,23 +1,32 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import type { Fact } from "../types";
+import { computed, ref } from "vue";
+import type { Fact, HandEntry, IgnoredAnswer } from "../types";
 import type { PropType } from "vue";
 import { useReview } from "./context";
-import { seatName, time } from "./format";
+import { factLabel, seatName, time } from "./format";
+import { errorText } from "../shared/useAction";
 import TileFace from "./TileFace.vue";
 import TilePalette from "./TilePalette.vue";
-defineProps({
+const props = defineProps({
   hand: { type: Number, required: true },
-  entry: { type: Object, default: () => ({}) },
-  notes: { type: Array as PropType<string[]>, default: () => [] },
+  entry: { type: Object as PropType<HandEntry>, required: true },
+  ignored: { type: Array as PropType<IgnoredAnswer[]>, default: () => [] },
 });
 const review = useReview(),
   editing = ref<number | null>(null);
+const facts = computed(() => review.facts.value[props.hand] || []);
+const reason = (fact: Fact) =>
+  props.ignored.find((row) => row.ts != null && row.ts === fact.ts)?.reason;
+const unmatched = computed(() =>
+  props.ignored.filter(
+    (row) => row.ts == null || !facts.value.some((fact) => fact.ts === row.ts),
+  ),
+);
 async function remove(fact: Fact) {
   try {
     await review.remove(fact);
   } catch (error) {
-    review.error.value = error instanceof Error ? error.message : String(error);
+    review.error.value = errorText(error);
   }
 }
 async function replace(fact: Fact, tile: string) {
@@ -29,18 +38,16 @@ async function replace(fact: Fact, tile: string) {
     await review.remove(fact);
     editing.value = null;
   } catch (error) {
-    review.error.value = error instanceof Error ? error.message : String(error);
+    review.error.value = errorText(error);
   }
 }
 </script>
 <template>
-  <details>
-    <summary>
-      Facts for this hand ({{ review.facts.value[hand]?.length || 0 }})
-    </summary>
+  <details :open="ignored.length > 0">
+    <summary>Saved answers ({{ facts.length }})</summary>
     <ul>
-      <li v-for="fact in review.facts.value[hand] || []" :key="fact.ts">
-        <b>{{ fact.kind }}</b> {{ seatName(entry, fact.seat) }}
+      <li v-for="fact in facts" :key="fact.ts">
+        <b>{{ factLabel(fact.kind) }}</b> {{ seatName(entry, fact.seat) }}
         {{ fact.t != null ? time(fact.t) : "" }} {{ fact.type }}
         <span v-if="fact.tile" class="tile"><TileFace :tile="fact.tile" /></span
         ><span
@@ -48,11 +55,13 @@ async function replace(fact: Fact, tile: string) {
           :key="index"
           class="tile"
           ><TileFace :tile="tile" /></span
-        >{{ fact.text || fact.outcome || fact.seats?.join(" ")
+        >{{ fact.kind === "note" ? fact.text : fact.seats?.join(" ")
         }}<span v-if="fact.kind === 'site_wrong'"
           >site {{ fact.site?.join("/") }} → {{ fact.han }}/{{ fact.fu }}</span
         ><span v-if="fact.author !== 'tool'">
           ({{ fact.author || fact.source || "Imported answer" }})</span
+        ><span v-if="reason(fact)" class="warn">
+          Not applied: {{ reason(fact) }}</span
         ><button v-if="fact.ts" @click="remove(fact)">Delete</button
         ><button v-if="fact.ts && fact.tile" @click="editing = fact.ts">
           Edit tile</button
@@ -62,21 +71,9 @@ async function replace(fact: Fact, tile: string) {
           @pick="replace(fact, $event)"
         />
       </li>
-    </ul>
-  </details>
-  <details v-if="notes.length">
-    <summary>Decoder notes for this hand ({{ notes.length }})</summary>
-    <ul>
-      <li
-        v-for="(note, index) in notes"
-        :key="index"
-        :class="{
-          warn: /ignored|not applied|never observed|matched no call|contradicts/.test(
-            note,
-          ),
-        }"
-      >
-        {{ note }}
+      <li v-for="(row, index) in unmatched" :key="`ignored-${index}`">
+        <b>{{ factLabel(row.kind) }}</b>
+        <span class="warn"> Not applied: {{ row.reason }}</span>
       </li>
     </ul>
   </details>

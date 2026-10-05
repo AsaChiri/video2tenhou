@@ -3,9 +3,11 @@
 
 """Deployment export must preserve the selected inference state exactly."""
 
+from __future__ import annotations
+
 import hashlib
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 import torch
@@ -13,14 +15,10 @@ import torch
 from video2tenhou.train import export_detector
 from video2tenhou.train.export_detector import export_inference_checkpoint
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 def test_export_keeps_ema_inference_state_not_raw_training_weights(
-    tmp_path: "Path",
+    tmp_path: Path,
 ) -> None:
-    """Verify export keeps ema inference state not raw training weights."""
     source, target = tmp_path / "training.pt", tmp_path / "runtime.pt"
     selected = {
         "weight": torch.tensor([0.125, -2.5], dtype=torch.float32),
@@ -61,8 +59,7 @@ def test_export_keeps_ema_inference_state_not_raw_training_weights(
     )
 
 
-def test_export_rejects_another_family_or_class_contract(tmp_path: "Path") -> None:
-    """Verify export rejects another family or class contract."""
+def test_export_rejects_another_family_or_class_contract(tmp_path: Path) -> None:
     source, target = tmp_path / "training.pt", tmp_path / "runtime.pt"
     for family, names in (("yolox", {0: "face"}), ("yolo9", {0: "1m"})):
         torch.save(
@@ -81,9 +78,8 @@ def test_export_rejects_another_family_or_class_contract(tmp_path: "Path") -> No
 
 
 def test_changed_source_does_not_leave_a_publishable_export(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify changed source does not leave a publishable export."""
     source, target = tmp_path / "training.pt", tmp_path / "runtime.pt"
     torch.save(
         {
@@ -98,7 +94,7 @@ def test_changed_source_does_not_leave_a_publishable_export(
     original_hash = export_detector.file_hash
     reads = 0
 
-    def changed_hash(path: "Path") -> "str":
+    def changed_hash(path: Path) -> str:
         nonlocal reads
         if path == source:
             reads += 1
@@ -114,9 +110,8 @@ def test_changed_source_does_not_leave_a_publishable_export(
 
 
 def test_runtime_metadata_binds_checkpoint_and_explicit_operating_point(
-    tmp_path: "Path",
+    tmp_path: Path,
 ) -> None:
-    """Verify runtime metadata binds checkpoint and explicit operating point."""
     weights = tmp_path / "weights.pt"
     torch.save(
         {
@@ -154,9 +149,8 @@ def test_runtime_metadata_binds_checkpoint_and_explicit_operating_point(
 
 
 def test_metadata_does_not_accept_an_unknown_checkpoint_contract(
-    tmp_path: "Path",
+    tmp_path: Path,
 ) -> None:
-    """Verify metadata does not accept an unknown checkpoint contract."""
     weights = tmp_path / "weights.pt"
     torch.save(
         {"model_family": "yolo9", "size": "s", "names": {0: "1m"}, "nc": 1}, weights
@@ -168,8 +162,7 @@ def test_metadata_does_not_accept_an_unknown_checkpoint_contract(
     assert not weights.with_name("meta.json").exists()
 
 
-def test_export_and_metadata_require_declared_detection_task(tmp_path: "Path") -> None:
-    """Verify export and metadata require declared detection task."""
+def test_export_and_metadata_require_declared_detection_task(tmp_path: Path) -> None:
     source, target = tmp_path / "training.pt", tmp_path / "runtime.pt"
     torch.save(
         {
@@ -204,9 +197,8 @@ def test_export_and_metadata_require_declared_detection_task(tmp_path: "Path") -
     ],
 )
 def test_metadata_rejects_invalid_runtime_settings_before_reading_checkpoint(
-    tmp_path: "Path", settings: "dict"
+    tmp_path: Path, settings: dict
 ) -> None:
-    """Verify metadata rejects invalid runtime settings before reading checkpoint."""
     weights = tmp_path / "weights.pt"
     # Invalid inference settings must fail before a checkpoint is loaded or metadata is
     # written.

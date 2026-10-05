@@ -16,21 +16,19 @@ import time
 from importlib import metadata
 from pathlib import Path
 
+from video2tenhou.files import atomic_write_text
 from video2tenhou.files import sha256_file as file_hash
 
 
 def _check_refinement_checkpoint(names: dict, *, refine_human: bool) -> None:
     if refine_human and names != {0: "face"}:
-        msg = "Human refinement requires an existing one-class face checkpoint"
-        raise ValueError(msg)
+        raise ValueError(
+            "Human refinement requires an existing one-class face checkpoint"
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Train the model and retain its settings, weights and validation results.
-
-    Train the installed LibreYOLO with recorded inputs and retain success and failure
-    metadata.
-    """
+    """Train the installed LibreYOLO on recorded inputs; record success or failure."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--base", required=True, type=Path)
@@ -75,11 +73,10 @@ def main(argv: list[str] | None = None) -> None:
         row.get("origin") != "human" or row.get("reviewed") is not True
         for row in manifest_rows
     ):
-        msg = (
+        raise ValueError(
             "Human refinement requires a dataset containing only reviewed human "
             "annotations"
         )
-        raise ValueError(msg)
     max_labels = max(200, 4 * max(row["boxes"] for row in manifest_rows))
     config = {
         "data": str(args.data.resolve()),
@@ -154,8 +151,8 @@ def main(argv: list[str] | None = None) -> None:
         raise
     finally:
         report["elapsed_seconds"] = time.perf_counter() - started
-        (args.out / "provenance.json").write_text(
-            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        atomic_write_text(
+            args.out / "provenance.json", json.dumps(report, indent=2, default=str)
         )
 
 

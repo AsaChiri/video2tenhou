@@ -9,16 +9,15 @@ import json
 import logging
 from contextlib import closing
 from io import StringIO
-from typing import TYPE_CHECKING
+from pathlib import Path
 
+import numpy as np
 import pytest
 
+from video2tenhou import calibfit, cli
 from video2tenhou.calibfit import RegionCheck
 from video2tenhou.logging_setup import RESULT, command_logging
-from video2tenhou.tool import check_calibration
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from video2tenhou.perception import detector
 
 
 def test_command_results_survive_progress_and_repeated_invocations(
@@ -51,8 +50,7 @@ def test_failed_command_restores_embedding_apps_logging(
 
         @command_logging
         def fail() -> None:
-            message = "Command failed"
-            raise RuntimeError(message)
+            raise RuntimeError("Command failed")
 
         with pytest.raises(RuntimeError, match="Command failed"):
             fail()
@@ -61,22 +59,38 @@ def test_failed_command_restores_embedding_apps_logging(
         assert stream.getvalue() == "Caller still receives warnings\n"
 
 
-def test_calibration_command_emits_one_json_document(
+@pytest.mark.parametrize("level", ["ok", "fail"])
+def test_calibration_command_emits_one_json_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    level: str,
 ) -> None:
-    """The review subprocess protocol tolerates model progress on stderr."""
-    monkeypatch.setattr(check_calibration, "Detector", object)
+    """Studio child commands end with one outcome; progress stays on stderr."""
+    monkeypatch.setattr(detector, "Detector", object)
 
     def checks(*_args: object) -> list[RegionCheck]:
         logging.getLogger("video2tenhou.calibfit").info("Checking table borders")
-        return [RegionCheck("pond:TL", note="100% checked")]
+        return [RegionCheck("pond:TL", level=level, cut=3, note="100% checked")]
 
-    monkeypatch.setattr(check_calibration, "check_all", checks)
-    check_calibration.main([str(tmp_path / "video.mp4"), "pml", str(tmp_path)])
+    monkeypatch.setattr(calibfit, "check_all", checks)
+    monkeypatch.setattr(
+        calibfit, "fit_sheet", lambda *_args: np.zeros((2, 2, 3), np.uint8)
+    )
+    video = str(tmp_path / "video.mp4")
+    code = cli.main(
+        ["calib", "check", video, "--work", str(tmp_path), "--out", str(tmp_path)]
+    )
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {
-        "pond:TL": {"level": "ok", "held": 0, "cut": 0, "note": "100% checked"}
-    }
-    assert captured.err == "Checking table borders\n"
+    result = {"pond:TL": {"level": level, "held": 0, "cut": 3, "note": "100% checked"}}
+    if level == "ok":
+        assert code == 0
+        assert json.loads(captured.out) == {"result": result}
+    else:
+        assert code == 1
+        assert json.loads(captured.out) == {
+            "error": "Adjust the table borders in Calibration: pond:TL cuts tiles.",
+            "result": result,
+        }
+    assert "Checking table borders\n" in captured.err
+    assert "{" not in captured.err

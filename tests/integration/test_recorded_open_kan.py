@@ -3,10 +3,14 @@
 
 """Real omitted kan-window evidence corrects a draw without a human constraint."""
 
+from __future__ import annotations
+
 import copy
 import gzip
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
+
+import pytest
 
 from tests.integration.helpers import restore_model
 from tests.paths import DATA
@@ -17,23 +21,15 @@ from video2tenhou.engine.dense import DenseContext
 from video2tenhou.engine.review import draws_to_reread
 from video2tenhou.engine.solver import Solution
 from video2tenhou.engine.turns import Turn
+from video2tenhou.read import ReadContext
 from video2tenhou.record import HandResult
 from video2tenhou.tenhou6 import replay_kyoku
 
-if TYPE_CHECKING:
-    from video2tenhou.read import ReadContext
 
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
-
-
+@pytest.mark.slow
 def test_recorded_open_kan_window_corrects_confident_inference(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path"
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Verify recorded open kan window corrects confident inference."""
     with gzip.open(DATA / "week11_open_kan.json.gz", "rt", encoding="utf-8") as stream:
         case = json.load(stream)
     model = restore_model(case["model"])
@@ -56,12 +52,12 @@ def test_recorded_open_kan_window_corrects_confident_inference(
     requests = []
 
     def recorded(
-        context: "ReadContext",
-        lo: "float",
-        hi: "float",
-        regions: "list[str]",
+        context: ReadContext,
+        lo: float,
+        hi: float,
+        regions: list[str],
         **_unused_kwargs: object,
-    ) -> "dict":
+    ) -> dict:
         requests.append((lo, hi, regions))
         assert (lo, hi, regions) == (
             case["request"]["lo"],
@@ -86,12 +82,11 @@ def test_recorded_open_kan_window_corrects_confident_inference(
             models=models_stub(),
             work_dir=tmp_path,
             t0=case["t0"],
-            problems=[],
         ),
     )
     assert len(requests) == 1
     assert len(model.hand_ev) == before + 9
-    solution = model.solve(margins=False, time_limit=60, workers=2, prior=prior)
+    solution = model.solve(time_limit=60, workers=2, prior=prior)
     assert solution.ok
     assert solution.optimal
     assert [solution.draws[("N", j)] for j in (4, 5, 6)] == ["2p", "1z", "1s"]

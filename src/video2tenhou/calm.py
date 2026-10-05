@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import groupby
 from pathlib import Path
@@ -28,6 +29,7 @@ import numpy as np
 
 from . import video
 from .cache import source_identity
+from .files import atomic_write_text
 from .layout import CORNERS, Calibration
 
 if TYPE_CHECKING:
@@ -42,27 +44,26 @@ REGIONS = (
 MOTION_THR = 4.0  # mean abs gray difference between consecutive samples (0.5 s apart)
 # skin fraction above the region's own baseline (its 20th percentile: static content)
 SKIN_THR = 0.05
-SCORE_VERSION = 1  # Uniform black padding for crops crossing an image boundary.
+# score file version; 1 pads crops crossing the image edge with uniform black
+SCORE_VERSION = 1
 MIN_CALM_SAMPLES = 3  # >= 1 s at 2 fps
-MAX_GAP = (
-    15.0  # read floor: no region goes longer than this (one turn cycle) without a read
-)
+# read floor: no region goes longer than this (one turn cycle) without a read
+MAX_GAP = 15.0
 # the read floor's single frames must be this still (x MOTION_THR): a frame in motion
-# shows
+# shows tiles being moved, and at the end of a hand, pushed into the table
 FLOOR_MOTION = 1.5
-# tiles being moved, and at the end of a hand, pushed into the table
 
 
 LOGGER = logging.getLogger("video2tenhou.calm")
 
 
 def region_key(cal: Calibration, name: str) -> str:
-    """Hash the geometry determining a region's pixels.
+    """Short hash of the geometry one region's pixels are cut from.
 
-    Short hash of the pixels one region is cut from: its frame->image matrix, its size,
-    and, for a hand band, the roll the crop is turned by. Two calibrations with the same
-    key give the same picture, so a score or a reading of one is a score or a reading of
-    the other; a `scale: 1.0` written where nothing was written before is not a change.
+    That is its frame->image matrix, its size and, for a hand band, the roll the crop is
+    turned by. Two calibrations with the same key give the same picture, so a score or a
+    reading of one is a score or a reading of the other; a `scale: 1.0` written where
+    nothing was written before is not a change.
     """
     transform, size = cal.transform(name)
     roll = cal.roll(name.partition(":")[2]) if name.startswith("hand:") else 0.0
@@ -92,11 +93,7 @@ def skin_mask(bgr: np.ndarray) -> np.ndarray:
 
 
 def cheap_regions(frame: np.ndarray, cal: Calibration) -> dict[str, np.ndarray]:
-    """Crop all regions at unit scale, sharing one overhead de-rotation.
-
-    Region crops at scale 1: ponds from one de-rotated square, hands and melds as
-    slices.
-    """
+    """Crop every region at scale 1: ponds from one de-rotated square, others sliced."""
     out = {}
     derotation = cal.derotation()
     derot = cv2.warpAffine(
@@ -114,6 +111,20 @@ def cheap_regions(frame: np.ndarray, cal: Calibration) -> dict[str, np.ndarray]:
     return out
 
 
+@contextmanager
+def _opencv_threads(count: int) -> Iterator[None]:
+    """Use ``count`` OpenCV threads in the block, restoring the process setting.
+
+    Model identities record the OpenCV thread count, so it must be restored.
+    """
+    previous = cv2.getNumThreads()
+    cv2.setNumThreads(count)
+    try:
+        yield
+    finally:
+        cv2.setNumThreads(previous)
+
+
 def scores(
     path: str | Path,
     cal: Calibration,
@@ -127,20 +138,21 @@ def scores(
     for n, (t, frame) in enumerate(video.sample(path, fps=fps), start=1):
         regs = cheap_regions(frame, cal)
         m_row, s_row = [], []
-        for name in REGIONS:
-            img = regs[name]
-            small = cv2.resize(
-                img,
-                (max(1, img.shape[1] // 2), max(1, img.shape[0] // 2)),
-                interpolation=cv2.INTER_AREA,
-            )
-            gray = cv2.GaussianBlur(
-                cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (5, 5), 0
-            ).astype(np.float32)
-            m = float(np.abs(gray - prev[name]).mean()) if name in prev else 0.0
-            prev[name] = gray
-            m_row.append(m)
-            s_row.append(float((skin_mask(small) > 0).mean()))
+        with _opencv_threads(1):  # pool dispatch costs more than these small images
+            for name in REGIONS:
+                img = regs[name]
+                small = cv2.resize(
+                    img,
+                    (max(1, img.shape[1] // 2), max(1, img.shape[0] // 2)),
+                    interpolation=cv2.INTER_AREA,
+                )
+                gray = cv2.GaussianBlur(
+                    cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (5, 5), 0
+                ).astype(np.float32)
+                m = float(np.abs(gray - prev[name]).mean()) if name in prev else 0.0
+                prev[name] = gray
+                m_row.append(m)
+                s_row.append(float((skin_mask(small) > 0).mean()))
         ts.append(t)
         mot.append(m_row)
         skn.append(s_row)
@@ -207,10 +219,9 @@ def intervals(
     *,
     thresholds: CalmThresholds = DEFAULT_THRESHOLDS,
 ) -> list[Interval]:
-    """Find maximal calm and disturbed runs, rejecting short calm spans.
+    """Find maximal calm and disturbed runs per region.
 
-    Maximal runs of calm / disturbed samples per region; calm runs shorter than min_calm
-    become disturbed.
+    Calm runs shorter than ``thresholds.min_samples`` samples count as disturbed.
     """
     out: list[Interval] = []
     for r, name in enumerate(REGIONS):
@@ -296,15 +307,14 @@ def fill_gaps(
     *,
     thresholds: CalmThresholds = DEFAULT_THRESHOLDS,
 ) -> list[Interval]:
-    """Add partial intervals wherever calm observations leave a long gap.
+    """Add partial intervals wherever a region has no calm interval for max_gap.
 
-    Read floor. Wherever a region has no calm interval for longer than max_gap, partial
-    intervals are added: runs of >= min_calm still samples (motion below the threshold
-    whatever the skin score: an arm resting over part of the region), and where the span
-    is still longer than max_gap, the stillest sample of each chunk when it is still
-    enough (FLOOR_MOTION): a chunk with no such frame stays unread. A partial
-    observation is positive evidence only: a tile seen is there, a tile absent may be
-    hidden.
+    The partial intervals are runs of >= min_calm still samples (motion below the
+    threshold whatever the skin score: an arm resting over part of the region), and
+    where the span is still longer than max_gap, the stillest sample of each chunk when
+    it is still enough (FLOOR_MOTION): a chunk with no such frame stays unread. A
+    partial observation is positive evidence only: a tile seen is there, a tile absent
+    may be hidden.
     """
     out = list(ivs)
     for r, name in enumerate(REGIONS):
@@ -358,16 +368,16 @@ def run_calm(
 ) -> list[Interval]:
     """Reuse source- and geometry-matched scores, derive intervals and write calm.jsonl.
 
-    Threshold changes reuse saved scores. Source contents are rehashed at this
-    stage boundary, even if the path, size and timestamps are unchanged. Changed
-    pixels, missing source provenance or ``force`` require another scoring pass.
+    Threshold changes reuse saved scores. Changed source contents (see
+    ``cache.source_identity``), changed region geometry, missing source provenance
+    or ``force`` require another scoring pass.
     Incomplete caches are recomputed; failed scoring or publication preserves
     the previous complete score file.
     """
     work.mkdir(parents=True, exist_ok=True)
     npz = work / "calm_scores.npz"
     key = geometry_key(cal)
-    source = source_identity(path, refresh=True)
+    source = source_identity(path)
     cached = None
     if npz.exists() and not force:
         # Scores belong to both the recording and its calibrated rectangles.
@@ -430,8 +440,9 @@ def run_calm(
     else:
         ts, mot, skn = cached
     ivs = fill_gaps(intervals(ts, mot, skn), ts, mot, skn)
-    with (work / "calm.jsonl").open("w", encoding="utf-8") as f:
-        f.writelines(json.dumps(iv.to_dict()) + "\n" for iv in ivs)
+    atomic_write_text(
+        work / "calm.jsonl", "".join(json.dumps(iv.to_dict()) + "\n" for iv in ivs)
+    )
     return ivs
 
 

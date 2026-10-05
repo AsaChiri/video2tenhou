@@ -15,6 +15,7 @@ from starlette.responses import FileResponse, Response
 from starlette.routing import Mount, Route
 
 from .http import REVIEW_BODY_LIMIT, json_response, read_json_body
+from .workflow import BUSY
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
 
     from .review_state import ReviewState
     from .workflow import Workspace
+
+ANALYSIS_JOBS = ("prepare", "analyze")
 
 
 class ReviewRoutes:
@@ -36,31 +39,19 @@ class ReviewRoutes:
         """Resolve the project key captured by Starlette's parent mount."""
         return self.workspace.review_state(request.path_params["key"])
 
-    def analysis_running(self) -> bool:
-        """Inspect the shared pipeline exclusion state under its lock."""
-        with self.workspace.lock:
-            return any(
-                project.get("job", {}).get("running")
-                for project in self.workspace.projects.values()
-            )
-
     def check_write(self, *, allow_review_job: bool) -> None:
-        """Reject conflicting work before receiving an optional request body."""
-        with self.workspace.lock:
-            if self.analysis_running():
-                raise HTTPException(
-                    HTTPStatus.CONFLICT,
-                    "Analysis is running. Wait until it finishes before "
-                    "changing review data.",
-                )
-            if not allow_review_job and any(
-                any(job.get("running") for job in state.jobs.values())
-                for state in self.workspace.states.values()
-            ):
-                raise HTTPException(
-                    HTTPStatus.CONFLICT,
-                    "A review job is running. Wait for it to finish first.",
-                )
+        """Reject conflicting work before receiving an optional request body.
+
+        Answers may be saved while hands are updating; nothing changes review data
+        while a recording is prepared or analyzed.
+        """
+        running = self.workspace.busy()
+        if running is not None and (
+            running.kind in ANALYSIS_JOBS or not allow_review_job
+        ):
+            raise HTTPException(
+                HTTPStatus.CONFLICT, f"{BUSY[running.kind]}. Wait for it to finish."
+            )
 
     async def mutate(
         self,
@@ -80,33 +71,30 @@ class ReviewRoutes:
 
         return await run_in_threadpool(apply)
 
-    def revision(self, request: Request) -> Response:
-        """Report externally rebuilt review artifacts."""
-        return json_response(self.state(request).revision())
+    async def start(
+        self, request: Request, start: Callable[[str, dict], dict]
+    ) -> Response:
+        """Bound the body of a job request; the workspace claims its job slot."""
+        await run_in_threadpool(self.check_write, allow_review_job=False)
+        body = await read_json_body(request, REVIEW_BODY_LIMIT)
+        key = request.path_params["key"]
+        return json_response(await run_in_threadpool(start, key, body))
 
     def hands(self, request: Request) -> Response:
-        """List the recording's hands and their current review state."""
+        """List the recording's hands and whether each awaits an update."""
         return json_response(self.state(request).hand_summary())
 
-    def decode_all_status(self, request: Request) -> Response:
-        """Return progress for a full recording rebuild."""
-        return json_response(self.state(request).redecode_all_status())
-
-    def decode_pending_status(self, request: Request) -> Response:
-        """Return progress for rebuilding pending hands."""
-        return json_response(self.state(request).redecode_pending_status())
-
     def items(self, request: Request) -> Response:
-        """List review questions across the recording."""
+        """List open review questions across the recording."""
         return json_response(self.state(request).all_items())
 
     def read(self, request: Request) -> Response:
         """Read tiles only when the analysis pipeline is idle."""
-        if self.analysis_running():
+        running = self.workspace.busy()
+        if running is not None and running.kind in ANALYSIS_JOBS:
             raise HTTPException(
                 HTTPStatus.CONFLICT,
-                "Analysis is running. Tile labeling becomes available "
-                "when it finishes.",
+                f"{BUSY[running.kind]}. Tile labeling is available when it finishes.",
             )
         query = request.query_params
         return json_response(
@@ -130,28 +118,12 @@ class ReviewRoutes:
         )
 
     def calibration(self, request: Request) -> Response:
-        """Return the current recording geometry."""
+        """Return the current recording geometry and its border checks."""
         return json_response(self.state(request).calib())
 
-    def calibration_job(self, request: Request) -> Response:
-        """Return calibration fitting or checking progress."""
-        key = request.query_params.get("key", "calib")
-        return json_response(self.state(request).jobs.get(key) or {"running": False})
-
-    def decode_status(self, request: Request) -> Response:
-        """Return rebuild progress for the hand captured by Starlette."""
-        return json_response(
-            self.state(request).redecode_status(request.path_params["hand"])
-        )
-
     def hand(self, request: Request) -> Response:
-        """Return a hand's reconstruction alongside its saved answers."""
-        state = self.state(request)
-        hand = request.path_params["hand"]
-        decoded = state.review_decode(hand)
-        return json_response(
-            {"entry": state.hands[hand], "decode": decoded, "facts": state.facts(hand)}
-        )
+        """Return a hand's reconstruction and the answers it could not apply."""
+        return json_response(self.state(request).hand_view(request.path_params["hand"]))
 
     def frame(self, request: Request) -> Response:
         """Render one calibrated evidence frame."""
@@ -172,16 +144,20 @@ class ReviewRoutes:
         return FileResponse(path, media_type="video/mp4")
 
     def plate(self, request: Request) -> Response:
-        """Encode the current calibration plate as JPEG."""
+        """Encode the prepared calibration plate as JPEG without building one."""
         image = self.state(request).plate()
+        if image is None:
+            raise HTTPException(
+                HTTPStatus.CONFLICT,
+                "Prepare the recording to show the table preview.",
+            )
         ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 90])
         if not ok:
-            message = "Unable to encode the calibration plate."
-            raise RuntimeError(message)
+            raise RuntimeError("Unable to encode the calibration plate.")
         return Response(buffer.tobytes(), media_type="image/jpeg")
 
     async def add_fact(self, request: Request) -> Response:
-        """Save an answer even while a review rebuild is running."""
+        """Save an answer even while hands are updating."""
         return await self.mutate(
             request,
             lambda state, body: state.add_fact(body),
@@ -189,7 +165,7 @@ class ReviewRoutes:
         )
 
     async def delete_fact(self, request: Request) -> Response:
-        """Delete one saved answer without blocking an active review rebuild."""
+        """Delete one saved answer even while hands are updating."""
         return await self.mutate(
             request,
             lambda state, body: {"deleted": state.delete_fact(float(body["ts"]))},
@@ -199,19 +175,13 @@ class ReviewRoutes:
     async def label(self, request: Request) -> Response:
         """Save one corrected tile label."""
         return await self.mutate(
-            request, lambda state, body: {"saved": str(state.save_label(body))}
+            request, lambda state, body: {"saved": state.save_label(body).name}
         )
 
-    async def decode_all(self, request: Request) -> Response:
-        """Start a recording-wide rebuild."""
-        return await self.mutate(
-            request, lambda state, _body: state.start_redecode_all()
-        )
-
-    async def decode_pending(self, request: Request) -> Response:
-        """Start rebuilding only hands with pending changes."""
-        return await self.mutate(
-            request, lambda state, _body: state.start_redecode_pending()
+    async def rebuild(self, request: Request) -> Response:
+        """Start updating pending hands, all hands, or the listed hands."""
+        return await self.start(
+            request, lambda key, body: self.workspace.rebuild(key, body.get("hands"))
         )
 
     async def save_calibration(self, request: Request) -> Response:
@@ -219,23 +189,15 @@ class ReviewRoutes:
         return await self.mutate(request, lambda state, body: state.save_calib(body))
 
     async def fit_calibration(self, request: Request) -> Response:
-        """Start calibration fitting under the shared job exclusion policy."""
-        return await self.mutate(
-            request, lambda state, _body: state.start_job("calib", state.run_calib_fit)
+        """Start measuring the table again."""
+        return await self.start(
+            request, lambda key, _body: self.workspace.calibrate(key, "fit")
         )
 
     async def check_calibration(self, request: Request) -> Response:
-        """Start calibration checking under the shared job exclusion policy."""
-        return await self.mutate(
-            request,
-            lambda state, _body: state.start_job("check", state.run_calib_check),
-        )
-
-    async def decode(self, request: Request) -> Response:
-        """Start rebuilding the hand captured by Starlette."""
-        return await self.mutate(
-            request,
-            lambda state, _body: state.start_redecode(request.path_params["hand"]),
+        """Start checking the saved borders."""
+        return await self.start(
+            request, lambda key, _body: self.workspace.calibrate(key, "check")
         )
 
 
@@ -245,12 +207,7 @@ def review_routes(workspace: Workspace) -> Mount:
     return Mount(
         "/review/{key}/api",
         routes=[
-            Route("/revision", endpoints.revision),
             Route("/hands", endpoints.hands),
-            Route("/decode_all", endpoints.decode_all_status),
-            Route("/decode_all", endpoints.decode_all, methods=["POST"]),
-            Route("/decode_pending", endpoints.decode_pending_status),
-            Route("/decode_pending", endpoints.decode_pending, methods=["POST"]),
             Route("/items", endpoints.items),
             Route("/read", endpoints.read),
             Route("/context", endpoints.context),
@@ -259,11 +216,9 @@ def review_routes(workspace: Workspace) -> Mount:
             Route("/facts/delete", endpoints.delete_fact, methods=["POST"]),
             Route("/calib", endpoints.calibration),
             Route("/calib", endpoints.save_calibration, methods=["POST"]),
-            Route("/calib/job", endpoints.calibration_job),
             Route("/calib/fit", endpoints.fit_calibration, methods=["POST"]),
             Route("/calib/check", endpoints.check_calibration, methods=["POST"]),
-            Route("/decode/{hand:int}", endpoints.decode_status),
-            Route("/decode/{hand:int}", endpoints.decode, methods=["POST"]),
+            Route("/rebuild", endpoints.rebuild, methods=["POST"]),
             Route("/hand/{hand:int}", endpoints.hand),
             Route("/frame", endpoints.frame),
             Route("/clip", endpoints.clip),

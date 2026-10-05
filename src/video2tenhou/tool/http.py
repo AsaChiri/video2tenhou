@@ -25,16 +25,16 @@ PROJECT_BODY_LIMIT = 65536
 REVIEW_BODY_LIMIT = 4 * 1024 * 1024
 UPLOAD_BODY_LIMIT = 100 * 1024**3
 SECURITY_HEADERS = {
-    "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "same-origin",
     "Content-Security-Policy": "frame-ancestors 'self'",
 }
+IMMUTABLE = "public, max-age=31536000, immutable"
 
 
 def json_response(obj: object, code: int = HTTPStatus.OK) -> JSONResponse:
     """Render finite browser-compatible JSON with the shared response policy."""
-    return JSONResponse(sanitize(obj), status_code=code, headers=SECURITY_HEADERS)
+    return JSONResponse(sanitize(obj), status_code=code)
 
 
 async def read_json_body(request: Request, limit: int) -> dict:
@@ -53,8 +53,7 @@ async def read_json_body(request: Request, limit: int) -> dict:
         data.extend(chunk)
     body = json.loads(data or b"{}")
     if not isinstance(body, dict):
-        message = "Expected a JSON object."
-        raise TypeError(message)
+        raise TypeError("Expected a JSON object.")
     return body
 
 
@@ -75,6 +74,9 @@ class LocalAccess:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
                 headers.update(SECURITY_HEADERS)
+                # API data, evidence and exports change in place; only static
+                # assets choose to be cached.
+                headers.setdefault("Cache-Control", "no-store")
             await send(message)
 
         error = self.access_error(scope)

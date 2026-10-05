@@ -9,23 +9,20 @@ the place and the moment that decide an open question, before a human is asked.
 - the discard a call took: the three other ponds over the seconds before the meld
   appeared;
 - a turn the merge had to skip: that player's pond over the gap;
-- a draw with a close feasible alternative, or no alternative found before timeout: its
-  hand row from its
-  previous discard to the next player's discard, with still runs providing views before
-  the draw, just
-  after it, or after the discard;
+- an ambiguous draw (certification found a close competing reconstruction): its
+  hand row from its previous discard to the next player's discard, with still runs
+  providing views before the draw, just after it, or after the discard;
 - an unconfirmed open-kan replacement without direct draw evidence: the same
   bounded hand window, even when earlier hand counts imply a confident guess;
 - a riichi no turned tile was read for: the pond at the moment each of the seat's tiles
   was laid.
 
-Video-reading entrypoints take `models` = (detector, classifier, video path,
-calibration) and cache reads under work/<video>/dense/ (read.dense_reads).
+Video-reading entrypoints take a `DenseContext` built once per hand and cache reads
+under work/<video>/dense/ (read.dense_reads).
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -36,7 +33,7 @@ from video2tenhou.read import ReadContext, dense_pond_reads, dense_reads
 
 from . import rules
 from .hand import corner_of
-from .ponds import PondSlot, insert_slot, tail_runs
+from .ponds import PondSlot, insert_slot, next_slot_id, tail_runs
 from .solver import hand_evidence
 
 if TYPE_CHECKING:
@@ -46,15 +43,30 @@ if TYPE_CHECKING:
     from video2tenhou.engine.solver import HandModel
     from video2tenhou.read import ReadModels
 
-
-if TYPE_CHECKING:
-    from .turns import Turn
+    from .turns import Skip, Turn
 
 MAX_MISSING_TURN_WINDOW = 90
-DRAW_DISCARD_MATCH_WINDOW = 0.6
+# s: a hand-model turn and a merged turn this close are the same discard
+SAME_DISCARD = 0.6
 MAX_RIICHI_READ_WINDOW = 30.0
-SIDEWAYS_ASPECT = 1.15
+SIDEWAYS_ASPECT = 1.15  # width over height of a pond box lying across the row
 MIN_RIICHI_RUN = 3
+MIN_SIDEWAYS_SHARE = 0.6  # of the frames a riichi tile is seen in, at least this wide
+# a seat's declaring discard is this much wider than its median discard box
+WIDE_FACTOR = 1.25
+RIICHI_BEFORE = 2.0  # s before a discard's window that its pond is read for a riichi
+RIICHI_AFTER = 4.0  # s after the discard's first sighting
+DENSE_WINDOW = 1.0  # s before a dense read's first sighting that a tile can be laid
+FRAME = 0.2  # s between 5 fps frames: a tile gone after its last frame left by then
+GAP_MARGIN = 1.0  # s read on either side of a skipped turn's gap
+READ_MARGIN = 0.5  # s read on either side of an uncertain draw's window
+AFTER_OWN_DISCARD = 1.0  # s after the seat's previous discard its hand row is read
+STILL_FRAMES = 3  # a still run: this many 5 fps frames (0.6 s) ...
+# ... each reading like the run's first, but for a single frame off in this many boxes
+STILL_FLICKER = 1
+GAP = 0.5  # s: frames further apart than this are not consecutive
+# s of hand row read before and after the discard of an uncertain draw
+BEFORE_MAX, AFTER_MAX = 60.0, 20.0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -66,25 +78,27 @@ class DenseContext:
     work_dir: Path | None = None
     t0: float = 0.0
     t1: float = float("inf")
-    problems: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
 
     def reader(self) -> ReadContext:
         """Require a complete recording context before acquiring new evidence."""
         if self.models is None or self.work_dir is None:
-            msg = "Dense evidence acquisition requires models and a workspace directory"
-            raise ValueError(msg)
+            raise ValueError(
+                "Dense evidence acquisition requires models and a workspace directory"
+            )
         det, clf, video, cal = self.models
         return ReadContext(video, cal, self.work_dir, det, clf)
 
 
-def _slot(i: int, b: dict, p: np.ndarray) -> PondSlot:
+def _slot(logs: dict[str, list[PondSlot]], b: dict) -> PondSlot:
+    """Build a slot for a tile a dense read found (not yet in any log)."""
     return PondSlot(
-        i,
+        next_slot_id(logs),
         b["row"],
         b["col"],
-        p,
+        np.asarray(b["p"]),
         b["t_first"],
-        (b["t_first"] - 1.0, b["t_first"]),
+        (b["t_first"] - DENSE_WINDOW, b["t_first"]),
         b["t_last"],
         b["n"],
         0.0,
@@ -100,18 +114,15 @@ def taken_discards(
     *,
     context: DenseContext,
 ) -> list[tuple[str, dict]]:
-    """Find tiles placed and removed from other ponds within a window.
+    """Find tiles laid in the three other ponds over [lo, hi] that vanished before hi.
 
-    The tiles laid in the three other ponds over [lo, hi] that vanished again before hi:
-    the candidates for the discard a call of `caller` took (a called tile rests in the
-    pond for a second or two, often while the calm reads see nothing). Returns
-    [(discarder, run)] with run = {t_first, t_last, n, row, col, xyxy, p, tile}.
+    These are the candidates for the discard a call of `caller` took (a called tile
+    rests in the pond for a second or two, often while the calm reads see nothing).
+    Returns [(discarder, run)] with run = {t_first, t_last, n, row, col, xyxy, p, tile}.
     """
-    entry = context.entry
-    reader = context.reader()
     others = [s for s in rules.SEATS if s != caller]
-    corners = [corner_of(entry, s) for s in others]
-    reads = dense_pond_reads(reader, lo, hi, corners)
+    corners = [corner_of(context.entry, s) for s in others]
+    reads = dense_pond_reads(context.reader(), lo, hi, corners)
     out = []
     for s, corner in zip(others, corners, strict=False):
         out += [
@@ -123,91 +134,54 @@ def taken_discards(
 
 
 def place_taken(seat: str, run: dict, logs: dict[str, list[PondSlot]]) -> PondSlot:
-    """Insert a densely observed called tile into its pond chronologically.
-
-    A called tile a dense read found enters its pond's log, by its time.
-    """
-    sl = _slot(7000 + len(logs[seat]), run, np.asarray(run["p"]))
-    sl.t_removed = run["t_last"] + 0.2
+    """Insert a called tile a dense read found into its pond's log, by its time."""
+    sl = _slot(logs, run)
+    sl.t_removed = run["t_last"] + FRAME
     insert_slot(logs[seat], sl)
     return sl
 
 
 def skipped_turns(
-    order_problems: list[str],
-    turns: list[Turn],
-    logs: dict[str, list[PondSlot]],
-    *,
-    context: DenseContext,
+    skips: list[Skip], logs: dict[str, list[PondSlot]], *, context: DenseContext
 ) -> int:
-    """Read a skipped seat's pond densely to find a missed discard.
+    """Read each skipped seat's pond densely over the gap; return the discards added.
 
-    A seat that "skipped" a turn: its discard was probably never in a calm frame. Read
-    its pond densely over the gap and add the first new tile found. Returns how many
-    discards were added.
+    A seat that skipped a turn probably discarded while no calm frame showed its pond:
+    the first new tile a dense read finds over the gap is that discard.
     """
-    entry, t0, t1, problems = (
-        context.entry,
-        context.t0,
-        context.t1,
-        context.problems,
-    )
     reader = context.reader()
     added = 0
-    for p in order_problems:
-        m = re.match(r"turn (\d+): no discard of ([ESWN])", p)
-        if not m:
-            continue
-        i, seat = int(m.group(1)), m.group(2)
-        t_a = turns[i - 1].t if 0 < i <= len(turns) else t0
-        t_b = turns[i].t if i < len(turns) else t1
+    for skip in skips:
+        t_a = skip.after if skip.after is not None else context.t0
+        t_b = skip.before if skip.before is not None else context.t1
         if t_b - t_a > MAX_MISSING_TURN_WINDOW or t_b <= t_a:
             continue
-        corner = corner_of(entry, seat)
-        reads = dense_reads(
-            reader,
-            t_a - 1.0,
-            t_b + 1.0,
-            [f"pond:{corner}"],
-        )
+        region = f"pond:{corner_of(context.entry, skip.seat)}"
+        reads = dense_reads(reader, t_a - GAP_MARGIN, t_b + GAP_MARGIN, [region])
         b = next(
             (
                 b
-                for b in tail_runs(logs[seat], reads[f"pond:{corner}"])
+                for b in tail_runs(logs[skip.seat], reads[region])
                 if b["tile"] not in ("X", "none")
             ),
             None,
         )
         if b is None:
             continue
-        sl = _slot(8000 + len(logs[seat]), b, np.asarray(b["p"]))
+        sl = _slot(logs, b)
         if b["gone"]:
-            sl.t_removed = b["t_last"] + 0.2
-        insert_slot(logs[seat], sl)
-        problems.append(
-            f"{seat}'s discard {b['tile']} at {b['t_first']:.1f}s found in a "
-            f"dense read (turn {i} was skipped)"
+            sl.t_removed = b["t_last"] + FRAME
+        insert_slot(logs[skip.seat], sl)
+        context.diagnostics.append(
+            f"{skip.seat}'s discard {b['tile']} at {b['t_first']:.1f}s found in a "
+            f"dense read (turn {skip.i} was skipped)"
         )
         added += 1
     return added
 
 
-STILL_FRAMES = 3  # a still run: this many 5 fps frames (0.6 s) ...
-# ... each reading like the run's first, but for a single frame off in this many boxes
-STILL_FLICKER = 1
-GAP = 0.5  # s: frames further apart than this are not consecutive
-BEFORE_MAX, AFTER_MAX = (
-    60.0,
-    20.0,
-)  # s of hand row read before and after the discard of an uncertain draw
-
-
 def _row(frame: dict) -> list[dict]:
-    """Extract the hand row in reading order, excluding melds and slivers.
-
-    The hand row of one reading, left to right (a meld moved beside it and slivers left
-    out).
-    """
+    """Return the hand row of one reading, left to right (no melds or slivers)."""
     return sorted(
         (b for b in frame["boxes"] if b["role"] == "tile"),
         key=lambda b: (b["xyxy"][0] + b["xyxy"][2]) / 2,
@@ -215,13 +189,12 @@ def _row(frame: dict) -> list[dict]:
 
 
 def still_runs(frames: list[dict], region: str) -> list[dict]:
-    """Find runs whose hand readings remain stable across enough frames.
+    """Find still views of a hand row by its reading, not by the motion test.
 
-    Still views of a hand row found by its reading, not by the motion test: runs of at
-    least STILL_FRAMES consecutive frames with the same count and the same tile in every
-    position (a single frame may be off in STILL_FLICKER boxes when the next one reads
-    as the run again). Each is an observation in the calm format (mean posterior per
-    position), so hand_evidence takes it as a calm view.
+    Runs of at least STILL_FRAMES consecutive frames with the same count and the same
+    tile in every position (a single frame may be off in STILL_FLICKER boxes when the
+    next one reads as the run again). Each is an observation in the calm format (mean
+    posterior per position), so hand_evidence takes it as a calm view.
     """
     rows = [_row(f) for f in frames]
     tops = [[int(np.argmax(b["p"])) for b in r] for r in rows]
@@ -238,9 +211,8 @@ def still_runs(frames: list[dict], region: str) -> list[dict]:
     while i < len(frames):
         k = i + 1
         # a frame holds the run when it reads like its first, or differs in a box or so
-        # that the next frame restores
-        # (a flicker); a change that stays is a change, and a gap in the frames ends the
-        # run
+        # that the next frame restores (a flicker); a change that stays is a change, and
+        # a gap in the frames ends the run
         while (
             k < len(frames)
             and frames[k]["t"] - frames[k - 1]["t"] <= GAP
@@ -289,23 +261,16 @@ def draws(
     melds_before: dict[str, dict[int, int]],
     *,
     context: DenseContext,
-) -> int:
-    """Read each player's hand densely between consecutive discards.
+) -> None:
+    """Read each listed draw's hand row densely and add its still views to the model.
 
-    For the supplied draws, read the player's hand row at 5 fps from its own previous
-    discard to the next player's discard, and take every still run of it as a view of
-    the hand (DESIGN.md 4.8 "Uncertain draws"): the hand before the draw, the moment
-    after it, the hand after the discard. The draws of one seat whose stretches overlap
-    are read in one window. Adds the evidence to the model; returns how many of the
-    draws got a view that pins them (a full row on either side, or the moment after the
-    draw). Callers select acquisition candidates by feasible alternative cost gaps;
-    certified confidence bounds independently determine what needs review.
+    The row is read at 5 fps from the seat's previous discard to the next player's
+    discard, and every still run of it is a view of the hand (DESIGN.md 4.8 "Uncertain
+    draws"): the hand before the draw, the moment after it, the hand after the discard.
+    The draws of one seat whose stretches overlap are read in one window. Callers
+    select acquisition candidates by feasible alternative cost gaps; certified
+    confidence bounds independently determine what needs review.
     """
-    entry, t0, problems = (
-        context.entry,
-        context.t0,
-        context.problems,
-    )
     reader = context.reader()
     spans: dict[str, list[tuple[float, float, int]]] = {}
     for s, j in low:
@@ -316,28 +281,33 @@ def draws(
             (
                 t
                 for t in turns
-                if t.seat == s and abs(t.t - st.t_discard) < DRAW_DISCARD_MATCH_WINDOW
+                if t.seat == s and abs(t.t - st.t_discard) < SAME_DISCARD
             ),
             None,
         )
         if turn is None:
             continue
         own_prev = max(
-            (t.t for t in turns if t.seat == s and t.t < turn.t - 0.6), default=t0
+            (t.t for t in turns if t.seat == s and t.t < turn.t - SAME_DISCARD),
+            default=context.t0,
         )
         nxt = (
             turns[turn.i + 1].t if turn.i + 1 < len(turns) else st.t_discard + AFTER_MAX
         )
         spans.setdefault(s, []).append(
             (
-                max(own_prev + 1.0, st.t_discard - BEFORE_MAX, t0),
+                max(
+                    own_prev + AFTER_OWN_DISCARD,
+                    st.t_discard - BEFORE_MAX,
+                    context.t0,
+                ),
                 min(nxt, st.t_discard + AFTER_MAX),
                 j,
             )
         )
     n_new = 0
     for s, sp in spans.items():
-        corner = corner_of(entry, s)
+        region = f"hand:{corner_of(context.entry, s)}"
         windows: list[list] = []
         for lo, hi, _ in sorted(sp):
             if windows and lo <= windows[-1][1]:
@@ -346,13 +316,8 @@ def draws(
                 windows.append([lo, hi])
         runs: list[dict] = []
         for lo, hi in windows:
-            reads = dense_reads(
-                reader,
-                lo - 0.5,
-                hi + 0.5,
-                [f"hand:{corner}"],
-            )
-            runs += still_runs(reads[f"hand:{corner}"], f"hand:{corner}")
+            reads = dense_reads(reader, lo - READ_MARGIN, hi + READ_MARGIN, [region])
+            runs += still_runs(reads[region], region)
         hev, dev, _ = hand_evidence(
             s,
             model.turns[s],
@@ -374,11 +339,10 @@ def draws(
             )
         )
     if low:
-        problems.append(
+        context.diagnostics.append(
             f"dense hand reads for {len(low)} uncertain draws: still views pin "
             f"{n_new} of them"
         )
-    return n_new
 
 
 def _sideways_run(reads: list[dict], box: Sequence[float]) -> tuple[int, int] | None:
@@ -387,9 +351,8 @@ def _sideways_run(reads: list[dict], box: Sequence[float]) -> tuple[int, int] | 
     cy = (box[1] + box[3]) / 2
     tw = box[2] - box[0]
     # a tile at rest does not turn: the box at this position must be wide in most
-    # frames it is there, over
-    # at least three of them; a single wide box is a tile in the player's fingers,
-    # not a declaration
+    # frames it is there, over at least three of them; a single wide box is a tile in
+    # the player's fingers, not a declaration
     run = side = 0
     for r in reads:
         near = [
@@ -405,59 +368,46 @@ def _sideways_run(reads: list[dict], box: Sequence[float]) -> tuple[int, int] | 
         b = min(near, key=lambda b: abs((b["xyxy"][0] + b["xyxy"][2]) / 2 - cx))
         run += 1
         side += 1 if _aspect(b["xyxy"]) > SIDEWAYS_ASPECT else 0
-        if run >= MIN_RIICHI_RUN and side >= 0.6 * run:
+        if run >= MIN_RIICHI_RUN and side >= MIN_SIDEWAYS_SHARE * run:
             return side, run
     return None
 
 
 def turned_tile(seat: str, turns: list[Turn], *, context: DenseContext) -> Turn | None:
-    """Find a declaring discard missed by calm sideways-tile observations.
+    """Find the declaring discard of a seat whose turned tile no calm reading flagged.
 
-    The declaring discard of a seat whose turned tile no calm reading flagged. A riichi
-    tile lies across the row, so it is far wider than its neighbours: first the boxes
-    already read, then, when the tile was called away before any calm frame (or the box
-    was cut), a dense read of the pond around each discard.
+    A riichi tile lies across the row, so it is far wider than its neighbours: first the
+    boxes already read, then, when the tile was called away before any calm frame (or
+    the box was cut), a dense read of the pond around each discard.
     """
-    entry, models, work_dir, t0, problems = (
-        context.entry,
-        context.models,
-        context.work_dir,
-        context.t0,
-        context.problems,
-    )
     mine = [(t, t.slot) for t in turns if t.seat == seat and t.slot is not None]
     if not mine:
         return None
     boxes = [(t, _aspect(slot.xyxy)) for t, slot in mine if slot.xyxy]
     if boxes:
         med = float(np.median([a for _, a in boxes]))
-        wide = [(t, a) for t, a in boxes if a > 1.25 * med]
+        wide = [(t, a) for t, a in boxes if a > WIDE_FACTOR * med]
         if len(wide) == 1:
             t, a = wide[0]
-            problems.append(
+            context.diagnostics.append(
                 f"riichi of {seat}: the discard at {t.t:.0f}s lies across the "
                 f"row (aspect {a:.2f} against {med:.2f}): it is the declaration"
             )
             return t
-    if models is None:
+    if context.models is None:
         return None
-    if work_dir is None:
-        msg = "Dense riichi evidence requires a workspace directory"
-        raise ValueError(msg)
-    det, clf, video_path, cal = models
-    corner = corner_of(entry, seat)
+    reader = context.reader()
+    corner = corner_of(context.entry, seat)
     for t, slot in mine:
-        lo = max(t0, slot.t_window[0] - 2.0)
-        hi = t.t + 4.0
+        lo = max(context.t0, slot.t_window[0] - RIICHI_BEFORE)
+        hi = t.t + RIICHI_AFTER
         if hi - lo > MAX_RIICHI_READ_WINDOW or not slot.xyxy:
             continue
-        reads = dense_pond_reads(
-            ReadContext(video_path, cal, work_dir, det, clf), lo, hi, [corner]
-        )[corner]
+        reads = dense_pond_reads(reader, lo, hi, [corner])[corner]
         match = _sideways_run(reads, slot.xyxy)
         if match is not None:
             side, run = match
-            problems.append(
+            context.diagnostics.append(
                 f"riichi of {seat}: its discard at {t.t:.0f}s lies across "
                 f"the row in {side} of {run} dense frames: it is the "
                 "declaration"
@@ -467,10 +417,6 @@ def turned_tile(seat: str, turns: list[Turn], *, context: DenseContext) -> Turn 
 
 
 def _aspect(box: Sequence[float]) -> float:
-    """Return a pond box's width divided by its height.
-
-    Width over height of a pond box: an upright tile is about 0.78, a turned one about
-    1.3.
-    """
+    """Width over height of a pond box: an upright tile about 0.78, a turned one 1.3."""
     x0, y0, x1, y1 = box
     return (x1 - x0) / max(1.0, y1 - y0)

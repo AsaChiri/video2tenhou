@@ -45,7 +45,7 @@ annotation coordinates.
    Add `--t 120 --t 1800 --t 3600` with representative early, middle and late play times
    to generate additional contact sheets under `work/calib/`. The border check
    independently samples recognized play. Inspect warnings; failures block
-   normal analysis. `--skip-fit-check` is for controlled debugging.
+   normal analysis; `convert --skip-fit-check` is for controlled debugging.
 5. Analyze a representative game and compare against independent human ground
    truth, including red fives, called tiles, kans and low light, before calling
    the layout supported.

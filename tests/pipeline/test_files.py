@@ -3,21 +3,19 @@
 
 """File publication preserves the old artifact on any incomplete write."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TextIO
 
 import pytest
 
 from video2tenhou import files
 
-if TYPE_CHECKING:
-    from typing import TextIO
 
-
-def test_streaming_hash_and_nested_unicode_json(tmp_path: "Path") -> None:
-    """Verify streaming hash and nested unicode json."""
+def test_streaming_hash_and_nested_unicode_json(tmp_path: Path) -> None:
     path = tmp_path / "nested" / "evidence.json"
     files.atomic_write_json(path, {"tile": "東"}, indent=1)
     assert json.loads(path.read_text(encoding="utf-8")) == {"tile": "東"}
@@ -27,22 +25,18 @@ def test_streaming_hash_and_nested_unicode_json(tmp_path: "Path") -> None:
 
 @pytest.mark.parametrize("failure", ["serialization", "sync", "replacement"])
 def test_failed_publication_preserves_existing_contents_and_cleans_up(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", failure: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Verify failed publication preserves existing contents and cleans up."""
     path = tmp_path / "evidence.json"
     path.write_text('{"complete":true}', encoding="utf-8")
     before = path.read_bytes()
 
     def fail(*_unused_args: object, **_unused_kwargs: object) -> None:
-        msg = "interrupted write"
-        raise OSError(msg)
+        raise OSError("interrupted write")
 
     if failure == "serialization":
 
-        def partial(
-            value: "object", stream: "TextIO", **_unused_kwargs: object
-        ) -> None:
+        def partial(value: object, stream: TextIO, **_unused_kwargs: object) -> None:
             stream.write('{"partial":')
             fail()
 
@@ -57,8 +51,7 @@ def test_failed_publication_preserves_existing_contents_and_cleans_up(
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_text_publication_replaces_complete_file(tmp_path: "Path") -> None:
-    """Verify text publication replaces complete file."""
+def test_text_publication_replaces_complete_file(tmp_path: Path) -> None:
     path = tmp_path / "rows.jsonl"
     files.atomic_write_text(path, '"old"\n')
     files.atomic_write_text(path, '"new"\n"rows"\n')

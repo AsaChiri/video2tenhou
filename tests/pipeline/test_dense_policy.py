@@ -3,37 +3,32 @@
 
 """Retention changes reuse raw sparse reads and isolate derived dense caches."""
 
+from __future__ import annotations
+
 import copy
 import json
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 
+from tests.builders import one_hot
 from tests.recognition import RecognitionStub
 from video2tenhou import read
 from video2tenhou.calm import Interval
 from video2tenhou.layout import Calibration
-from video2tenhou.perception.evidence_policy import DEFAULT_POLICY, resolve_policy
-from video2tenhou.train.data import CLASS_INDEX, CLASSES
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-    from video2tenhou.perception.reader import RegionClassifier, RegionDetector
-
-
-if TYPE_CHECKING:
-    from video2tenhou.perception.evidence_policy import EvidencePolicy
+from video2tenhou.perception.evidence_policy import (
+    DEFAULT_POLICY,
+    EvidencePolicy,
+    resolve_policy,
+)
+from video2tenhou.perception.reader import RegionClassifier, RegionDetector
+from video2tenhou.perception.tiles import CLASS_INDEX, CLASSES
 
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
-
-
-def _policy(*, sparse_hand: float = 0.2, dense_hand: float = 0.2) -> "EvidencePolicy":
+def _policy(*, sparse_hand: float = 0.2, dense_hand: float = 0.2) -> EvidencePolicy:
     return resolve_policy(
         {
             "schema_version": 1,
@@ -43,10 +38,9 @@ def _policy(*, sparse_hand: float = 0.2, dense_hand: float = 0.2) -> "EvidencePo
     )
 
 
-def _recognition(monkeypatch: "pytest.MonkeyPatch") -> tuple:
+def _recognition(monkeypatch: pytest.MonkeyPatch) -> tuple:
     calls = []
-    posterior = np.zeros(len(CLASSES)).tolist()
-    posterior[CLASS_INDEX["1s"]] = 1.0
+    posterior = one_hot("1s")
     boxes = [
         {
             "xyxy": [x, 0, x + 38, 58],
@@ -59,8 +53,8 @@ def _recognition(monkeypatch: "pytest.MonkeyPatch") -> tuple:
     ]
 
     def recognize(
-        items: "read.CropBatch", det: "RegionDetector", clf: "RegionClassifier"
-    ) -> "list[SimpleNamespace]":
+        items: read.CropBatch, det: RegionDetector, clf: RegionClassifier
+    ) -> list[SimpleNamespace]:
         items = list(items)
         calls.extend((t, region) for t, region, _ in items)
         results = []
@@ -85,7 +79,7 @@ def _recognition(monkeypatch: "pytest.MonkeyPatch") -> tuple:
 
     def sample(
         *_unused_args: object, **_unused_kwargs: object
-    ) -> "Iterator[tuple[float, np.ndarray]]":
+    ) -> Iterator[tuple[float, np.ndarray]]:
         yield 0.0, np.zeros((4, 4, 3), np.uint8)
 
     monkeypatch.setattr(read.video, "sample", sample)
@@ -96,15 +90,14 @@ def _recognition(monkeypatch: "pytest.MonkeyPatch") -> tuple:
 
 
 def test_dense_policy_recomputes_structure_and_only_dense_changes_invalidate(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify dense policy recomputes structure and only dense changes invalidate."""
     calls, raw_boxes = _recognition(monkeypatch)
     det = RecognitionStub(id="unchanged-detector", evidence_policy=DEFAULT_POLICY)
     clf = RecognitionStub(id="unchanged-classifier", classes=CLASSES, T=1.0)
     cal = Calibration.load("pml")
 
-    def acquire() -> "dict":
+    def acquire() -> dict:
         return read.dense_reads(
             read.ReadContext("recording", cal, tmp_path, det, clf),
             0.0,
@@ -128,9 +121,8 @@ def test_dense_policy_recomputes_structure_and_only_dense_changes_invalidate(
 
 
 def test_policy_only_changes_leave_sparse_read_manifest_and_raw_bytes_reusable(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify policy only changes leave sparse read manifest and raw bytes reusable."""
     calls, _ = _recognition(monkeypatch)
     det = RecognitionStub(id="unchanged-detector", evidence_policy=DEFAULT_POLICY)
     clf = RecognitionStub(id="unchanged-classifier", classes=CLASSES, T=1.0)

@@ -7,14 +7,18 @@
     video2tenhou download <video-url> <out.mp4> [--start HH:MM:SS --end HH:MM:SS]
     video2tenhou trim <video> <out.mp4> [--start HH:MM:SS --end HH:MM:SS]
     video2tenhou calib fit <video> [--calib pml] [--keep overhead hand ...] [--force]
-    video2tenhou calib check <video> [--t <seconds> ...] [--calib pml] [--out
-    work/calib]
+    video2tenhou calib check <video> [--t <seconds> ...] [--calib pml]
     video2tenhou convert <video> --game <id> [--game <id>] [--out out] [--calib pml]
+    video2tenhou rebuild <video> [--hands <i> ...] [--force]
 
 A new video starts with `calib fit`: the geometry of the composite is measured and
 checked before tile recognition, because later stages read the crops it defines.
 Calibration samples visible table tiles independently of broadcast overlay text
 (DESIGN.md 4.2a).
+
+Every command except `web` logs progress on stderr and ends with one JSON document on
+stdout when it has an outcome to report: `{"result": ...}` and/or `{"error": "..."}`.
+An error message tells the user what to do; tracebacks stay in the log.
 """
 
 from __future__ import annotations
@@ -28,38 +32,58 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import cv2
-
-from video2tenhou.engine.decode import DecodeRunOptions
 from video2tenhou.files import atomic_write_json
-from video2tenhou.logging_setup import command_logging
+from video2tenhou.logging_setup import RESULT, command_logging
 
 from . import paths
-from .layout import fit_path
 
 if TYPE_CHECKING:
     from argparse import Namespace
+    from collections.abc import Callable
+
+    import numpy as np
 
     from video2tenhou.calibfit import RegionCheck
     from video2tenhou.layout import Calibration
+    from video2tenhou.perception.evidence_policy import EvidencePolicy
+    from video2tenhou.read import ReadContext
     from video2tenhou.record import Game
 
 
 LOGGER = logging.getLogger("video2tenhou.cli")
 
 
+class CommandFailed(SystemExit):
+    """Stop a command with a message for the user and an optional partial result."""
+
+    def __init__(self, message: str, result: object = None) -> None:
+        """Keep the message as the exit status, as SystemExit does for text."""
+        super().__init__(message)
+        self.result = result
+
+
 def cmd_download(a: Namespace) -> None:
     """Download a broadcast using the source and optional clip bounds from argparse."""
     from . import video  # noqa: PLC0415
 
-    video.download(a.url, a.out, a.start, a.end)
+    try:
+        video.download(a.url, a.out, a.start, a.end)
+    except subprocess.CalledProcessError as error:
+        raise CommandFailed(
+            "The download failed. Check the video URL and the connection, then retry."
+        ) from error
 
 
 def cmd_trim(a: Namespace) -> None:
     """Create a separate recording for the selected local time range."""
     from . import video  # noqa: PLC0415
 
-    video.trim(a.source, a.out, a.start, a.end)
+    try:
+        video.trim(a.source, a.out, a.start, a.end)
+    except subprocess.CalledProcessError as error:
+        raise CommandFailed(
+            "The selected time range could not be cut from the recording."
+        ) from error
 
 
 def _work_dir(a: Namespace) -> Path:
@@ -67,6 +91,8 @@ def _work_dir(a: Namespace) -> Path:
 
 
 def _print_fit(cal: Calibration, video: str | Path) -> None:
+    from .layout import fit_path  # noqa: PLC0415
+
     if cal.fit:
         oh = cal.fit.get("overhead") or {}
         LOGGER.info(
@@ -86,7 +112,14 @@ def _print_fit(cal: Calibration, video: str | Path) -> None:
         )
 
 
-def cmd_calib_fit(a: Namespace) -> None:
+def _write_jpeg(path: Path, image: np.ndarray, quality: int) -> None:
+    import cv2  # noqa: PLC0415
+
+    cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    LOGGER.info("  %s", path)
+
+
+def cmd_calib_fit(a: Namespace) -> dict:
     """Measure per-recording geometry and fail when borders cut detected tiles."""
     from . import calibfit  # noqa: PLC0415
     from .layout import Calibration  # noqa: PLC0415
@@ -95,48 +128,66 @@ def cmd_calib_fit(a: Namespace) -> None:
     work = _work_dir(a)
     cal = Calibration.load(a.calib, a.video)
     det = None if a.no_models else Detector()
-    calibfit.run_fit(
-        Path(a.video),
-        cal,
-        work,
-        det=det,
-        options=calibfit.FitOptions(force=a.force, keep=set(a.keep or [])),
-    )
+    recording = calibfit.Recording(Path(a.video), det)  # shared by fit and check
+    calibfit.run_fit(recording, cal, work, force=a.force, keep=set(a.keep or []))
     cal = Calibration.load(a.calib, a.video)
     LOGGER.info("[0 fit] %s", a.video)
     _print_fit(cal, a.video)
     for c in ("TL", "TR", "BL", "BR"):
         LOGGER.info("  hand %s: roll %+.1f deg", c, cal.roll(c))
-    if det is not None:
-        checks = calibfit.check_all(Path(a.video), cal, det, work)
-        _report_checks(checks)
-    else:
-        checks = []
+    checks = (
+        []
+        if det is None
+        else calibfit.check_all(Path(a.video), cal, det, work, recording=recording)
+    )
+    _report_checks(checks)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    p = out / f"fit_{Path(a.video).stem}.jpg"
-    cv2.imwrite(
-        str(p),
+    _write_jpeg(
+        out / f"fit_{Path(a.video).stem}.jpg",
         calibfit.fit_sheet(Path(a.video), cal, work, checks),
-        [cv2.IMWRITE_JPEG_QUALITY, 92],
+        92,
     )
-    LOGGER.info("  %s", p)
-    if any(not c.ok for c in checks):
-        LOGGER.info(
-            "  Fix the failing regions: video2tenhou web -> recording Settings "
-            "-> Calibration"
-        )
-        raise SystemExit(1)
+    return _checks_outcome(checks)
 
 
-def _report_checks(checks: list[RegionCheck]) -> bool:
-    LOGGER.info("  border check (a region's border must not cut a tile):")
+def _report_checks(checks: list[RegionCheck]) -> None:
+    if checks:
+        LOGGER.info("  border check (a region's border must not cut a tile):")
     for c in sorted(checks, key=lambda c: c.region):
         LOGGER.info("%s", c.line())
-    return all(c.ok for c in checks)
 
 
-def cmd_calib_check(a: Namespace) -> None:
+def _border_problem(check: RegionCheck) -> str:
+    if check.region == "overhead":
+        return "does not match the table"
+    if check.foreign:
+        return "reads another pond"
+    return "cuts tiles" if check.cut else "sees no tiles"
+
+
+def border_failure(checks: list[RegionCheck]) -> str | None:
+    """Describe failing border checks as one instruction, or None when all pass."""
+    failing = [c for c in sorted(checks, key=lambda c: c.region) if not c.ok]
+    if not failing:
+        return None
+    problems = "; ".join(f"{c.region} {_border_problem(c)}" for c in failing)
+    return f"Adjust the table borders in Calibration: {problems}."
+
+
+def _checks_outcome(checks: list[RegionCheck]) -> dict:
+    """Return every region's check, stopping the command when one fails."""
+    result = {
+        c.region: {"level": c.level, "held": c.held, "cut": c.cut, "note": c.note}
+        for c in checks
+    }
+    failure = border_failure(checks)
+    if failure:
+        raise CommandFailed(failure, result)
+    return result
+
+
+def cmd_calib_check(a: Namespace) -> dict:
     """Validate existing geometry and optionally render time-specific contact sheets."""
     from . import calibfit, video  # noqa: PLC0415
     from .layout import Calibration, contact_sheet  # noqa: PLC0415
@@ -147,34 +198,34 @@ def cmd_calib_check(a: Namespace) -> None:
     out.mkdir(parents=True, exist_ok=True)
     LOGGER.info("[calib check] %s with layout %s", a.video, a.calib)
     _print_fit(cal, a.video)
-    ok = True
+    checks = []
     if not a.no_models:
         from .perception.detector import Detector  # noqa: PLC0415
 
         checks = calibfit.check_all(Path(a.video), cal, Detector(), work)
-        ok = _report_checks(checks)
-        p = out / f"fit_{Path(a.video).stem}.jpg"
-        cv2.imwrite(
-            str(p),
+        _report_checks(checks)
+        _write_jpeg(
+            out / f"fit_{Path(a.video).stem}.jpg",
             calibfit.fit_sheet(Path(a.video), cal, work, checks),
-            [cv2.IMWRITE_JPEG_QUALITY, 92],
+            92,
         )
-        LOGGER.info("  %s", p)
     for t in a.t or []:
         frame = video.frame_at(a.video, t)
-        p = out / f"calib_{Path(a.video).stem}_{int(t)}.jpg"
-        cv2.imwrite(str(p), contact_sheet(frame, cal), [cv2.IMWRITE_JPEG_QUALITY, 90])
-        LOGGER.info("  %s", p)
-    if not ok:
-        raise SystemExit(1)
+        _write_jpeg(
+            out / f"calib_{Path(a.video).stem}_{int(t)}.jpg",
+            contact_sheet(frame, cal),
+            90,
+        )
+    return _checks_outcome(checks)
 
 
 def _convert_header(
-    a: Namespace, cal: Calibration, work: Path
+    a: Namespace, context: ReadContext
 ) -> tuple[list[Game], list[dict]]:
     """Bind the recording's authoritative games before accepting hand timing."""
     from . import record, timeline  # noqa: PLC0415
 
+    work = context.work
     rec = work / "record.json"
     if rec.exists() and not a.force:
         games = [
@@ -191,9 +242,9 @@ def _convert_header(
             [record.to_dict(g) for g in games],
             indent=1,
         )
-    _gate(a, cal, work)
+    _gate(a, context)
     LOGGER.info("[1 header] table clearings and scoremj: %s -> %s", a.video, work)
-    entries, problems = timeline.run_header(a.video, cal, games, work, force=a.force)
+    entries, problems = timeline.run_header(context, games, force=a.force)
     for e in entries:
         LOGGER.info(
             "  hand %2d game %s %s/%s sticks %s %7.0f-%7.0f s  winds %s  site %s",
@@ -211,7 +262,10 @@ def _convert_header(
         LOGGER.info("PROBLEMS (table timing and site record disagree):")
         for p in problems:
             LOGGER.info("  - %s", p)
-        raise SystemExit(1)
+        raise CommandFailed(
+            "The hands found in the video do not match the score record. Check the "
+            "game IDs and the recording's time range in Settings."
+        )
     LOGGER.info("  %s hands agree with the site record", len(entries))
     return games, entries
 
@@ -224,11 +278,68 @@ def cmd_convert(a: Namespace) -> None:
     work = Path(a.work) / Path(a.video).stem
     work.mkdir(parents=True, exist_ok=True)
     _require_fit(a, cal)
-    games, entries = _convert_header(a, cal, work)
-    if a.stop == "header":
+    recognized = _recognize(a, cal, work)
+    if recognized is None:
         return
-    from . import calm  # noqa: PLC0415
+    games, entries, touched, policy = recognized
+    from .engine.decode import run_decode  # noqa: PLC0415
+    from .export import write_outputs  # noqa: PLC0415
 
+    LOGGER.info("[5 decode]")
+    only = set(a.hands) if a.hands else None
+    force_all = (a.force or a.redo is not None or bool(a.reread)) and not only
+    redo = (only or set()) | (set() if force_all else touched)
+    if redo:
+        run_decode(
+            work,
+            entries,
+            games,
+            force=True,
+            only=redo,
+            video_path=Path(a.video),
+            cal=cal,
+            evidence_policy=policy,
+        )
+    decodes = run_decode(
+        work,
+        entries,
+        games,
+        force=force_all,
+        video_path=Path(a.video),
+        cal=cal,
+        evidence_policy=policy,
+    )
+    if a.stop == "decode":
+        return
+    write_outputs(
+        Path(a.out) / Path(a.video).stem,
+        games,
+        decodes,
+        entries,
+        decode_dir=work / "decode",
+    )
+    (work / "calibration.changed").unlink(missing_ok=True)
+    (work / "inputs.changed").unlink(missing_ok=True)
+
+
+def _recognize(
+    a: Namespace, cal: Calibration, work: Path
+) -> tuple[list[Game], list[dict], set[int], EvidencePolicy] | None:
+    """Gate, time, read and vote the recording with one detector/classifier pair.
+
+    Returns None when `--stop` ends the conversion before reconstruction. The models
+    are local to this stage, so they are released before reconstruction loads its
+    own only if a hand rereads the video; one pair is resident at a time.
+    """
+    from . import calm, observe, read  # noqa: PLC0415
+    from .perception.classifier import Classifier  # noqa: PLC0415
+    from .perception.detector import Detector  # noqa: PLC0415
+
+    det = Detector()
+    context = read.ReadContext(a.video, cal, work, det, Classifier())
+    games, entries = _convert_header(a, context)
+    if a.stop == "header":
+        return None
     LOGGER.info("[2 calm]")
     # Stage 1 already refreshed calm evidence when --force was requested.
     ivs = calm.run_calm(a.video, cal, work, force=False)
@@ -241,22 +352,16 @@ def cmd_convert(a: Namespace) -> None:
             s["median_calm_s"],
         )
     if a.stop == "calm":
-        return
-    from . import observe, read  # noqa: PLC0415
-    from .perception.classifier import Classifier  # noqa: PLC0415
-    from .perception.detector import Detector  # noqa: PLC0415
-
+        return None
     LOGGER.info("[3 read]")
-    det, clf = Detector(), Classifier()
     if a.force or a.redo == "read":
         read.clear_dense(work)  # dense reads start over with the calm reads
     st, touched = read.run_read(
-        read.ReadContext(a.video, cal, work, det, clf),
+        context,
         entries,
         ivs,
-        options=read.ReadOptions(
-            force=a.force or a.redo == "read", reread=set(a.reread or [])
-        ),
+        force=a.force or a.redo == "read",
+        reread=set(a.reread or []),
     )
     LOGGER.info(
         "  %s%s",
@@ -264,182 +369,112 @@ def cmd_convert(a: Namespace) -> None:
         f"  new readings in hands {sorted(touched)}" if touched else "",
     )
     if a.stop == "read":
-        return
+        return None
     LOGGER.info("[4 observe]")
-    # a hand with new readings is observed (and decoded) again even when nothing else is
-    # forced
+    # A hand with new readings is voted and decoded again even when nothing else is
+    # forced.
     st = observe.run_observe(
         work,
         entries,
         ivs,
-        options=observe.ObservationOptions(
-            force=a.force or a.redo in ("read", "observe") or bool(a.reread),
-            touched=touched,
-            policy=det.evidence_policy,
-        ),
+        force=a.force or a.redo in ("read", "observe") or bool(a.reread),
+        touched=touched,
+        policy=det.evidence_policy,
     )
-    touched = set(touched) | set(st.get("changed_hands", []))
     LOGGER.info("  %s", st)
     if a.stop == "observe":
-        return
-    from .engine.decode import run_decode  # noqa: PLC0415
-
-    LOGGER.info("[5 decode]")
-    only = set(a.hands) if a.hands else None
-    force_all = (a.force or a.redo is not None or bool(a.reread)) and not only
-    redo = (only or set()) | (set() if force_all else touched)
-    if redo:
-        run_decode(
-            work,
-            entries,
-            games,
-            options=DecodeRunOptions(
-                force=True,
-                only=redo,
-                video_path=Path(a.video),
-                cal=cal,
-                evidence_policy=det.evidence_policy,
-            ),
-        )
-    decodes = run_decode(
-        work,
-        entries,
+        return None
+    return (
         games,
-        options=DecodeRunOptions(
-            force=force_all,
-            video_path=Path(a.video),
-            cal=cal,
-            evidence_policy=det.evidence_policy,
-        ),
+        entries,
+        set(touched) | set(st.get("changed_hands", [])),
+        det.evidence_policy,
     )
-    if a.stop == "decode":
-        return
-    LOGGER.info("[6 write]")
+
+
+def cmd_rebuild(a: Namespace) -> None:
+    """Reconstruct hands with the saved answers, then rewrite every export.
+
+    Without `--force`, a hand whose decode already matches its evidence, record and
+    answers is reused. Evidence is never re-read: changed geometry or project inputs
+    require `convert` first.
+    """
+    from . import record  # noqa: PLC0415
+    from .engine.decode import DECODER_VERSION, run_decode  # noqa: PLC0415
+    from .export import write_outputs  # noqa: PLC0415
+    from .layout import Calibration  # noqa: PLC0415
+
+    work = _work_dir(a)
+    if any((work / m).exists() for m in ("calibration.changed", "inputs.changed")):
+        raise CommandFailed(
+            "The table geometry or project settings changed. Choose Analyze "
+            "recording to refresh the readings before updating hands."
+        )
+    hands = json.loads((work / "hands.json").read_text(encoding="utf-8"))
+    games = [
+        record.from_dict(row)
+        for row in json.loads((work / "record.json").read_text(encoding="utf-8"))
+    ]
+    known = {h["hand"] for h in hands}
+    selected = set(a.hands) if a.hands else known
+    if not selected <= known:
+        raise CommandFailed("Unknown hand selected for rebuilding.")
+    run_decode(
+        work,
+        hands,
+        games,
+        force=a.force,
+        only=selected,
+        video_path=Path(a.video),
+        cal=Calibration.load(a.calib, a.video),
+    )
+    # A decode by another decoder version is stale and never exported.
+    saved = [work / "decode" / f"{h['hand']:02d}.json" for h in hands]
+    decodes = [
+        decoded
+        for path in saved
+        if path.exists()
+        and (decoded := json.loads(path.read_text(encoding="utf-8"))).get(
+            "decoder_version"
+        )
+        == DECODER_VERSION
+    ]
     write_outputs(
-        Path(a.out) / Path(a.video).stem, games, decodes, entries, Path(a.video).stem
+        Path(a.out) / Path(a.video).stem,
+        games,
+        decodes,
+        hands,
+        decode_dir=work / "decode",
     )
-    (work / "calibration.changed").unlink(missing_ok=True)
-    (work / "inputs.changed").unlink(missing_ok=True)
-
-
-def hand_status(d: dict, *, left_out: bool) -> str:
-    """Classify a hand as complete, needing review or in conflict.
-
-    Complete (nothing open) / review (open questions) / conflict (no legal
-    reconstruction, or a log the replayer rejects: nothing is written for it).
-    """
-    if left_out or any(i["kind"] == "conflict" for i in d["items"]):
-        return "conflict"
-    return "review" if d["items"] else "complete"
-
-
-def write_outputs(
-    out: Path, games: list[Game], decodes: list[dict], entries: list[dict], title: str
-) -> None:
-    """Write game logs, viewer links, confidence reports and review queues.
-
-    g<k>.json (the logs, without the hands left out), g<k>.html (their tenhou URLs),
-    g<k>.confidence.json, review.json and report.md.
-    """
-    from .engine.assemble import game_from_decodes  # noqa: PLC0415
-    from .engine.validation import review_artifact  # noqa: PLC0415
-
-    out.mkdir(parents=True, exist_ok=True)
-    report, review = [], []
-    for gi, game in enumerate(games):
-        ds = [d for d in decodes if d["game"] == gi]
-        expected = [e for e in entries if e["game"] == gi]
-        g, conf, left_out = game_from_decodes(ds, entries, game, title)
-        (out / f"g{gi}.json").write_text(g.dumps(), encoding="utf-8")
-        (out / f"g{gi}.html").write_text(g.links_html(), encoding="utf-8")
-        atomic_write_json(
-            out / f"g{gi}.confidence.json",
-            {str(h): rows for h, rows in conf.items()},
-            indent=1,
+    current = {d["hand"] for d in decodes}
+    unread = sorted(h + 1 for h in selected if h not in current)
+    if unread:
+        names = ", ".join(map(str, unread))
+        raise CommandFailed(
+            (
+                f"Hand {names} has no tile readings."
+                if len(unread) == 1
+                else f"Hands {names} have no tile readings."
+            )
+            + " Choose Analyze recording to read the video again."
         )
-        for decoded in sorted(ds, key=lambda d: d["hand"]):
-            entry = next(e for e in entries if e["hand"] == decoded["hand"])
-            d = review_artifact(decoded, entry, left_out.get(decoded["hand"], []))
-            items = d["items"]
-            sc = d["score"]
-            score = (
-                "-"
-                if not sc
-                else (
-                    "ok"
-                    if sc["match"]
-                    else (
-                        sc["error"]
-                        or f"{sc['han']}/{sc['fu']} vs {sc['site'][0]}/{sc['site'][1]}"
-                    )
-                )
-            )
-            # lost: the tiles nothing showed (draws, kan indicators), written as the
-            # rules' guess; each is an open
-            # question until the reviewer supplies it or says Can't tell
-            lost = sum(1 for r in d.get("confidence", []) if r.get("lost"))
-            report.append(
-                f"| {d['hand']} | {gi} | {d['kyoku']}/{d['honba']} | "
-                f"{hand_status(d, left_out=d['hand'] in left_out)} | "
-                f"{('no' if d['hand'] in left_out else 'yes')} | "
-                f"{d['stats']['turns']} | {d['stats']['calls']} | {len(items)} "
-                f"| {lost} | {score} |"
-            )
-            for it in items:
-                # an item may carry its own `hand` (a reconstructed hand of tiles): it
-                # must not overwrite the hand number
-                row = dict(it)
-                if isinstance(row.get("hand"), list):
-                    row["tiles"] = row.pop("hand")
-                review.append({**row, "hand": d["hand"]})
-        decoded_ids = {d["hand"] for d in ds}
-        for entry in expected:
-            if entry["hand"] in decoded_ids:
-                continue
-            reason = (
-                "No current reconstruction is available. Analyze this recording "
-                "again to rebuild missing or outdated evidence."
-            )
-            review.append({"kind": "conflict", "hand": entry["hand"], "text": reason})
-            report.append(
-                f"| {entry['hand']} | {gi} | {entry['kyoku']}/{entry['honba']} "
-                "| conflict | no | 0 | 0 | 1 | 0 | - |"
-            )
-        report.append(
-            f"\nhanchan {gi}: {len(g.kyokus)} of {len(expected)} hands written"
-        )
-        for h, v in sorted(left_out.items()):
-            report.append(
-                f"  - hand {h} left out: {v[0]}"
-                + (f" (+{len(v) - 1} more)" if len(v) > 1 else "")
-            )
-        report.append("")
-    atomic_write_json(
-        out / "review.json",
-        review,
-        indent=1,
-    )
-    head = (
-        "| hand | game | kyoku/honba | status | written | turns | calls | open "
-        "items | lost | score |\n|---|---|---|---|---|---|---|---|---|---|\n"
-    )
-    (out / "report.md").write_text(head + "\n".join(report) + "\n", encoding="utf-8")
-    LOGGER.info("%s", (out / "report.md").read_text(encoding="utf-8"))
 
 
 def _require_fit(a: Namespace, cal: Calibration) -> None:
     """Reject missing geometry before spending time scanning a recording."""
     if not a.skip_fit_check and cal.fit is None:
-        msg = (
-            f"[0 fit] {a.video} has no calibration fit. The layout's numbers "
-            "are the reference video's; on any other video the ponds and meld "
-            "insets land in the wrong place.\n        Run: video2tenhou calib "
-            f"fit {a.video}"
+        LOGGER.info(
+            "[0 fit] %s has no calibration fit; the layout's numbers belong to its "
+            "reference video. Run: video2tenhou calib fit %s",
+            a.video,
+            a.video,
         )
-        raise SystemExit(msg)
+        raise CommandFailed(
+            "This recording has no table calibration. Prepare the recording first."
+        )
 
 
-def _gate(a: Namespace, cal: Calibration, work: Path) -> None:
+def _gate(a: Namespace, context: ReadContext) -> None:
     """Validate tile geometry after alignment and before any tile-reading stage.
 
     Independent table samples check region geometry; border failures stop
@@ -447,22 +482,18 @@ def _gate(a: Namespace, cal: Calibration, work: Path) -> None:
     """
     from . import calibfit  # noqa: PLC0415
 
+    cal = context.calibration
     _require_fit(a, cal)
     if a.skip_fit_check:
         return
-    from .perception.detector import Detector  # noqa: PLC0415
-
     LOGGER.info("[0 fit] checking this video's geometry")
     _print_fit(cal, a.video)
-    checks = calibfit.check_all(Path(a.video), cal, Detector(), work)
-    if not _report_checks(checks):
-        bad = ", ".join(c.region for c in checks if not c.ok)
-        msg = (
-            f"        {bad} would be read from a crop that cuts tiles: fix the "
-            "fit first (video2tenhou web -> Settings -> Calibration), or pass "
-            "--skip-fit-check to run anyway."
-        )
-        raise SystemExit(msg)
+    checks = calibfit.check_all(Path(a.video), cal, context.detector, context.work)
+    _report_checks(checks)
+    failure = border_failure(checks)
+    if failure:
+        LOGGER.info("  Pass --skip-fit-check to convert anyway.")
+        raise CommandFailed(failure)
 
 
 def cmd_web(a: Namespace) -> int | None:
@@ -509,6 +540,33 @@ def cmd_web(a: Namespace) -> int | None:
     return None
 
 
+def run_command(a: Namespace) -> int:
+    """Run one command and report its outcome as the final JSON line on stdout.
+
+    A `SystemExit` with a message is a failure the user can act on; any other
+    exception is logged with its traceback and reported as unexpected.
+    """
+    try:
+        result = a.fn(a)
+    except SystemExit as stop:
+        if not isinstance(stop.code, str):
+            raise
+        outcome = {"error": stop.code}
+        if isinstance(stop, CommandFailed) and stop.result is not None:
+            outcome["result"] = stop.result
+        RESULT.info("%s", json.dumps(outcome))
+        return 1
+    except Exception as error:
+        LOGGER.exception("%s failed", a.cmd)
+        detail = str(error) or type(error).__name__
+        outcome = {"error": f"Unexpected error: {detail}", "unexpected": True}
+        RESULT.info("%s", json.dumps(outcome))
+        return 1
+    if result is not None:
+        RESULT.info("%s", json.dumps({"result": result}))
+    return 0
+
+
 def _calibration_commands(parser: argparse.ArgumentParser) -> None:
     """Define calibration commands and their shared workspace defaults."""
     csub = parser.add_subparsers(dest="sub", required=True)
@@ -551,6 +609,53 @@ def _calibration_commands(parser: argparse.ArgumentParser) -> None:
         help="print the fit without running the detector",
     )
     cc.set_defaults(fn=cmd_calib_check)
+
+
+def _stage_commands(add_parser: Callable[..., argparse.ArgumentParser]) -> None:
+    """Define conversion and review rebuild commands."""
+    v = add_parser("convert")
+    v.add_argument("video")
+    v.add_argument("--game", type=int, action="append", required=True)
+    v.add_argument("--out", default=str(paths.DATA_DIR / "out"))
+    v.add_argument("--calib", default="pml")
+    v.add_argument("--work", default=str(paths.DATA_DIR / "work"))
+    v.add_argument("--force", action="store_true", help="recompute cached stages")
+    v.add_argument(
+        "--stop",
+        choices=["header", "calm", "read", "observe", "decode"],
+        help="stop after this stage",
+    )
+    v.add_argument(
+        "--redo",
+        choices=["read", "observe", "decode"],
+        help="recompute this stage even if cached",
+    )
+    v.add_argument(
+        "--reread",
+        choices=["pond", "hand", "meld"],
+        nargs="*",
+        help=(
+            "re-read these region kinds from scratch (after a calibration change), "
+            "then observe and decode again"
+        ),
+    )
+    v.add_argument("--hands", type=int, nargs="*", help="re-decode only these hands")
+    v.add_argument(
+        "--skip-fit-check",
+        action="store_true",
+        help="run even when the geometry check fails (the log will be wrong)",
+    )
+    v.set_defaults(fn=cmd_convert)
+    r = add_parser(
+        "rebuild", help="reconstruct hands with saved answers and rewrite the exports"
+    )
+    r.add_argument("video")
+    r.add_argument("--hands", type=int, nargs="*", help="these hands (default: all)")
+    r.add_argument("--force", action="store_true", help="decode even if up to date")
+    r.add_argument("--out", default=str(paths.DATA_DIR / "out"))
+    r.add_argument("--calib", default="pml")
+    r.add_argument("--work", default=str(paths.DATA_DIR / "work"))
+    r.set_defaults(fn=cmd_rebuild)
 
 
 @command_logging
@@ -599,43 +704,10 @@ def main(argv: list[str] | None = None) -> int | None:
 
     c = sub.add_parser("calib")
     _calibration_commands(c)
-
-    v = sub.add_parser("convert")
-    v.add_argument("video")
-    v.add_argument("--game", type=int, action="append", required=True)
-    v.add_argument("--out", default=str(paths.DATA_DIR / "out"))
-    v.add_argument("--calib", default="pml")
-    v.add_argument("--work", default=str(paths.DATA_DIR / "work"))
-    v.add_argument("--force", action="store_true", help="recompute cached stages")
-    v.add_argument(
-        "--stop",
-        choices=["header", "calm", "read", "observe", "decode"],
-        help="stop after this stage",
-    )
-    v.add_argument(
-        "--redo",
-        choices=["read", "observe", "decode"],
-        help="recompute this stage even if cached",
-    )
-    v.add_argument(
-        "--reread",
-        choices=["pond", "hand", "meld"],
-        nargs="*",
-        help=(
-            "re-read these region kinds from scratch (after a calibration change), "
-            "then observe and decode again"
-        ),
-    )
-    v.add_argument("--hands", type=int, nargs="*", help="re-decode only these hands")
-    v.add_argument(
-        "--skip-fit-check",
-        action="store_true",
-        help="run even when the geometry check fails (the log will be wrong)",
-    )
-    v.set_defaults(fn=cmd_convert)
+    _stage_commands(sub.add_parser)
 
     a = ap.parse_args(argv)
-    return a.fn(a)
+    return a.fn(a) if a.cmd == "web" else run_command(a)
 
 
 if __name__ == "__main__":

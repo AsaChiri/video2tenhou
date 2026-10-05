@@ -3,14 +3,15 @@
 
 """Unreadable storage is an operational failure, not a reason to redo recognition."""
 
+from __future__ import annotations
+
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from video2tenhou import calibfit, calm, observe, timeline
+from tests.recognition import RecognitionStub
+from video2tenhou import calibfit, calm, observe, read, timeline
 from video2tenhou.layout import Calibration
-from video2tenhou.perception import detector
 
 
 @pytest.mark.parametrize(
@@ -18,12 +19,11 @@ from video2tenhou.perception import detector
 )
 @pytest.mark.parametrize("error_type", [PermissionError, OSError])
 def test_storage_errors_propagate_without_regenerating_caches(
-    tmp_path: "Path",
-    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     stage: str,
-    error_type: "type[OSError]",
+    error_type: type[OSError],
 ) -> None:
-    """Verify storage errors propagate without regenerating caches."""
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")
     work = tmp_path / "work"
@@ -44,13 +44,13 @@ def test_storage_errors_propagate_without_regenerating_caches(
     read_text, load = Path.read_text, calm.np.load
 
     def denied_read(
-        path: "Path", encoding: str | None = None, errors: str | None = None
+        path: Path, encoding: str | None = None, errors: str | None = None
     ) -> str:
         if path == inaccessible:
             raise failure
         return read_text(path, encoding=encoding, errors=errors)
 
-    def denied_load(path: "Path", *, allow_pickle: bool = False) -> object:
+    def denied_load(path: Path, *, allow_pickle: bool = False) -> object:
         if path == inaccessible:
             raise failure
         return load(path, allow_pickle=allow_pickle)
@@ -65,11 +65,13 @@ def test_storage_errors_propagate_without_regenerating_caches(
     monkeypatch.setattr(timeline, "read_pond_counts", unexpected)
     if stage == "timing":
         monkeypatch.setattr(calm, "run_calm", lambda *_unused_a, **_unused_kw: [])
-        monkeypatch.setattr(detector, "Detector", lambda: SimpleNamespace(id="test"))
+    model = RecognitionStub("test")
     runs = {
         "calm": lambda: calm.run_calm(source, cal, work),
         "plate": lambda: calibfit.table_plate(source, work),
-        "timing": lambda: timeline.run_header(source, cal, [], work),
+        "timing": lambda: timeline.run_header(
+            read.ReadContext(source, cal, work, model, model), []
+        ),
         "observations": lambda: observe.validate_observation_cache(work, [hand], []),
         "intervals": lambda: observe.validate_observation_cache(work, [hand]),
     }

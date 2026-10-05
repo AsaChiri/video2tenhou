@@ -3,6 +3,7 @@ import { ref } from "vue";
 import type { PropType } from "vue";
 import { meldFact } from "./meld";
 import { useReview } from "./context";
+import { useAction } from "../shared/useAction";
 import TileListEditor from "./TileListEditor.vue";
 const props = defineProps({
   hand: { type: Number, required: true },
@@ -13,16 +14,13 @@ const props = defineProps({
   source: String,
 });
 const review = useReview(),
+  { busy, error, run } = useAction(),
   type = ref(props.type),
   source = ref(props.source || "kamicha"),
-  tiles = ref(props.tiles.filter((tile) => tile !== "X" && tile !== "?")),
-  busy = ref(false),
-  error = ref("");
-async function save(remove = false) {
-  if (busy.value) return;
-  busy.value = true;
-  try {
-    await review.save(
+  tiles = ref(props.tiles.filter((tile) => tile !== "X" && tile !== "?"));
+const save = (remove = false) =>
+  run(() =>
+    review.save(
       remove
         ? {
             kind: "meld_remove",
@@ -42,13 +40,8 @@ async function save(remove = false) {
             }),
             hand: props.hand,
           },
-    );
-  } catch (failure) {
-    error.value = failure instanceof Error ? failure.message : String(failure);
-  } finally {
-    busy.value = false;
-  }
-}
+    ),
+  );
 </script>
 <template>
   <div

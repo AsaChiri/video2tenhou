@@ -43,13 +43,9 @@ import numpy as np
 from .paths import ASSET_DIR, LABEL_DIR
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from numpy.typing import ArrayLike
-
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
 
 HALF_TURN_QUARTERS = 2
 
@@ -65,9 +61,7 @@ def fit_path(video: str | Path) -> Path:
 
 
 def apply_fit(data: dict, fit: dict) -> dict:
-    """Substitute a video's measured geometry into the base layout.
-
-    The layout dict with one video's measured geometry substituted (DESIGN.md 4.2a).
+    """Return the layout dict with one video's measured geometry substituted (4.2a).
 
     Only what the fit names is replaced, so a fit that measured the overhead alone keeps
     the layout's panels. The pond and unit rectangles are never in a fit: they are the
@@ -105,8 +99,7 @@ class Rect:
     def crop(self, img: np.ndarray) -> np.ndarray:
         """Crop at the requested coordinates, padding off-image pixels with black."""
         if self.w <= 0 or self.h <= 0:
-            msg = f"Crop dimensions must be positive: {self}"
-            raise ValueError(msg)
+            raise ValueError(f"Crop dimensions must be positive: {self}")
         height, width = img.shape[:2]
         x0, y0 = max(0, self.x), max(0, self.y)
         x1, y1 = min(width, self.x + self.w), min(height, self.y + self.h)
@@ -171,10 +164,7 @@ class Calibration:
     def load(
         cls, name_or_path: str | Path = "pml", video: str | Path | None = None
     ) -> Calibration:
-        """Load the layout and apply the video's saved fit when available.
-
-        The layout, with this video's fit applied when it has one (`cal.fit`).
-        """
+        """Load the layout with the video's saved fit applied when it has one."""
         p = Path(name_or_path)
         if not p.exists():
             p = CALIB_DIR / f"{name_or_path}.json"
@@ -206,11 +196,7 @@ class Calibration:
     def crop_rot_scale(
         rect: Rect, k: int, scale: float
     ) -> tuple[np.ndarray, tuple[int, int]]:
-        """Compose the transform and output size for a rotated, scaled crop.
-
-        Matrix and size for cropping `rect`, turning it k quarter turns clockwise and
-        scaling.
-        """
+        """Matrix and size to crop `rect`, turn it k clockwise quarter turns, scale."""
         w, h = rect.w, rect.h
         if k == 0:
             affine = np.array([[1, 0, -rect.x], [0, 1, -rect.y]], np.float64)
@@ -228,11 +214,7 @@ class Calibration:
         return transform, (round(size[0] * scale), round(size[1] * scale))
 
     def roll(self, corner: str) -> float:
-        """Return the hand row's angle in the corner camera.
-
-        Angle of the hand row in the corner camera; rotating a crop by -roll makes the
-        tiles upright.
-        """
+        """Hand row angle in the corner camera; turning by -roll stands tiles up."""
         return float(self.data["hand"][corner].get("roll", 0.0))
 
     def regions(self) -> list[str]:
@@ -246,6 +228,17 @@ class Calibration:
         out += [f"cam:{c}" for c in self.cam]
         return out
 
+    def panel(self, name: str) -> tuple[Rect, float]:
+        """Frame rectangle and scale of a hand, meld or camera region."""
+        kind, _, corner = name.partition(":")
+        if kind == "hand":
+            return self.hand[corner]
+        if kind == "meld":
+            return self.meld[corner]
+        if kind == "cam":
+            return self.cam[corner], 1.0
+        raise KeyError(name)
+
     def transform(self, name: str) -> tuple[np.ndarray, tuple[int, int]]:
         """(3x3 frame->region matrix, (width, height) of the region image)."""
         kind, _, corner = name.partition(":")
@@ -255,32 +248,14 @@ class Calibration:
             rect, k, s = self.pond[corner]
             transform, size = self.crop_rot_scale(rect, k, s)
             return transform @ self.derotation(), size
-        if kind == "hand":
-            rect, s = self.hand[corner]
-        elif kind == "meld":
-            rect, s = self.meld[corner]
-        elif kind == "cam":
-            rect, s = self.cam[corner], 1.0
-        else:
-            raise KeyError(name)
-        transform, size = self.crop_rot_scale(rect, 0, s)
-        return transform, size
+        rect, s = self.panel(name)
+        return self.crop_rot_scale(rect, 0, s)
 
     def region(self, frame: np.ndarray, name: str) -> tuple[np.ndarray, np.ndarray]:
         """(region image, 3x3 frame->region matrix). The frame must be 1080p."""
         transform, (w, h) = self.transform(name)
-        kind, _, corner = name.partition(":")
-        if kind in ("hand", "meld", "cam"):
-            rect = (
-                {
-                    "hand": self.hand[corner][0],
-                    "meld": self.meld[corner][0],
-                    "cam": self.cam[corner],
-                }[kind]
-                if kind != "cam"
-                else self.cam[corner]
-            )
-            img = rect.crop(frame)
+        if name.partition(":")[0] in ("hand", "meld", "cam"):
+            img = self.panel(name)[0].crop(frame)
             if transform[0, 0] != 1.0:
                 img = cv2.resize(img, (w, h), interpolation=cv2.INTER_CUBIC)
             return img, transform
@@ -331,10 +306,7 @@ def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def contact_sheet(frame: np.ndarray, cal: Calibration) -> np.ndarray:
-    """Draw frame regions alongside their rendered crops.
-
-    The frame with every region outlined, plus the rendered regions, in one image.
-    """
+    """Draw the frame with every region outlined, plus the rendered regions."""
     over = frame.copy()
     for c in CORNERS:
         for r, col in (

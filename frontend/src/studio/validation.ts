@@ -1,3 +1,5 @@
+import { parseTime } from "../review/format";
+
 export function gameIds(text: string) {
   const parts = text
     .trim()
@@ -29,11 +31,9 @@ export function gameIds(text: string) {
 export function timeRange(start: string, end: string) {
   const parse = (value: string) => {
     if (!value) return 0;
-    if (!/^\d+(?::[0-5]\d){0,2}(?:\.\d+)?$/.test(value))
-      throw new Error("Use seconds, MM:SS or HH:MM:SS.");
-    return value
-      .split(":")
-      .reduce((total, part) => total * 60 + Number(part), 0);
+    const seconds = parseTime(value);
+    if (seconds === null) throw new Error("Use seconds, MM:SS or HH:MM:SS.");
+    return seconds;
   };
   if (end && parse(end) <= parse(start))
     throw new Error("End time must be after start time.");

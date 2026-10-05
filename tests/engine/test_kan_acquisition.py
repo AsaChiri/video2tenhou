@@ -3,8 +3,11 @@
 
 """Open-kan acquisition fills missing evidence without overriding human answers."""
 
+from __future__ import annotations
+
 import numpy as np
 
+from video2tenhou.engine.confidence import Certificate
 from video2tenhou.engine.review import draws_to_reread, turn_key
 from video2tenhou.engine.solver import (
     TILES,
@@ -16,7 +19,6 @@ from video2tenhou.engine.solver import (
 
 
 def test_open_kan_acquisition_is_unique_and_respects_facts_and_evidence() -> None:
-    """Verify open-kan acquisition is unique and honors existing evidence."""
     turns = [
         SeatTurn(j, "kan", "1s", 10 * j, 10 * j + 5, kan="daiminkan") for j in range(6)
     ]
@@ -31,8 +33,10 @@ def test_open_kan_acquisition_is_unique_and_respects_facts_and_evidence() -> Non
         {},
         {},
         {},
-        margins={("N", j): 0.0 if j == 3 else 10.0 for j in range(6)},
-        alternative_gaps={("N", j): 0.0 if j == 3 else 10.0 for j in range(6)},
+        certificates={
+            ("draw", "N", j): Certificate(0.0, 0.0) if j == 3 else Certificate(10.0)
+            for j in range(6)
+        },
     )
     # Already-uncertain j3 is not duplicated; certified j0 still gets evidence.
     assert draws_to_reread(result, model) == [("N", 3), ("N", 0)]

@@ -94,9 +94,10 @@
   margin-bottom: 18px;
   border-bottom: 1px solid #dce3e2;
 }
-.review-workspace .review-heading p {
+.review-workspace .notes {
   max-width: 70ch;
-  color: var(--muted);
+  margin: 0 0 12px;
+  padding-left: 20px;
 }
 .review-workspace .question-count {
   color: var(--accent);
@@ -118,14 +119,9 @@
   max-width: 65ch;
 }
 .review-workspace .update-progress {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 24px;
+  margin-left: 12px;
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
-}
-.review-workspace .review-progress progress {
-  width: 100%;
-  accent-color: var(--accent);
 }
 .review-workspace .workbench {
   display: grid;

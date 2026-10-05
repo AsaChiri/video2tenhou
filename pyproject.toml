@@ -63,6 +63,10 @@ skip_empty = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = [
+    "slow: recorded-hand reconstructions with CP-SAT searches; deselect with -m 'not slow' for a quick loop",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -72,13 +76,29 @@ line-ending = "lf"
 
 [tool.ruff.lint]
 select = ["ALL"]
-# Approved by the maintainer: incompatible docstring/formatter rules.
-ignore = ["D203", "D213", "COM812"]
+ignore = [
+    # Approved by the maintainer: incompatible docstring/formatter rules.
+    "D203",
+    "D213",
+    "COM812",
+    # Approved: noun-phrase summaries; forcing the imperative mood doubled docstrings.
+    "D401",
+    # Approved: inline exception messages instead of a `msg` variable before each raise.
+    "EM101",  # string literal message
+    "EM102",  # f-string message
+    "TRY003",  # long message outside the exception class
+]
+
+[tool.ruff.lint.pylint]
+# Approved: up to eight arguments; parameter objects that only dodged five hid signatures.
+max-args = 8
 
 [tool.ruff.lint.per-file-ignores]
 # Approved: pytest assertions, numeric expectations and checks of internal behavior.
 # Test doubles also retain unused named parameters to match real interfaces.
-"tests/**/*.py" = ["S101", "PLR2004", "SLF001", "ARG001", "ARG002"]
+# Approved: test names document tests (D), annotations are optional in tests (ANN)
+# and tests need no type-checking-only import blocks (TC).
+"tests/**/*.py" = ["S101", "PLR2004", "SLF001", "ARG001", "ARG002", "D", "ANN", "TC"]
 # Approved by the maintainer: non-security training-image augmentation.
 "src/video2tenhou/train/data.py" = ["S311"]
 

@@ -20,41 +20,29 @@ from typing import TYPE_CHECKING
 import cv2
 import numpy as np
 import torch
-from torch import nn
 from torch.nn import functional
 from torch.utils.data import DataLoader, Dataset
-from torchvision import models
 
 from video2tenhou.files import atomic_write_json
 from video2tenhou.logging_setup import RESULT, command_logging
 from video2tenhou.paths import DATA_DIR as ROOT
-
-from .data import CLASS_INDEX, CLASSES, CROP_H, CROP_W
+from video2tenhou.perception.classifier import make_model, to_tensor
+from video2tenhou.perception.crops import CROP_H, CROP_W
+from video2tenhou.perception.tiles import CLASS_INDEX, CLASSES
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
-
-
-if TYPE_CHECKING:
     from pathlib import Path
 
 BLUR_PROBABILITY = 0.3
 OCCLUSION_PROBABILITY = 0.3
 
 
-MEAN = np.array([0.485, 0.456, 0.406], np.float32)
-STD = np.array([0.229, 0.224, 0.225], np.float32)
 TRAINING_SEED = 0
 AUGMENTATION_RECIPE = "numpy-generator-pcg64-v1"
 
 
 LOGGER = logging.getLogger("video2tenhou.train.train_classifier")
-
-
-def to_tensor(bgr: np.ndarray) -> torch.Tensor:
-    """Convert BGR pixels to an ImageNet-normalized float tensor in RGB CHW order."""
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    return torch.from_numpy(((rgb - MEAN) / STD).transpose(2, 0, 1))
 
 
 class Crops(Dataset):
@@ -78,19 +66,14 @@ class Crops(Dataset):
         p, y, kind = self.items[index]
         img = cv2.imread(str(p))
         if img is None:
-            msg = f"Cannot read classifier training image: {p}"
-            raise OSError(msg)
+            raise OSError(f"Cannot read classifier training image: {p}")
         if self.augment:
             img = augment(img, self.rng)
         return to_tensor(img), y, kind
 
 
 def augment(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Apply training perturbations appropriate to physical tile faces.
-
-    Apply small image perturbations appropriate to physical tile faces for training
-    only.
-    """
+    """Apply small training-only perturbations appropriate to physical tile faces."""
     h, w = img.shape[:2]
     # affine: rotation, scale, shear, translation
     ang = rng.uniform(-15, 15)
@@ -115,17 +98,6 @@ def augment(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         ey = int(rng.integers(0, h - eh + 1))
         img[ey : ey + eh, ex : ex + ew] = rng.integers(0, 255, 3)
     return img
-
-
-def make_model(n: int, *, pretrained: bool = False) -> nn.Module:
-    """Construct ResNet18; only training requests ImageNet weights for initialization.
-
-    Inference immediately loads the complete local checkpoint, so downloading
-    and then discarding a pretrained state is unnecessary and breaks offline use.
-    """
-    m = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
-    m.fc = nn.Linear(m.fc.in_features, n)
-    return m
 
 
 @torch.no_grad()
@@ -167,11 +139,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
 
 @command_logging
 def main(argv: list[str] | None = None) -> None:
-    """Train the model and retain its settings, weights and validation results.
-
-    Train the classifier, calibrate confidence on validation crops, and save weights and
-    metadata.
-    """
+    """Train the classifier, calibrate it on validation crops, save weights and meta."""
     a = _arguments(argv)
     torch.manual_seed(TRAINING_SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -217,8 +185,9 @@ def main(argv: list[str] | None = None) -> None:
                 {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
             )
     if best_state is None:
-        msg = "Training produced no checkpoint with finite validation accuracy"
-        raise RuntimeError(msg)
+        raise RuntimeError(
+            "Training produced no checkpoint with finite validation accuracy"
+        )
     model.load_state_dict(best_state)
     logits, ys, kinds = predict_logits(model, vl, device)
     temperature = fit_temperature(logits, ys)

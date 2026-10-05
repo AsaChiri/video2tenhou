@@ -3,15 +3,14 @@
 
 """Conflict trials must preserve evidence even when the solver raises."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from dataclasses import asdict
-from typing import TYPE_CHECKING
 
 import pytest
 
 from video2tenhou.engine import rules, solver
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 
 def fact_case(model: solver.HandModel) -> None:
@@ -38,7 +37,7 @@ def meld_case(model: solver.HandModel) -> None:
 @pytest.mark.parametrize("fail", [False, True])
 def test_diagnostic_trial_preserves_original_evidence(
     monkeypatch: pytest.MonkeyPatch,
-    configure: "Callable[[solver.HandModel], None]",
+    configure: Callable[[solver.HandModel], None],
     *,
     fail: bool,
 ) -> None:
@@ -52,13 +51,12 @@ def test_diagnostic_trial_preserves_original_evidence(
     )
     trials = []
 
-    def build(trial: solver.HandModel) -> tuple:
+    def build(trial: solver.HandModel) -> solver.Program:
         trials.append(trial)
         assert trial is not model
         if fail:
-            msg = "diagnostic solver interrupted"
-            raise RuntimeError(msg)
-        return solver.ReconstructionModel(), {}, {}, {}
+            raise RuntimeError("diagnostic solver interrupted")
+        return solver.Program()
 
     monkeypatch.setattr(solver.HandModel, "build", build)
     if fail:

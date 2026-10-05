@@ -28,20 +28,17 @@ def inference_settings(value: dict, **overrides: float | bool | None) -> dict:
     """Resolve defaults and explicit overrides, then validate effective settings."""
     defaults = {"imgsz": 1024, "confidence": 0.15, "iou": 0.5, "cuda_graph": False}
     if not isinstance(value, dict) or set(value) - defaults.keys():
-        msg = "Unsupported detector inference metadata"
-        raise ValueError(msg)
+        raise ValueError("Unsupported detector inference metadata")
     settings = {
         **defaults,
         **value,
         **{key: item for key, item in overrides.items() if item is not None},
     }
     if not isinstance(settings["cuda_graph"], bool):
-        msg = "Detector CUDA graph setting must be boolean"
-        raise TypeError(msg)
+        raise TypeError("Detector CUDA graph setting must be boolean")
     size = settings["imgsz"]
     if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
-        msg = "Detector image size must be a positive integer"
-        raise ValueError(msg)
+        raise ValueError("Detector image size must be a positive integer")
     if any(
         not isinstance(item, (int, float))
         or isinstance(item, bool)
@@ -49,27 +46,20 @@ def inference_settings(value: dict, **overrides: float | bool | None) -> dict:
         or not 0 < item <= 1
         for item in (settings["confidence"], settings["iou"])
     ):
-        msg = "Detector confidence and IoU must be finite numbers in (0, 1]"
-        raise ValueError(msg)
+        raise ValueError("Detector confidence and IoU must be finite numbers in (0, 1]")
     return settings
 
 
-def checkpoint_metadata(weights: Path, weights_hash: str, backend: str | None) -> dict:
-    """Load adjacent settings only after verifying checkpoint identity and backend."""
+def checkpoint_metadata(weights: Path, weights_hash: str) -> dict:
+    """Load adjacent settings after verifying they describe these LibreYOLO bytes."""
     model_meta = {}
     meta_path = weights.with_name("meta.json")
     if meta_path.exists():
         model_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if not isinstance(model_meta, dict) or model_meta.get("schema_version") != 1:
-            msg = "Unsupported detector metadata schema"
-            raise ValueError(msg)
+            raise ValueError("Unsupported detector metadata schema")
         if model_meta.get("weights_sha256") != weights_hash:
-            msg = "Detector metadata does not match checkpoint SHA-256"
-            raise ValueError(msg)
+            raise ValueError("Detector metadata does not match checkpoint SHA-256")
         if model_meta.get("backend") != "libreyolo":
-            msg = "Unsupported detector metadata backend"
-            raise ValueError(msg)
-        if backend is not None and backend != model_meta["backend"]:
-            msg = "Explicit detector backend conflicts with checkpoint metadata"
-            raise ValueError(msg)
+            raise ValueError("Unsupported detector metadata backend")
     return model_meta

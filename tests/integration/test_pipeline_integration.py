@@ -1,84 +1,90 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exercise the handoff from authoritative records to checked, downloadable logs.
+"""Convert turns an authoritative record and stage evidence into checked logs.
 
-The small legal ron needs no trained model, network or private recording. These
-tests catch seat rotation, invalid-hand leakage and review/export disagreement.
+Video, model, scoring-site and solver boundaries are replaced; the command's record
+persistence, alignment and geometry gates, observation voting and export run for
+real. The small legal ron needs no trained model, network or private recording.
+These tests catch seat rotation, invalid-hand leakage and review/export disagreement.
 """
+
+from __future__ import annotations
 
 import json
 from argparse import Namespace
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import pytest
 
-from video2tenhou import calibfit, calm, cli, observe, read, record, tenhou6, timeline
+from tests.builders import publish_reads
+from video2tenhou import (
+    calibfit,
+    calm,
+    cli,
+    export,
+    observe,
+    read,
+    record,
+    tenhou6,
+    timeline,
+)
 from video2tenhou.calm import Interval
 from video2tenhou.engine import decode
 from video2tenhou.layout import Calibration
-from video2tenhou.observe import run_observe as actual_run_observe
 from video2tenhou.perception import classifier, detector
 from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
-from video2tenhou.train.data import CLASSES
 
-if TYPE_CHECKING:
-    from video2tenhou.perception.reader import RegionDetector
+INTERVAL = Interval("pond:TL", 0.0, 2.0, 3, calm=True, motion=0.0, skin=0.0)
 
 
-if TYPE_CHECKING:
-    from pathlib import Path
+def pond_tile(work: Path) -> str:
+    """Return the first top-left pond tile voted for hand 0."""
+    return observe.load_obs(work, 0)["pond:TL"][0]["slots"][0]["tile"]
 
 
 @pytest.fixture
-def conversion(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
-) -> "SimpleNamespace":
-    """CPU stage doubles retain the real command, record persistence and export path."""
+def conversion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """A recording whose hand-0 readings are published and whose inputs changed."""
     game, entries = aligned_record()
     work = tmp_path / "work" / "broadcast"
-    work.mkdir(parents=True)
+    publish_reads(work / "reads/00", "1m", complete=True)
     for marker in ("calibration.changed", "inputs.changed"):
         (work / marker).write_text("rebuild needed")
-    calls = []
-    monkeypatch.setattr(cli, "_require_fit", lambda *_unused_args: None)
-    monkeypatch.setattr(cli, "_gate", lambda *_unused_args: calls.append("geometry"))
+    fetched, rebuilt, decodes = [], [], {}
     monkeypatch.setattr(
-        record, "fetch_game", lambda *_unused_args: calls.append("record") or game
+        record, "fetch_game", lambda game_id: fetched.append(game_id) or game
     )
-    monkeypatch.setattr(
-        timeline, "run_header", lambda *_unused_args, **_unused_kwargs: (entries, [])
-    )
-    monkeypatch.setattr(calm, "run_calm", lambda *_unused_args, **_unused_kwargs: [])
+    monkeypatch.setattr(timeline, "run_header", lambda *_args, **_kw: (entries, []))
+    monkeypatch.setattr(calm, "run_calm", lambda *_args, **_kw: [INTERVAL])
     monkeypatch.setattr(
         detector, "Detector", lambda: SimpleNamespace(evidence_policy=DEFAULT_POLICY)
     )
     monkeypatch.setattr(classifier, "Classifier", object)
     monkeypatch.setattr(
-        read, "run_read", lambda *_unused_args, **_unused_kwargs: ({"readings": 0}, {0})
+        read, "run_read", lambda *_args, **_kw: ({"readings": 0}, set())
     )
 
-    def observations(
-        *_unused_args: object,
-        options: observe.ObservationOptions,
+    def run_decode(
+        work_dir: Path,
+        hands: list[dict],
+        _games: list,
+        *,
+        force: bool = False,
+        only: set[int] | None = None,
         **_unused_kwargs: object,
-    ) -> dict:
-        assert options.touched == {0}
-        calls.append("observe")
-        return {}
+    ) -> list[dict]:
+        """Rebuild forced or new hands from their observations; reuse the rest."""
+        for entry in hands:
+            hand = entry["hand"]
+            forced = force and (only is None or hand in only)
+            if forced or hand not in decodes:
+                rebuilt.append(pond_tile(work_dir))
+                decodes[hand] = reconstruction()
+        return [decodes[entry["hand"]] for entry in hands]
 
-    monkeypatch.setattr(observe, "run_observe", observations)
-
-    def decoding(
-        *_unused_args: object,
-        options: decode.DecodeRunOptions,
-        **_unused_kwargs: object,
-    ) -> list:
-        calls.append(("decode", options.force, options.only))
-        return [reconstruction()]
-
-    monkeypatch.setattr(decode, "run_decode", decoding)
+    monkeypatch.setattr(decode, "run_decode", run_decode)
     args = Namespace(
         calib="pml",
         video="broadcast.mp4",
@@ -90,149 +96,93 @@ def conversion(
         redo=None,
         reread=[],
         hands=[],
+        skip_fit_check=True,
     )
-    return SimpleNamespace(args=args, work=work, calls=calls, entries=entries)
+    return SimpleNamespace(
+        args=args,
+        work=work,
+        out=tmp_path / "out" / "broadcast",
+        fetched=fetched,
+        rebuilt=rebuilt,
+    )
 
 
-def test_convert_propagates_removed_evidence_and_publishes_checked_outputs(
-    conversion: "SimpleNamespace",
+def test_convert_publishes_a_replayable_log_and_reuses_the_saved_record(
+    conversion: SimpleNamespace,
 ) -> None:
-    """Rebuild observations and hands after removal-only reading changes."""
     c = conversion
     cli.cmd_convert(c.args)
-    assert c.calls == [
-        "record",
-        "geometry",
-        "observe",
-        ("decode", True, {0}),
-        ("decode", False, None),
-    ]
-    assert not (c.work / "calibration.changed").exists()
-    assert not (c.work / "inputs.changed").exists()
-    exported = json.loads(
-        (c.args.out / "broadcast/g0.json").read_text(encoding="utf-8")
-    )
+    exported = json.loads((c.out / "g0.json").read_text(encoding="utf-8"))
     assert tenhou6.replay(exported) == []
     assert len(exported["log"]) == 1
-    c.calls.clear()
+    assert c.rebuilt == ["1m"]
+    assert not (c.work / "calibration.changed").exists()
+    assert not (c.work / "inputs.changed").exists()
     cli.cmd_convert(c.args)
-    assert "record" not in c.calls  # persisted authoritative record reused
+    assert c.fetched == [101]
+    assert c.rebuilt == ["1m"]  # unchanged evidence keeps its reconstruction
 
 
-def test_convert_alignment_failure_stops_before_recognition(
-    conversion: "SimpleNamespace", monkeypatch: "pytest.MonkeyPatch"
+def test_misaligned_record_is_refused_before_any_evidence_is_voted(
+    conversion: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify convert alignment failure stops before recognition."""
     c = conversion
+    _, entries = aligned_record()
     monkeypatch.setattr(
-        timeline,
-        "run_header",
-        lambda *_unused_args, **_unused_kwargs: (c.entries, ["wrong game"]),
+        timeline, "run_header", lambda *_args, **_kw: (entries, ["wrong game"])
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(cli.CommandFailed, match="do not match the score record"):
         cli.cmd_convert(c.args)
-    assert c.calls == ["record", "geometry"]
+    assert not (c.work / "obs").exists()
+    assert not c.out.exists()
     assert (c.work / "calibration.changed").exists()
-    assert not c.args.out.exists()
 
 
-def test_resume_after_read_publication_revotes_and_redecodes_without_new_reads(
-    conversion: "SimpleNamespace", monkeypatch: "pytest.MonkeyPatch"
+def test_readings_published_before_an_interruption_are_voted_and_decoded(
+    conversion: SimpleNamespace,
 ) -> None:
-    """A prior process may finish recognition but stop before voting or decoding."""
+    """A later process published new readings and stopped before voting."""
     c = conversion
-    interval = Interval("pond:TL", 0.0, 2.0, 3, calm=True, motion=0.0, skin=0.0)
-    hdir = c.work / "reads/00"
-    hdir.mkdir(parents=True)
-    (hdir / "done.json").write_text('{"complete":true}')
-    path = hdir / "pond_TL.jsonl"
-
-    def write(tile: "str") -> None:
-        p = [0.0] * len(CLASSES)
-        p[CLASSES.index(tile)] = 1.0
-        path.write_text(
-            "".join(
-                json.dumps(
-                    {
-                        "t": t,
-                        "region": "pond:TL",
-                        "size": [400, 700],
-                        "boxes": [
-                            {
-                                "xyxy": [10, 10, 50, 70],
-                                "conf": 0.9,
-                                "sideways": False,
-                                "p": p,
-                            }
-                        ],
-                    }
-                )
-                + "\n"
-                for t in (0.0, 1.0, 2.0)
-            )
-        )
-
-    write("1m")
-    actual_run_observe(c.work, c.entries, [interval], log=lambda _: None)
-    write("2p")
-    monkeypatch.setattr(
-        read,
-        "run_read",
-        lambda *_unused_args, **_unused_kwargs: ({"readings": 0}, set()),
-    )
-    monkeypatch.setattr(
-        calm, "run_calm", lambda *_unused_args, **_unused_kwargs: [interval]
-    )
-    monkeypatch.setattr(observe, "run_observe", actual_run_observe)
     cli.cmd_convert(c.args)
-    assert observe.load_obs(c.work, 0)["pond:TL"][0]["slots"][0]["tile"] == "2p"
-    assert [call for call in c.calls if isinstance(call, tuple)] == [
-        ("decode", True, {0}),
-        ("decode", False, None),
-    ]
-    c.calls.clear()
+    publish_reads(c.work / "reads/00", "2p", complete=True)
     cli.cmd_convert(c.args)
-    assert [call for call in c.calls if isinstance(call, tuple)] == [
-        ("decode", False, None)
-    ]
+    assert pond_tile(c.work) == "2p"
+    assert c.rebuilt == ["1m", "2p"]
+    cli.cmd_convert(c.args)
+    assert c.rebuilt == ["1m", "2p"]
 
 
 def test_convert_failed_export_keeps_rebuild_markers(
-    conversion: "SimpleNamespace", monkeypatch: "pytest.MonkeyPatch"
+    conversion: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify convert failed export keeps rebuild markers."""
     c = conversion
 
-    def failed(*_unused_args: object) -> None:
-        msg = "output unavailable"
-        raise OSError(msg)
+    def failed(*_args: object, **_kw: object) -> None:
+        raise OSError("output unavailable")
 
-    monkeypatch.setattr(cli, "write_outputs", failed)
+    monkeypatch.setattr(export, "write_outputs", failed)
     with pytest.raises(OSError, match="output unavailable"):
         cli.cmd_convert(c.args)
     assert (c.work / "calibration.changed").exists()
     assert (c.work / "inputs.changed").exists()
 
 
-def test_forced_conversion_checks_geometry_before_table_timing_without_overlay(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
-) -> None:
-    """Verify forced conversion checks geometry before table timing without overlay."""
+@pytest.fixture
+def gated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """A fitted recording whose geometry checks and table-timing scans are counted."""
     source = tmp_path / "broadcast.mp4"
     source.write_bytes(b"recording fixture")
     game, _ = aligned_record()
     cal = Calibration.load("pml")
     cal.fit = {"overhead": {"iou": 1.0}}
-    monkeypatch.setattr(
-        Calibration, "load", classmethod(lambda _cls, *_unused_args: cal)
+    monkeypatch.setattr(Calibration, "load", classmethod(lambda _cls, *_args: cal))
+    monkeypatch.setattr(record, "fetch_game", lambda _game_id: game)
+    gate = SimpleNamespace(
+        samples=[{"t_start": 30.0, "t_end": 30.0}], checked=[], checks=[], scans=0
     )
-    monkeypatch.setattr(record, "fetch_game", lambda _gid: game)
-    scans, checked, order = [], [], []
-    samples = [{"t_start": 30.0, "t_end": 30.0}]
 
-    def scan(*_unused_args: object, **_unused_kwargs: object) -> dict:
-        order.append("table")
-        scans.append(True)
+    def scan(*_args: object, **_kw: object) -> dict:
+        gate.scans += 1
         return {
             c: [
                 {"t0": t, "t1": t + 1, "count": count, "n_used": 1, "partial": False}
@@ -241,31 +191,24 @@ def test_forced_conversion_checks_geometry_before_table_timing_without_overlay(
             for c in timeline.CORNERS
         }
 
+    def check(
+        _recording: object, _cal: Calibration, hands: list[dict], **_kw: object
+    ) -> list:
+        gate.checked.append(hands)
+        return gate.checks
+
     monkeypatch.setattr(timeline, "read_pond_counts", scan)
-    monkeypatch.setattr(timeline.calm, "run_calm", lambda *_unused_a, **_unused_kw: [])
+    monkeypatch.setattr(timeline.calm, "run_calm", lambda *_args, **_kw: [])
     monkeypatch.setattr(
-        timeline.video, "probe", lambda *_unused_a: SimpleNamespace(duration=61)
+        timeline.video, "probe", lambda *_args: SimpleNamespace(duration=61)
     )
     monkeypatch.setattr(detector, "Detector", lambda: SimpleNamespace(id="test"))
-    monkeypatch.setattr(calibfit, "prepare_table_samples", lambda *_unused_a: samples)
-    monkeypatch.setattr(
-        calibfit, "table_plate", lambda *_unused_args, **_unused_kwargs: object()
-    )
-    monkeypatch.setattr(calibfit, "pond_blocks", lambda *_unused_args: None)
-
-    def check(
-        path: "Path",
-        calibration: "Calibration",
-        model: "RegionDetector",
-        hands: "list[dict]",
-        **_unused_kwargs: object,
-    ) -> list:
-        order.append("geometry")
-        checked.append(hands)
-        return []
-
+    monkeypatch.setattr(classifier, "Classifier", object)
+    monkeypatch.setattr(calibfit, "prepare_table_samples", lambda *_args: gate.samples)
+    monkeypatch.setattr(calibfit, "table_plate", lambda *_args, **_kw: object())
+    monkeypatch.setattr(calibfit, "pond_blocks", lambda *_args: None)
     monkeypatch.setattr(calibfit, "check_regions", check)
-    args = Namespace(
+    gate.args = Namespace(
         calib="pml",
         video=str(source),
         work=tmp_path / "work",
@@ -275,17 +218,31 @@ def test_forced_conversion_checks_geometry_before_table_timing_without_overlay(
         stop="header",
         skip_fit_check=False,
     )
-    cli.cmd_convert(args)
-    assert len(scans) == 1
-    assert checked == [samples]
-    assert order == ["geometry", "table"]
-    # A forced refresh scans table timing once; the geometry gate uses independent
-    # samples.
-    cli.cmd_convert(args)
-    assert len(scans) == len(checked) == 2
+    return gate
 
 
-def site_payload() -> "dict":
+def test_cut_tiles_stop_conversion_before_table_timing_is_read(
+    gated: SimpleNamespace,
+) -> None:
+    cut = calibfit.RegionCheck("pond:TL", held=3, cut=3, frames=8)
+    cut.verdict()
+    gated.checks = [cut]
+    with pytest.raises(cli.CommandFailed, match="Adjust the table borders"):
+        cli.cmd_convert(gated.args)
+    assert gated.scans == 0
+
+
+def test_forced_conversion_checks_geometry_on_independent_table_samples(
+    gated: SimpleNamespace,
+) -> None:
+    """Geometry is measured on table samples, never on the hand timing it gates."""
+    cli.cmd_convert(gated.args)
+    cli.cmd_convert(gated.args)
+    assert gated.checked == [gated.samples, gated.samples]
+    assert gated.scans == 2
+
+
+def site_payload() -> dict:
     """Create an authoritative game response for pipeline integration."""
     return {
         "id": 101,
@@ -316,7 +273,7 @@ def site_payload() -> "dict":
     }
 
 
-def reconstruction() -> "dict":
+def reconstruction() -> dict:
     """Create a complete synthetic hand suitable for replay validation."""
     hands = [
         "111222333444s1z5p",
@@ -365,15 +322,14 @@ def aligned_record() -> tuple:
     return game, entries
 
 
-def test_record_alignment_export_and_replay(tmp_path: "Path") -> None:
-    """Verify record alignment export and replay."""
+def test_record_alignment_export_and_replay(tmp_path: Path) -> None:
     game, entries = aligned_record()
     decode = reconstruction()
     # A hand awaiting a human answer remains exportable and visibly under review.
     decode["items"] = [
         {"kind": "draw", "seat": "S", "hand": ["5p"], "text": "Confirm tile"}
     ]
-    cli.write_outputs(tmp_path, [game], [decode], entries, "Integration")
+    export.write_outputs(tmp_path, [game], [decode], entries, decode_dir=tmp_path)
     exported = json.loads((tmp_path / "g0.json").read_text(encoding="utf-8"))
     assert tenhou6.replay(exported) == []
     assert exported["name"] == [f"Player {i}" for i in range(4)]
@@ -389,23 +345,23 @@ def test_record_alignment_export_and_replay(tmp_path: "Path") -> None:
 
 
 def test_illegal_reconstruction_is_excluded_with_actionable_conflict(
-    tmp_path: "Path",
+    tmp_path: Path,
 ) -> None:
-    """Verify illegal reconstruction is excluded with actionable conflict."""
     game, entries = aligned_record()
     decode = reconstruction()
     decode["haipai"]["S"][0] = "9p"  # destroys the advertised winning hand
-    cli.write_outputs(tmp_path, [game], [decode], entries, "Invalid")
+    export.write_outputs(tmp_path, [game], [decode], entries, decode_dir=tmp_path)
     assert json.loads((tmp_path / "g0.json").read_text(encoding="utf-8"))["log"] == []
     assert "| conflict | no |" in (tmp_path / "report.md").read_text(encoding="utf-8")
     review = json.loads((tmp_path / "review.json").read_text(encoding="utf-8"))
-    assert any(
-        item["kind"] == "conflict" and "winning hand" in item["text"] for item in review
-    )
+    (conflict,) = [item for item in review if item["kind"] == "conflict"]
+    winner = decode["result"]["winner"]
+    assert ("not_winning", winner) in {
+        (v["kind"], v["seat"]) for v in conflict["violations"]
+    }
 
 
 def test_site_record_supplies_hand_metadata() -> None:
-    """Verify site record supplies hand metadata."""
     game, entries = aligned_record()
     game.hands[0].honba = 1
     entries, problems = timeline.site_entries([(0, 60)], [game])
@@ -414,11 +370,10 @@ def test_site_record_supplies_hand_metadata() -> None:
 
 
 def test_missing_decode_is_reported_instead_of_an_empty_complete_game(
-    tmp_path: "Path",
+    tmp_path: Path,
 ) -> None:
-    """Verify missing decode is reported instead of an empty complete game."""
     game, entries = aligned_record()
-    cli.write_outputs(tmp_path, [game], [], entries, "Missing evidence")
+    export.write_outputs(tmp_path, [game], [], entries, decode_dir=tmp_path)
     assert json.loads((tmp_path / "g0.json").read_text(encoding="utf-8"))["log"] == []
     review = json.loads((tmp_path / "review.json").read_text(encoding="utf-8"))
     assert len(review) == 1

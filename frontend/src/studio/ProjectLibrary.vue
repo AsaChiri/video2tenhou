@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from "vue";
-import type { Project } from "../types";
+import type { Project, WorkspaceJob } from "../types";
 import { api } from "../shared/api";
+import { useAction } from "../shared/useAction";
 
 const props = defineProps<{
   projects: Project[];
   loading: boolean;
   unavailable?: boolean;
+  job?: WorkspaceJob | null;
 }>();
 const emit = defineEmits<{
   open: [id: string];
@@ -19,9 +21,10 @@ const query = ref("");
 const editing = ref<string | null>(null);
 const removing = ref<string | null>(null);
 const name = ref("");
-const busy = ref(false);
-const error = ref("");
+const { busy, error, run } = useAction();
 const nameInput = ref<HTMLInputElement[] | null>(null);
+const running = (project: Project) =>
+  !!props.job?.running && props.job.project === project.id;
 const visible = computed(() => {
   const search = query.value.trim().toLocaleLowerCase();
   return [...props.projects]
@@ -37,8 +40,8 @@ function title(project: Project) {
   return project.display_name || project.name;
 }
 function status(project: Project) {
-  if (project.job.running) return project.job.stage || "Processing";
-  if (project.review_running) return "Updating review";
+  if (running(project)) return props.job?.stage || "Processing";
+  if (project.checking) return "Checking recording";
   if (project.job.error) return "Needs attention";
   if (project.stale_exports) return "Analysis needed";
   if (project.artifacts.some((file) => /^g\d+\.json$/.test(file)))
@@ -61,11 +64,8 @@ function confirmDelete(project: Project) {
   removing.value = project.id;
   error.value = "";
 }
-async function save(project: Project) {
-  if (busy.value) return;
-  busy.value = true;
-  error.value = "";
-  try {
+const save = (project: Project) =>
+  run(async () => {
     emit(
       "updated",
       await api<Project>(`/api/projects/${project.id}/rename`, {
@@ -73,26 +73,13 @@ async function save(project: Project) {
       }),
     );
     editing.value = null;
-  } catch (failure) {
-    error.value = failure instanceof Error ? failure.message : String(failure);
-  } finally {
-    busy.value = false;
-  }
-}
-async function remove(project: Project) {
-  if (busy.value) return;
-  busy.value = true;
-  error.value = "";
-  try {
+  });
+const remove = (project: Project) =>
+  run(async () => {
     await api(`/api/projects/${project.id}/delete`, {});
     emit("deleted", project.id);
     removing.value = null;
-  } catch (failure) {
-    error.value = failure instanceof Error ? failure.message : String(failure);
-  } finally {
-    busy.value = false;
-  }
-}
+  });
 </script>
 
 <template>
@@ -102,12 +89,7 @@ async function remove(project: Project) {
     :aria-busy="loading"
   >
     <div class="library-heading">
-      <div>
-        <h1 id="projects-heading">Projects</h1>
-        <p class="muted">
-          Continue a recording, review its hands, or start a new project.
-        </p>
-      </div>
+      <h1 id="projects-heading">Projects</h1>
       <button class="primary" @click="emit('create')">New project</button>
     </div>
     <p v-if="loading" role="status">Loading projects…</p>
@@ -177,9 +159,9 @@ async function remove(project: Project) {
             <button :disabled="busy" @click="edit(project)">Rename</button>
             <button
               class="danger"
-              :disabled="busy || project.job.running || project.review_running"
+              :disabled="busy || running(project)"
               :title="
-                project.job.running || project.review_running
+                running(project)
                   ? 'Wait for this project’s job to finish.'
                   : undefined
               "
@@ -232,9 +214,7 @@ async function remove(project: Project) {
             <div class="actions">
               <button
                 class="danger"
-                :disabled="
-                  busy || project.job.running || project.review_running
-                "
+                :disabled="busy || running(project)"
                 @click="remove(project)"
               >
                 {{ busy ? "Deleting…" : "Delete project" }}

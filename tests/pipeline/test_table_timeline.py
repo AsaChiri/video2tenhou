@@ -3,26 +3,23 @@
 
 """Table timing supplies timestamps; scoremj supplies all hand metadata."""
 
-import json
+from __future__ import annotations
+
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 
 from tests.recognition import RecognitionStub
+from video2tenhou import read
 from video2tenhou import timeline as timing
 from video2tenhou.layout import Calibration
-from video2tenhou.perception import detector
 from video2tenhou.perception.detector import Det
 from video2tenhou.record import SEATS, Game, HandResult
 
-if TYPE_CHECKING:
-    from pathlib import Path
 
-    import pytest
-
-
-def game() -> "Game":
+def game() -> Game:
     """Create an authoritative synthetic game with starting-seat metadata."""
     return Game(
         123,
@@ -37,7 +34,7 @@ def game() -> "Game":
     )
 
 
-def observations() -> "dict[str, list[dict]]":
+def observations() -> dict[str, list[dict]]:
     # Static old ponds at the opening, then two hands and an empty tail.
     """Create timed pond counts covering an opening, two hands and a tail."""
     return {
@@ -63,14 +60,12 @@ def observations() -> "dict[str, list[dict]]":
 
 
 def test_static_opening_and_empty_tail_do_not_become_hands() -> None:
-    """Verify static opening and empty tail do not become hands."""
     assert timing.hand_windows(observations(), 200) == [(21.5, 81), (81.5, 141)]
 
 
-def test_counts_exclude_indicators_backs_partial_views_and_invalid_rows(
-    monkeypatch: "pytest.MonkeyPatch",
+def test_counts_exclude_indicators_partial_views_and_invalid_rows(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify counts exclude indicators backs partial views and invalid rows."""
     image = np.zeros((200, 220, 3), np.uint8)
     ivs = [
         timing.calm.Interval("pond:TL", 0, 2, 5, calm=True, motion=0, skin=0),
@@ -81,10 +76,8 @@ def test_counts_exclude_indicators_backs_partial_views_and_invalid_rows(
         timing.calm.Interval("pond:TL", 3, 5, 5, calm=True, motion=0, skin=0),
     ]
 
-    def detection(
-        *, x: "int", y: int = 30, confidence: float = 0.9, back: bool = False
-    ) -> "Det":
-        return Det(xyxy=(x, y, x + 20, y + 30), conf=confidence, back=back)
+    def detection(*, x: int, y: int = 30, confidence: float = 0.9) -> Det:
+        return Det(xyxy=(x, y, x + 20, y + 30), conf=confidence)
 
     batches = iter(
         [
@@ -93,7 +86,6 @@ def test_counts_exclude_indicators_backs_partial_views_and_invalid_rows(
                     detection(x=20),
                     detection(x=42),
                     detection(x=20, y=170),
-                    detection(x=70, back=True),
                     detection(x=95, confidence=0.2),
                 ]
             ],
@@ -117,7 +109,6 @@ def test_counts_exclude_indicators_backs_partial_views_and_invalid_rows(
 
 
 def test_recording_starting_with_active_play_keeps_first_hand() -> None:
-    """Verify recording starting with active play keeps first hand."""
     rows = {
         c: [
             {"t0": t, "t1": t + 1, "count": n, "n_used": 1}
@@ -129,7 +120,6 @@ def test_recording_starting_with_active_play_keeps_first_hand() -> None:
 
 
 def test_site_metadata_uses_fixed_chairs_and_rotates_winds_without_ocr() -> None:
-    """Verify site metadata uses fixed chairs and rotates winds without ocr."""
     entries, problems = timing.site_entries([(0, 100), (100.5, 200)], [game()])
     assert not problems
     assert entries[0]["corner_wind"] == {"TL": "E", "BL": "S", "BR": "W", "TR": "N"}
@@ -140,7 +130,6 @@ def test_site_metadata_uses_fixed_chairs_and_rotates_winds_without_ocr() -> None
 
 
 def test_repeats_keep_the_dealer_and_new_games_reset_starting_seats() -> None:
-    """Verify repeats keep the dealer and new games reset starting seats."""
     first = game()
     first.hands[1].kyoku = 0
     first.hands[1].honba = 1
@@ -157,7 +146,6 @@ def test_repeats_keep_the_dealer_and_new_games_reset_starting_seats() -> None:
 
 
 def test_mismatched_hand_count_does_not_invent_alignment() -> None:
-    """Verify mismatched hand count does not invent alignment."""
     entries, problems = timing.site_entries([(0, 100)], [game()])
     assert entries == []
     assert "1 hands" in problems[0]
@@ -165,9 +153,8 @@ def test_mismatched_hand_count_does_not_invent_alignment() -> None:
 
 
 def test_production_header_needs_no_overlay_and_invalidates_table_cache(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify production header needs no overlay and invalidates table cache."""
     source = tmp_path / "video.mp4"
     source.write_bytes(b"source")
     data = dict(Calibration.load("pml").data)
@@ -178,7 +165,6 @@ def test_production_header_needs_no_overlay_and_invalidates_table_cache(
     monkeypatch.setattr(
         timing.video, "probe", lambda *_unused_a: SimpleNamespace(duration=200)
     )
-    monkeypatch.setattr(detector, "Detector", lambda: SimpleNamespace(id="detector-v1"))
     scans = []
     monkeypatch.setattr(
         timing,
@@ -186,25 +172,24 @@ def test_production_header_needs_no_overlay_and_invalidates_table_cache(
         lambda *_unused_a, **_unused_kw: scans.append(True) or observations(),
     )
     work = tmp_path / "work"
+    model = RecognitionStub("detector-v1")
+    context = read.ReadContext(source, cal, work, model, model)
     for _ in range(2):
-        entries, problems = timing.run_header(source, cal, [game()], work)
+        entries, problems = timing.run_header(context, [game()])
         assert len(entries) == 2
         assert not problems
     assert len(scans) == 1
     source.write_bytes(b"replacement")
-    timing.run_header(source, cal, [game()], work)
+    timing.run_header(context, [game()])
     assert len(scans) == 2
-    saved = json.loads((work / "table-timing.json").read_text())
-    saved["observations"]["TL"][0]["count"] = 123
-    (work / "table-timing.json").write_text(json.dumps(saved))
-    timing.run_header(source, cal, [game()], work)
+    (work / "table-timing.json").write_text('{"signature":')
+    timing.run_header(context, [game()])
     assert len(scans) == 3
 
 
 def test_failed_timing_preserves_existing_hand_metadata(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify failed timing preserves existing hand metadata."""
     source = tmp_path / "video.mp4"
     source.write_bytes(b"source")
     previous = '[{"human":"retained"}]'
@@ -213,14 +198,15 @@ def test_failed_timing_preserves_existing_hand_metadata(
     monkeypatch.setattr(
         timing.video, "probe", lambda *_unused_a: SimpleNamespace(duration=200)
     )
-    monkeypatch.setattr(detector, "Detector", lambda: SimpleNamespace(id="test"))
     monkeypatch.setattr(
         timing,
         "read_pond_counts",
         lambda *_unused_a, **_unused_kw: {c: [] for c in timing.CORNERS},
     )
+    model = RecognitionStub("test")
     entries, problems = timing.run_header(
-        source, Calibration.load("pml"), [game()], tmp_path
+        read.ReadContext(source, Calibration.load("pml"), tmp_path, model, model),
+        [game()],
     )
     assert not entries
     assert problems

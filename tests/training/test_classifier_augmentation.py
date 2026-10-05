@@ -5,18 +5,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 import torch
 
 from video2tenhou.train import train_classifier
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
 
 
 def test_seeded_crop_streams_are_reproducible_and_independent(

@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import type { CameraData } from "../types";
 import { useReview } from "./context";
+import { errorText } from "../shared/useAction";
 import TileFace from "./TileFace.vue";
 const props = defineProps({ hand: Number, seat: String, at: Number });
 const review = useReview(),
@@ -32,9 +33,7 @@ watch(
       );
       if (current) data.value = result;
     } catch (failure) {
-      if (current)
-        error.value =
-          failure instanceof Error ? failure.message : String(failure);
+      if (current) error.value = errorText(failure);
     }
   },
 );

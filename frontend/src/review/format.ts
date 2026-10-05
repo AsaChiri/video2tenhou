@@ -6,31 +6,72 @@ const winds: Record<string, string> = {
   W: "West",
   N: "North",
 };
-export const cornerOf = (entry: Partial<HandEntry>, seat?: string) =>
+export const cornerOf = (entry: Partial<HandEntry>, seat?: string | null) =>
   Object.entries(entry.corner_wind || {}).find(
     ([, wind]) => wind === seat,
   )?.[0];
-export function seatName(entry: Partial<HandEntry>, seat?: string) {
+export function seatName(entry: Partial<HandEntry>, seat?: string | null) {
   const corner = cornerOf(entry, seat);
   const name = (corner ? entry.nicks?.[corner] : undefined) || corner;
   return `${winds[seat || ""] || seat || ""}${name ? ` (${name})` : ""}`;
 }
-export function time(seconds?: number) {
-  const value = Math.round(seconds || 0);
+/** Video time as m:ss. */
+export function time(seconds?: number | null) {
+  const value = Math.max(0, Math.round(seconds || 0));
   return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, "0")}`;
 }
-export const roundName = (entry: HandEntry) =>
+/** Parse seconds, m:ss or h:mm:ss; null when the text is not a time. */
+export function parseTime(text: string): number | null {
+  const value = text.trim();
+  if (!/^\d+(?::[0-5]\d){0,2}(?:\.\d+)?$/.test(value)) return null;
+  return value.split(":").reduce((total, part) => total * 60 + Number(part), 0);
+}
+export const roundName = (entry: Pick<HandEntry, "kyoku" | "honba">) =>
   `${["East", "South", "West", "North"][Math.floor(entry.kyoku / 4)] || "Round"} ${(entry.kyoku % 4) + 1}, ${entry.honba} honba`;
 const decisionLabels: Record<string, string> = {
-  solver_incomplete: "Search incomplete",
-  uncertain_tiles: "Uncertain tiles",
+  haipai: "Starting hand",
+  result: "Final hand",
+  call: "Meld",
+  kan: "Kan",
+  riichi: "Riichi",
+  dora: "Dora indicators",
+  ura: "Ura indicators",
+  conflict: "Conflict",
+  order: "Missed discard",
 };
-export const decisionLabel = (item: ReviewChoice) =>
-  item.field === "haipai" || item.kind === "haipai"
-    ? "Starting hand"
-    : ["draw", "discard"].includes(item.field || item.kind || "")
-      ? `${item.field === "draw" || item.kind === "draw" ? "Draw" : "Discard"} ${(item.j ?? 0) + 1}`
-      : decisionLabels[item.kind || ""] || item.kind || item.field;
+export function decisionLabel(item: ReviewChoice) {
+  const kind = item.field || item.kind || "";
+  if (kind === "draw" || kind === "discard")
+    return `${kind === "draw" ? "Draw" : "Discard"} ${(item.j ?? 0) + 1}`;
+  return decisionLabels[kind] || kind;
+}
+const handStatus: Record<string, string> = {
+  conflict: "Conflict",
+  unresolvable: "Not solved",
+  review: "Questions",
+  complete: "Complete",
+};
+export const handStatusLabel = (status: string | null, pending: boolean) =>
+  pending ? "Updating" : status ? handStatus[status] || status : "Not analyzed";
+const factLabels: Record<string, string> = {
+  draw: "Draw",
+  discard: "Discard",
+  haipai: "Starting hand",
+  final_hand: "Final hand",
+  meld: "Meld",
+  meld_remove: "Meld removed",
+  missing_discard: "Missed discard",
+  riichi: "Riichi seats",
+  riichi_turn: "Riichi discard",
+  kan_time: "Kan after discard",
+  ura: "Ura indicators",
+  dora: "Dora indicators",
+  lost: "Can't tell",
+  site_wrong: "Site score corrected",
+  dismiss: "Question dismissed",
+  note: "Note",
+};
+export const factLabel = (kind: string) => factLabels[kind] || kind;
 export const paletteRows = [..."mps"].map((suit) =>
   [1, 2, 3, 4, 5, 0, 6, 7, 8, 9].map((rank) => rank + suit),
 );

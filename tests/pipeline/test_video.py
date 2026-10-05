@@ -3,9 +3,12 @@
 
 """Video metadata, frame sampling and bounded recording extraction."""
 
+from __future__ import annotations
+
 import json
 import shutil
 import subprocess
+import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +17,7 @@ from threading import Thread
 import numpy as np
 import pytest
 
+from tests.spies import record_results
 from video2tenhou import video
 from video2tenhou.cli import main
 from video2tenhou.commands import executable
@@ -24,7 +28,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def clip(tmp_path_factory: "pytest.TempPathFactory") -> "Path":
+def clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Generate a small encoded video for real decoder integration tests."""
     p = tmp_path_factory.mktemp("v") / "t.mp4"
     subprocess.run(  # noqa: S603
@@ -47,16 +51,14 @@ def clip(tmp_path_factory: "pytest.TempPathFactory") -> "Path":
     return p
 
 
-def test_probe(clip: "Path") -> None:
-    """Verify probe."""
+def test_probe(clip: Path) -> None:
     info = video.probe(clip)
     assert (info.width, info.height) == (320, 180)
     assert abs(info.fps - 30) < 1e-6
     assert abs(info.duration - 2.0) < 0.1
 
 
-def test_sample_and_seek(clip: "Path") -> None:
-    """Verify sample and seek."""
+def test_sample_and_seek(clip: Path) -> None:
     frames = list(video.sample(clip, fps=2.0))
     assert len(frames) == 4
     t, f = frames[1]
@@ -69,26 +71,38 @@ def test_sample_and_seek(clip: "Path") -> None:
 
 
 def test_failed_decode_is_reported_instead_of_an_empty_success(
-    tmp_path: "Path",
+    tmp_path: Path,
 ) -> None:
-    """Verify failed decode is reported instead of an empty success."""
     with pytest.raises(RuntimeError, match="ffmpeg could not sample"):
         list(video.sample(tmp_path / "missing.mp4"))
 
 
 def test_sample_can_be_closed_early_without_waiting_for_the_entire_clip(
-    clip: "Path",
+    clip: Path,
 ) -> None:
-    """Verify sample can be closed early without waiting for the entire clip."""
     frames = video.sample(clip, fps=30)
     assert next(frames)[0] == 0
     frames.close()
 
 
-def test_empty_window_does_not_start_a_decoder(
-    monkeypatch: "pytest.MonkeyPatch",
+def test_closing_a_sample_stops_the_decoder_and_joins_its_reader(
+    clip: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify empty window does not start a decoder."""
+    """Frames decoded ahead never outlive the generator that owns them."""
+    children = []
+    monkeypatch.setattr(
+        video.subprocess, "Popen", record_results(subprocess.Popen, children)
+    )
+    frames = video.sample(clip, fps=30)
+    next(frames)
+    frames.close()
+    assert children[0].poll() is not None
+    assert not any(t.name.startswith("video-read-ahead") for t in threading.enumerate())
+
+
+def test_empty_window_does_not_start_a_decoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         video.subprocess,
         "Popen",
@@ -101,12 +115,11 @@ def test_empty_window_does_not_start_a_decoder(
     "source", ["https://www.youtube.com/watch?v=example&feature=share", "--version"]
 )
 def test_download_cli_passes_source_as_literal_to_ytdlp(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", source: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
-    """Verify download cli passes source as literal to ytdlp."""
     commands = []
 
-    def download(cmd: "list[str]", **kwargs: "object") -> None:
+    def download(cmd: list[str], **kwargs: object) -> None:
         commands.append((cmd, kwargs))
         Path(cmd[cmd.index("-o") + 1]).write_bytes(b"complete video")
 
@@ -122,12 +135,11 @@ def test_download_cli_passes_source_as_literal_to_ytdlp(
 
 
 def test_download_section_uses_installed_ytdlp_and_preserves_literal_url(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify download section uses installed ytdlp and preserves literal url."""
     commands = []
 
-    def download(command: "list[str]", **_unused_kwargs: object) -> None:
+    def download(command: list[str], **_unused_kwargs: object) -> None:
         commands.append(command)
         Path(command[command.index("-o") + 1]).write_bytes(b"complete section")
 
@@ -144,13 +156,12 @@ def test_download_section_uses_installed_ytdlp_and_preserves_literal_url(
 
 
 def test_download_propagates_ytdlp_failure(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify download propagates ytdlp failure."""
     target = tmp_path / "video.mp4"
     target.write_bytes(b"previous complete video")
 
-    def fail(cmd: "list[str]", **_unused_kwargs: object) -> None:
+    def fail(cmd: list[str], **_unused_kwargs: object) -> None:
         Path(cmd[cmd.index("-o") + 1]).write_bytes(b"incomplete download")
         assert target.read_bytes() == b"previous complete video"
         raise subprocess.CalledProcessError(1, cmd)
@@ -177,7 +188,6 @@ def test_time_range_formats(
     end: float | str | None,
     expected: tuple[float, None] | tuple[float, float],
 ) -> None:
-    """Verify time range formats."""
     assert video.time_range(start, end) == expected
 
 
@@ -201,9 +211,8 @@ def test_time_range_formats(
     ],
 )
 def test_invalid_ranges_are_rejected_before_any_processing(
-    start: "str | float | None", end: "str | float | None"
+    start: str | float | None, end: str | float | None
 ) -> None:
-    """Verify invalid ranges are rejected before any processing."""
     with pytest.raises(ValueError, match="time"):
         video.time_range(start, end)
 
@@ -212,18 +221,14 @@ def test_invalid_ranges_are_rejected_before_any_processing(
     "value", [10**400, "9" * 400], ids=["enormous-integer", "enormous-string"]
 )
 @pytest.mark.parametrize("bound", ["start", "end"])
-def test_overflowing_times_are_validation_errors(
-    value: "str | int", bound: str
-) -> None:
-    """Verify overflowing times are validation errors."""
+def test_overflowing_times_are_validation_errors(value: str | int, bound: str) -> None:
     with pytest.raises(ValueError, match="time must be"):
         video.time_range(**{bound: value})
 
 
 def test_local_trim_cuts_between_keyframes_without_resizing_or_changing_rate(
-    clip: "Path", tmp_path: "Path"
+    clip: Path, tmp_path: Path
 ) -> None:
-    """Verify local trim cuts between keyframes without resizing or changing rate."""
     original = clip.read_bytes()
     output = video.trim(clip, tmp_path / "trimmed.mp4", "0.7", "1.4")
     info = video.probe(output)
@@ -263,34 +268,30 @@ def test_local_trim_cuts_between_keyframes_without_resizing_or_changing_rate(
     [("0.5", None, 1.5), (None, "1.2", 1.2), (None, None, 2.0)],
 )
 def test_local_trim_optional_bounds(
-    clip: "Path", tmp_path: "Path", start: str | None, end: str | None, duration: float
+    clip: Path, tmp_path: Path, start: str | None, end: str | None, duration: float
 ) -> None:
-    """Verify local trim optional bounds."""
     output = video.trim(clip, tmp_path / "trimmed.mp4", start, end)
     assert abs(video.probe(output).duration - duration) < 0.05
 
 
 @pytest.mark.parametrize(("start", "end"), [("2", None), (None, "2.1"), ("9", "10")])
 def test_local_trim_rejects_bounds_outside_recording(
-    clip: "Path", tmp_path: "Path", start: str | None, end: str | None
+    clip: Path, tmp_path: Path, start: str | None, end: str | None
 ) -> None:
-    """Verify local trim rejects bounds outside recording."""
     output = tmp_path / "trimmed.mp4"
     with pytest.raises(ValueError, match="within the recording"):
         video.trim(clip, output, start, end)
     assert not output.exists()
 
 
-def test_local_trim_never_overwrites_original(clip: "Path") -> None:
-    """Verify local trim never overwrites original."""
+def test_local_trim_never_overwrites_original(clip: Path) -> None:
     with pytest.raises(ValueError, match="different file"):
         video.trim(clip, clip, 0, 1)
 
 
 def test_trim_failure_preserves_existing_output_and_cleans_partial_file(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify trim failure preserves existing output and cleans partial file."""
     source, output = tmp_path / "source.mp4", tmp_path / "trimmed.mp4"
     source.write_bytes(b"original")
     output.write_bytes(b"complete")
@@ -298,7 +299,7 @@ def test_trim_failure_preserves_existing_output_and_cleans_partial_file(
         video, "probe", lambda _: video.VideoInfo(str(source), 320, 180, 30.0, 2.0)
     )
 
-    def fail(command: "list[str]", **_unused_kwargs: object) -> None:
+    def fail(command: list[str], **_unused_kwargs: object) -> None:
         Path(command[-1]).write_bytes(b"partial")
         raise subprocess.CalledProcessError(1, command)
 
@@ -311,9 +312,8 @@ def test_trim_failure_preserves_existing_output_and_cleans_partial_file(
 
 
 def test_trim_cli_passes_literal_paths_and_bounds(
-    monkeypatch: "pytest.MonkeyPatch",
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify trim cli passes literal paths and bounds."""
     calls = []
     monkeypatch.setattr(video, "trim", lambda *args: calls.append(args))
     main(
@@ -332,9 +332,8 @@ def test_trim_cli_passes_literal_paths_and_bounds(
 
 
 def test_trim_cli_accepts_normalized_submillisecond_bounds(
-    clip: "Path", tmp_path: "Path"
+    clip: Path, tmp_path: Path
 ) -> None:
-    """Verify trim cli accepts normalized submillisecond bounds."""
     output = tmp_path / "tiny-start.mp4"
     assert video.format_time(1e-5) == "0.00001"
     main(
@@ -357,15 +356,13 @@ def test_trim_cli_accepts_normalized_submillisecond_bounds(
     [(None, "12.75", "*0.0-12.75"), ("1.23456789", None, "*1.23456789-inf")],
 )
 def test_download_optional_bounds_are_normalized_without_losing_precision(
-    tmp_path: "Path",
-    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     start: str | None,
     end: str | None,
     section: str,
 ) -> None:
-    """Verify download optional bounds are normalized without losing precision."""
-
-    def run(command: "list[str]", **_unused_kwargs: object) -> None:
+    def run(command: list[str], **_unused_kwargs: object) -> None:
         actual_start, actual_end = (
             command[command.index("--download-sections") + 1]
             .removeprefix("*")
@@ -382,9 +379,8 @@ def test_download_optional_bounds_are_normalized_without_losing_precision(
 
 
 def test_download_success_without_output_is_not_published(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify download success without output is not published."""
     monkeypatch.setattr(
         video.subprocess, "run", lambda *_unused_args, **_unused_kwargs: None
     )
@@ -394,8 +390,7 @@ def test_download_success_without_output_is_not_published(
     assert not output.exists()
 
 
-def test_trim_keeps_optional_audio(clip: "Path", tmp_path: "Path") -> None:
-    """Verify trim keeps optional audio."""
+def test_trim_keeps_optional_audio(clip: Path, tmp_path: Path) -> None:
     source = tmp_path / "with-audio.mp4"
     subprocess.run(  # noqa: S603
         [
@@ -441,9 +436,8 @@ def test_trim_keeps_optional_audio(clip: "Path", tmp_path: "Path") -> None:
 
 
 def test_real_ytdlp_section_download_publishes_complete_accurate_clip(
-    clip: "Path", tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    clip: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify real ytdlp section download publishes complete accurate clip."""
     output = tmp_path / "downloaded.mp4"
     output.write_bytes(b"previous complete recording")
     run = subprocess.run

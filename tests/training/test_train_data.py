@@ -3,8 +3,10 @@
 
 """Training crop geometry and human annotation handling."""
 
+from __future__ import annotations
+
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -14,12 +16,8 @@ from video2tenhou.layout import Calibration
 from video2tenhou.train import data
 from video2tenhou.train.data import hand_of
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 def test_training_assigns_labels_by_physical_table_windows() -> None:
-    """Verify training assigns labels by physical table windows."""
     hands = [
         {"game": 0, "t_start": 40, "t_end": 300},
         {"game": 0, "t_start": 300.5, "t_end": 600},
@@ -32,9 +30,8 @@ def test_training_assigns_labels_by_physical_table_windows() -> None:
 
 
 def test_training_requires_pipeline_hand_table_even_if_old_label_table_exists(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify training requires pipeline hand table even if old label table exists."""
     monkeypatch.setattr(data, "ROOT", tmp_path)
     labels = tmp_path / "labels" / "recording"
     labels.mkdir(parents=True)
@@ -50,7 +47,7 @@ def test_training_requires_pipeline_hand_table_even_if_old_label_table_exists(
 
 
 def test_build_keeps_reviewed_tiles_and_empty_melds_in_whole_hand_splits(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Exercise annotation loading through detector labels and classifier images."""
     monkeypatch.setattr(data, "ROOT", tmp_path)
@@ -61,7 +58,8 @@ def test_build_keeps_reviewed_tiles_and_empty_melds_in_whole_hand_splits(
         "quad": [[20, 20], [80, 20], [80, 60], [20, 60]],
         "sideways": True,
     }
-    for stamp, boxes in ((5, [tile]), (45, [])):
+    back = {"tile": "X", "quad": [[100, 100], [160, 100], [160, 140], [100, 140]]}
+    for stamp, boxes in ((5, [tile]), (15, [tile, back]), (45, [])):
         (labels / f"{stamp}.json").write_text(
             json.dumps(
                 {
@@ -87,6 +85,11 @@ def test_build_keeps_reviewed_tiles_and_empty_melds_in_whole_hand_splits(
     stats = data.build("recording.mp4", Calibration.load("pml"), work, out)
     assert stats["det_train_boxes"] == 1
     assert stats["det_val_negatives"] == 1
+    # The face detector never learns a reviewed face-down tile as background.
+    assert stats["det_train_back_images_excluded"] == 1
+    assert not (out / "detector/labels/train/meld_TL_15.txt").exists()
+    assert len(list((out / "classifier/train/X").glob("*.png"))) == 1
+    assert (out / "detector/data.yaml").read_text().endswith("names:\n  0: face\n")
     assert (out / "detector/labels/train/meld_TL_5.txt").read_text().split() == [
         "0",
         "0.15625",
@@ -95,7 +98,7 @@ def test_build_keeps_reviewed_tiles_and_empty_melds_in_whole_hand_splits(
         "0.16667",
     ]
     assert (out / "detector/labels/val/meld_TL_45.txt").read_text() == ""
-    crops = list((out / "classifier/train/2p").glob("*.png"))
+    crops = list((out / "classifier/train/2p").glob("meld_TL_5_*.png"))
     assert len(crops) == 2
     for path in crops:
         image = cv2.imread(str(path))

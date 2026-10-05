@@ -3,6 +3,8 @@
 
 """The single built frontend is complete, local and served by the API router."""
 
+from __future__ import annotations
+
 from contextlib import closing
 from html.parser import HTMLParser
 from http import HTTPStatus
@@ -15,7 +17,7 @@ import pytest
 
 from tests.web.server import studio_server
 from video2tenhou import cli
-from video2tenhou.tool.http import STATIC
+from video2tenhou.tool.http import IMMUTABLE, STATIC
 
 
 class AssetReferences(HTMLParser):
@@ -37,8 +39,7 @@ class AssetReferences(HTMLParser):
             self.urls.append(attributes["href"])
 
 
-def test_built_application_and_assets_are_served_offline(tmp_path: "Path") -> None:
-    """Verify built application and assets are served offline."""
+def test_built_application_and_assets_are_served_offline(tmp_path: Path) -> None:
     with studio_server(tmp_path) as server, httpx.Client(trust_env=False) as client:
         base = server.url
         response = client.get(base).raise_for_status()
@@ -52,7 +53,7 @@ def test_built_application_and_assets_are_served_offline(tmp_path: "Path") -> No
             assert (STATIC / url.lstrip("/")).is_file()
             response = client.get(base + url)
             assert response.status_code == HTTPStatus.OK
-            assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["Cache-Control"] == IMMUTABLE
             assert response.headers["X-Content-Type-Options"] == "nosniff"
             expected_type = "javascript" if url.endswith(".js") else "text/css"
             assert expected_type in response.headers["Content-Type"]
@@ -77,8 +78,7 @@ def test_built_application_and_assets_are_served_offline(tmp_path: "Path") -> No
                 assert raw.getresponse().status == HTTPStatus.NOT_FOUND
 
 
-def test_web_is_the_only_browser_command(capsys: "pytest.CaptureFixture[str]") -> None:
-    """Verify web is the only browser command."""
+def test_web_is_the_only_browser_command(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as error:
         cli.main(["review", "recording.mp4"])
     assert error.value.code == 2

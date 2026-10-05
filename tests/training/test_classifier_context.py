@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -16,10 +17,6 @@ import torch
 from torch import nn
 
 from video2tenhou.train import classifier_context as cc
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
 
 
 def _png(path: Path, pixels: np.ndarray) -> Path:
@@ -91,14 +88,14 @@ def _build(corpus: SimpleNamespace) -> dict:
         corpus.anchors,
         corpus.manifest,
         corpus.output,
-        source=cc.ContextSource(video=corpus.video, work=corpus.work),
+        video=corpus.video,
+        work=corpus.work,
     )
 
 
 def test_context_build_preserves_anchors_and_original_timestamp_split(
     corpus: SimpleNamespace,
 ) -> None:
-    """Verify context build preserves anchors and original timestamp split."""
     original = corpus.anchor.read_bytes()
     report = _build(corpus)
     rows = [
@@ -135,7 +132,6 @@ def test_context_build_preserves_anchors_and_original_timestamp_split(
 def test_context_build_rejects_split_or_human_provenance_violation(
     corpus: SimpleNamespace, bad: str
 ) -> None:
-    """Verify context build rejects split or human provenance violation."""
     if bad == "heldout_anchor":
         corpus.labels[0]["t"] = 40.2  # Still the same rounded filename.
         corpus.manifest.write_text("")
@@ -153,7 +149,6 @@ def test_context_build_rejects_split_or_human_provenance_violation(
 
 
 def test_context_augmentation_uses_recorded_draw_order_and_human_rotation() -> None:
-    """Verify context augmentation uses recorded draw order and human rotation."""
     image = np.arange(40 * 40 * 3, dtype=np.uint8).reshape(40, 40, 3)
     calls, values = [], iter([0.1, 0.2, 0.05, -0.05])
 
@@ -180,7 +175,6 @@ def test_context_augmentation_uses_recorded_draw_order_and_human_rotation() -> N
 
 
 def test_anchor_teacher_mask_and_context_gradients() -> None:
-    """Verify anchor teacher mask and context gradients."""
     images = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
     logits = torch.tensor(
         [[1.0, 0.0, 2.0], [0.0, 2.0, 1.0], [2.0, 1.0, 0.0]], requires_grad=True
@@ -218,7 +212,6 @@ def test_anchor_teacher_mask_and_context_gradients() -> None:
 
 
 def test_frozen_batchnorm_retains_affine_learning() -> None:
-    """Verify frozen batchnorm retains affine learning."""
     model = nn.Sequential(nn.BatchNorm1d(3), nn.Dropout(0.1))
     bn = model[0]
     assert isinstance(bn, nn.BatchNorm1d)
@@ -246,7 +239,6 @@ def test_frozen_batchnorm_retains_affine_learning() -> None:
 def test_training_checkpoint_contract_with_tiny_cpu_model(
     corpus: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Verify training checkpoint contract with tiny cpu model."""
     _build(corpus)
     validation = tmp_path / "val"
     _png(validation / "1m/hand_TR_40_00.png", cc.to_crop(corpus.pixels))

@@ -3,35 +3,31 @@
 
 """Changing calibrated model content must invalidate evidence, irrespective of paths."""
 
+from __future__ import annotations
+
 import json
 import os
-from typing import TYPE_CHECKING
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Self
 
+import numpy as np
 import pytest
 
 from video2tenhou.perception import classifier
 
-if TYPE_CHECKING:
-    from typing import Self
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 def test_identity_tracks_checkpoint_metadata_and_preprocessing(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify identity tracks checkpoint metadata and preprocessing."""
-
     class Model:
-        def load_state_dict(self, state: "dict") -> None:
+        def load_state_dict(self, state: dict) -> None:
             pass
 
-        def to(self, device: "str") -> "Self":
+        def to(self, device: str) -> Self:
             return self
 
-        def eval(self) -> "Self":
+        def eval(self) -> Self:
             return self
 
     monkeypatch.setattr(classifier, "make_model", lambda _n: Model())
@@ -43,7 +39,7 @@ def test_identity_tracks_checkpoint_metadata_and_preprocessing(
     meta = {"classes": classifier.CLASSES, "temperature": 1.0}
     (tmp_path / "meta.json").write_text(json.dumps(meta))
 
-    def identity(device: str = "cpu") -> "str":
+    def identity(device: str = "cpu") -> str:
         return classifier.Classifier(tmp_path, device=device).id
 
     first = identity()
@@ -72,8 +68,37 @@ def test_identity_tracks_checkpoint_metadata_and_preprocessing(
     assert identity() != current
 
 
-def test_classifier_requires_declared_calibration_temperature(tmp_path: "Path") -> None:
-    """Verify classifier requires declared calibration temperature."""
+def test_classifier_requires_declared_calibration_temperature(tmp_path: Path) -> None:
     (tmp_path / "meta.json").write_text(json.dumps({"classes": classifier.CLASSES}))
     with pytest.raises(KeyError, match="temperature"):
         classifier.Classifier(tmp_path, device="cpu")
+
+
+def test_lazy_classifier_loads_weights_only_to_classify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cache checks need no weights; a changed checkpoint cannot be loaded later."""
+    monkeypatch.setattr(classifier, "select_device", lambda _device: "cpu")
+    (tmp_path / "weights.pt").write_bytes(b"checkpoint-a")
+    meta = {"classes": classifier.CLASSES, "temperature": 0.7}
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+    loaded = []
+
+    def load(model_dir: Path) -> SimpleNamespace:
+        loaded.append(model_dir)
+        return SimpleNamespace(
+            id=classifier.classifier_config(model_dir).id,
+            classify=lambda crops, _sideways: np.ones((len(crops), 1)),
+        )
+
+    monkeypatch.setattr(classifier, "Classifier", load)
+    lazy = classifier.LazyClassifier(tmp_path)
+    assert (lazy.classes, lazy.T, loaded) == (classifier.CLASSES, 0.7, [])
+    crop = np.zeros((96, 64, 3), np.uint8)
+    assert lazy.classify([crop, crop]).shape == (2, 1)
+    lazy.classify([crop])
+    assert loaded == [tmp_path]
+    stale = classifier.LazyClassifier(tmp_path)
+    (tmp_path / "weights.pt").write_bytes(b"checkpoint-b")
+    with pytest.raises(RuntimeError, match="changed after evidence was validated"):
+        stale.classify([crop])

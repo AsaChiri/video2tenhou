@@ -1,218 +1,157 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Profiler accounting must not change results, exceptions or decoder cleanup."""
+"""Profiling must not change results, exceptions or the instrumented functions."""
+
+from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import cast
 
 import pytest
 from ortools.sat.python.cp_model import OPTIMAL, CpModel, CpSolver
 
 from tools import profile_conversion as profile
-from video2tenhou import timeline
+from video2tenhou import cli, timeline
+from video2tenhou.engine import decode
 from video2tenhou.layout import Calibration
 from video2tenhou.perception.detector import Detector
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-    from typing import BinaryIO
+from video2tenhou.record import HandResult
 
 
-def test_threaded_accounting_and_stage_hand_context(tmp_path: "Path") -> None:
-    """Verify threaded accounting and stage hand context."""
-    recorder = profile.Recorder(tmp_path)
-    recorder.active_stage = "decode"
-    recorder.active_hand = 7
-
-    def add(_: object) -> None:
-        for _ in range(100):
-            recorder.add("search", 0.25, hand=recorder.active_hand)
-
-    with ThreadPoolExecutor(4) as pool:
-        list(pool.map(add, range(4)))
-    (row,) = recorder.totals.values()
-    assert (row["calls"], row["seconds"], row["hand"], row["stage"]) == (
-        400,
-        100,
-        7,
-        "decode",
-    )
-    recorder.close()
+def call(name: str, start: float, wall: float, **fields: object) -> profile.Call:
+    """Build a completed call with a controlled interval."""
+    completed = profile.Call(name, stage=None, hand=None, start=start, wall=wall)
+    return replace(completed, failed=False, **fields)
 
 
-def test_generator_excludes_consumer_and_closes_early(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
-) -> None:
-    """Verify generator excludes consumer and closes early."""
-    ticks = [0.0]
-    monkeypatch.setattr(profile.time, "perf_counter", lambda: ticks[0])
-    recorder = profile.Recorder(tmp_path)
-    closed = []
+def test_hand_and_stage_labels_reach_worker_calls_and_survive_failures() -> None:
+    """Worker calls inherit the active stage and hand; errors propagate unchanged."""
+    recorder = profile.Recorder()
+    worker = recorder.wrap(lambda: None, "worker")
 
-    def source() -> "Generator[str]":
-        try:
-            ticks[0] += 2
-            yield "frame"
-        finally:
-            ticks[0] += 3
-            closed.append(True)
+    def decode_hand(entry: dict) -> None:
+        with ThreadPoolExecutor(2) as pool:
+            list(pool.map(lambda _: worker(), range(3)))
+        raise ValueError("original")
 
-    iterator = recorder.generator(source)()
-    assert next(iterator) == "frame"
-    ticks[0] += 100  # Consumer processing must not be charged to ffmpeg.
-    iterator.close()
-    assert closed == [True]
-    rows = {row["name"]: row for row in recorder.totals.values()}
-    assert rows["video.sample.next_wait"]["seconds"] == 2
-    assert rows["video.sample.close"]["seconds"] == 3
-    recorder.close()
-
-
-def test_failure_preserves_exception_and_restores_hand_stage(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
-) -> None:
-    """Verify failure preserves exception and restores hand stage."""
-    recorder = profile.Recorder(tmp_path)
-    threads = {"opencv": 32}
-    monkeypatch.setattr(profile, "runtime_threads", lambda: dict(threads))
-
-    def failing(entry: "dict") -> None:
-        threads["opencv"] = 1  # Model imports can change settings before a failure.
-        msg = "original"
-        raise ValueError(msg)
-
-    wrapped = recorder.wrap(
-        failing, "hand", progress=True, hand_call=True, stage_call=True
+    stage = recorder.wrap(
+        recorder.wrap(decode_hand, profile.HAND, hand=True), "decode", stage=True
     )
     with pytest.raises(ValueError, match="original"):
-        wrapped({"hand": 3})
-    assert recorder.active_hand is None
-    assert recorder.active_stage is None
-    (row,) = recorder.totals.values()
-    assert row["failures"] == 1
-    assert row["hand"] == 3
-    recorder.close()
-    events = list(map(json.loads, (tmp_path / "events.jsonl").read_text().splitlines()))
-    assert [row["event"] for row in events] == ["start", "end"]
-    assert [row["runtime_threads"]["opencv"] for row in events] == [32, 1]
+        stage({"hand": 3})
+    assert (recorder.stage, recorder.hand) == (None, None)
+    workers = [item for item in recorder.calls if item.name == "worker"]
+    assert [(item.stage, item.hand) for item in workers] == [("decode", 3)] * 3
+    hand = next(item for item in recorder.calls if item.name == profile.HAND)
+    assert hand.failed
+    assert hand.stage == "decode"
 
 
-def test_cp_solver_actual_method_is_timed_once_and_restored(tmp_path: "Path") -> None:
-    """Verify cp solver actual method is timed once and restored."""
-    original = CpSolver.solve
-    recorder = profile.Recorder(tmp_path)
-    with profile.instrument(recorder):
-        model = CpModel()
-        variable = model.new_int_var(0, 1, "x")
-        model.minimize(variable)
-        assert CpSolver().solve(model) == OPTIMAL
-    assert CpSolver.solve is original
-    rows = [row for row in recorder.totals.values() if row["name"] == "CpSolver.solve"]
-    assert len(rows) == 1
-    assert rows[0]["calls"] == 1
-    recorder.close()
-    event = next(
-        row
-        for row in map(json.loads, (tmp_path / "events.jsonl").read_text().splitlines())
-        if row["event"] == "cp_search"
-    )
-    assert event["status"] == "OPTIMAL"
-    assert event["objective"] == 0
-
-
-def test_table_counting_is_timed_once_and_restored(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+def test_instrumentation_times_actual_methods_once_and_restores_them(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify table counting is timed once and restored."""
+    """Every patched entry point exists, is timed once and is restored afterwards."""
+    original = CpSolver.solve
     calls = []
 
-    def fake(
-        frame: "str",
-        _cal: object,
-        _intervals: object,
-        _detector: object,
-        **kwargs: "object",
-    ) -> str:
+    def counts(frame: str, *_args: object, **kwargs: object) -> str:
         calls.append((frame, kwargs))
         return "reading"
 
-    monkeypatch.setattr(timeline, "read_pond_counts", fake)
-
-    recorder = profile.Recorder(tmp_path)
+    monkeypatch.setattr(timeline, "read_pond_counts", counts)
+    recorder = profile.Recorder()
     with profile.instrument(recorder):
-        assert (
-            timeline.read_pond_counts(
-                "frame",
-                Calibration.load("pml"),
-                [],
-                Detector.__new__(Detector),
-                log=print,
-            )
-            == "reading"
+        model = CpModel()
+        model.minimize(model.new_int_var(0, 1, "x"))
+        assert CpSolver().solve(model) == OPTIMAL
+        detector = Detector.__new__(Detector)
+        reading = timeline.read_pond_counts(
+            "frame", Calibration.load("pml"), [], detector, log=print
         )
-    assert timeline.read_pond_counts is fake
-    rows = [
-        row
-        for row in recorder.totals.values()
-        if row["name"] == "timeline.read_pond_counts"
-    ]
-    assert len(rows) == 1
-    assert rows[0]["calls"] == 1
+        assert reading == "reading"
+    assert CpSolver.solve is original
+    assert timeline.read_pond_counts is counts
     assert calls == [("frame", {"log": print})]
-    recorder.close()
-
-
-def test_tool_versions_keep_failures_bounded_and_report_resolved_paths(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
-) -> None:
-    """One broken optional probe must not prevent metadata for the other tools."""
-    commands = []
-    monkeypatch.setattr(
-        profile.shutil,
-        "which",
-        lambda name: None if name == "ffmpeg" else str(tmp_path / name),
+    search, pond = recorder.calls
+    assert (search.name, search.status, search.failed) == (
+        "CpSolver.solve",
+        "OPTIMAL",
+        False,
     )
+    assert pond.name == "timeline.read_pond_counts"
 
-    def run(
-        command: "list[str]", *, timeout: float, stdout: "BinaryIO", **kwargs: "object"
-    ) -> "profile.subprocess.CompletedProcess[bytes]":
-        commands.append(command)
-        assert timeout == 3
-        assert kwargs["check"] is False
-        assert kwargs["stderr"] == profile.subprocess.STDOUT
-        assert kwargs["stdin"] == profile.subprocess.DEVNULL
-        name = Path(command[0]).name
-        if name == "uv":
-            raise profile.subprocess.TimeoutExpired(command, timeout)
-        if name == "ffprobe":
-            stdout.write(b"broken executable\n" + b"x" * 10000)
-            return profile.subprocess.CompletedProcess(command, 7)
-        raise AssertionError(command)
 
-    monkeypatch.setattr(profile.subprocess, "run", run)
-    rows = profile.tool_versions()
-    assert rows["ffmpeg"] == {"path": None, "version": None, "status": "missing"}
-    assert rows["ffprobe"]["status"] == "error"
-    assert rows["ffprobe"]["error"] == "broken executable"
-    assert rows["ffprobe"]["returncode"] == 7
-    assert rows["uv"]["status"] == "timeout"
-    assert rows["uv"]["version"] is None
-    assert [command[1] for command in commands] == [
-        "-version",
-        "--version",
+def test_summary_separates_concurrent_searches_dense_reads_and_stages() -> None:
+    """Hands report solve and certification time; stage shares give a ceiling."""
+    hand = {"stage": "engine.decode.run_decode", "hand": 2}
+    calls = [
+        call("read.run_read", 0, 80, cpu=160),
+        call("engine.decode.run_decode", 80, 20, cpu=20),
+        call(profile.HAND, 80, 10, cpu=12, **hand),
+        call("engine.dense.dense_reads", 81, 2, **hand),
+        call("engine.dense.dense_pond_reads", 83, 3, **hand),
+        call(profile.SOLVE, 84, 3, **hand),
+        call(profile.SEARCH, 84, 3, status="OPTIMAL", budget=60, **hand),
+        call(profile.CERTIFY, 87, 9, **hand),
+        call(profile.SEARCH, 87, 4, status="FEASIBLE", budget=4, **hand),
+        call(profile.SEARCH, 91, 4, status="UNKNOWN", budget=4, **hand),
     ]
-
-    monkeypatch.setattr(profile.shutil, "which", lambda name: str(tmp_path / name))
-
-    def denied(*_unused_args: object, **_unused_kwargs: object) -> None:
-        msg = "not executable"
-        raise PermissionError(msg)
-
-    monkeypatch.setattr(profile.subprocess, "run", denied)
-    assert all(
-        row["status"] == "error" and row["version"] is None
-        for row in profile.tool_versions().values()
+    summary = profile.summarize(calls)
+    assert [(row["name"], row["wall"]) for row in summary["stages"]] == [
+        ("read.run_read", 80),
+        ("engine.decode.run_decode", 20),
+    ]
+    (row,) = summary["hands"]
+    assert row["wall"] == 10
+    assert row["cpu"] == 12
+    assert row["dense_reads"] == 5
+    assert row["solve"] == 3
+    assert row["certify"] == 9
+    assert row["near_budget"] == 2
+    assert row["statuses"] == {"OPTIMAL": 1, "FEASIBLE": 1, "UNKNOWN": 1}
+    summary.update(
+        failure=None,
+        wall_seconds=100,
+        process_cpu_seconds=200,
+        metadata={"logical_cpus": 8, "initial_files": {"work": 0, "out": 0}},
     )
+    report = profile.render(summary)
+    assert "| read.run_read | 1 | 80.0 | 160.0 | 80.0% | 5.00x |" in report
+    assert "2.00 logical cores of 8" in report
+
+
+def test_main_writes_summary_and_report_even_when_conversion_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed conversion keeps its timings and fails the command."""
+
+    def convert(args: object) -> None:
+        decode.decode_hand({"hand": 5}, {}, cast("HandResult", None))
+
+    def failing_hand(entry: dict, *_args: object) -> None:
+        raise RuntimeError("hand failed")
+
+    monkeypatch.setattr(cli, "cmd_convert", convert)
+    monkeypatch.setattr(decode, "decode_hand", failing_hand)
+    monkeypatch.setattr(
+        profile,
+        "run_metadata",
+        lambda _args: {"logical_cpus": 1, "initial_files": {"work": 3, "out": 0}},
+    )
+    output = tmp_path / "profile"
+    assert (
+        profile.main(["--profile-output", str(output), "video.mp4", "--game", "1"]) == 1
+    )
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["failure"] == "RuntimeError: hand failed"
+    assert summary["hands"][0]["failed"]
+    assert (
+        "Files before conversion: work 3, output 0."
+        in (output / "report.md").read_text()
+    )
+    with pytest.raises(FileExistsError):
+        profile.main(["--profile-output", str(output), "video.mp4", "--game", "1"])

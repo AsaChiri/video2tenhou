@@ -1,7 +1,14 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Per-recording evidence, human facts, calibration and rebuild jobs."""
+"""Per-recording evidence, saved answers, calibration and hand freshness.
+
+Files on disk are the source of truth: hands, calibration, decodes and exports are
+re-read when their modification time or size changes. Slow work (frame seeks,
+model loading, clip encoding) never runs while `ReviewState.lock` is held; the lock
+only guards caches and the answer journal. Reads never change evidence or
+answers; the only file a read creates is a cached evidence clip.
+"""
 
 from __future__ import annotations
 
@@ -9,10 +16,11 @@ import hashlib
 import json
 import logging
 import math
-import os
-import sys
+import subprocess
 import threading
 import time
+import uuid
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import cv2
@@ -20,26 +28,30 @@ import numpy as np
 
 from video2tenhou import calibfit, video
 from video2tenhou.cache import source_identity
-from video2tenhou.engine.review import load_facts
+from video2tenhou.commands import executable
+from video2tenhou.engine.decode import DECODER_VERSION
+from video2tenhou.engine.review import decode_context, load_facts
 from video2tenhou.engine.validation import review_artifact
-from video2tenhou.files import atomic_write_json, atomic_write_text
+from video2tenhou.export import decode_identity, export_inputs
+from video2tenhou.files import (
+    atomic_write_json,
+    atomic_write_text,
+    read_published_text,
+)
 from video2tenhou.layout import CORNERS, Calibration, box_to_quad, fit_path
 from video2tenhou.observe import load_obs
 from video2tenhou.paths import DATA_DIR as ROOT
 from video2tenhou.perception import detector
+from video2tenhou.perception.crops import region_upright
 from video2tenhou.perception.reader import read_region
-from video2tenhou.train.data import region_upright
-
-from .processes import ProcessOwner
-
-if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
-
-    from video2tenhou.perception.classifier import Classifier
-
+from video2tenhou.record import from_dict
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from video2tenhou.perception.classifier import Classifier
+
+    from .processes import ProcessOwner
 
 FRAME_CACHE_LIMIT = 40
 FACT_TIMESTAMP_TOLERANCE = 1e-6
@@ -48,112 +60,487 @@ MAX_PREVIEW_SCALE = 4.0
 SCALE_CHANGE_TOLERANCE = 1e-6
 MIN_ROLL_CORRECTION = 0.5
 CONTEXT_TURN_WINDOW = 1.5
+BORDER_CHECKS = "border-checks.json"
+FACT_KINDS = frozenset(
+    {
+        "haipai",
+        "final_hand",
+        "draw",
+        "discard",
+        "missing_discard",
+        "meld",
+        "meld_remove",
+        "riichi",
+        "riichi_turn",
+        "kan_time",
+        "ura",
+        "dora",
+        "lost",
+        "site_wrong",
+        "dismiss",
+    }
+)
+# Reconstruction internals and developer reasoning never reach the browser.
+PRIVATE_DECODE_KEYS = (
+    "diagnostics",
+    "decode_context",
+    "decode_inputs",
+    "decoder_version",
+)
 LOGGER = logging.getLogger(__name__)
 
 
+def item_id(item: dict, kind: str | None = None) -> str:
+    """Identify a review question across rebuilds within its hand.
+
+    The kind, seat and turn (or the rounded second when there is no turn) are
+    stable when the same question is asked again.
+    """
+    j, t = item.get("j"), item.get("t")
+    position = j if j is not None else (round(t) if t is not None else "")
+    return f"{kind or item.get('kind')}:{item.get('seat') or ''}:{position}"
+
+
+def _round(row: dict) -> tuple:
+    return row.get("game"), row.get("kyoku"), row.get("honba")
+
+
 class ReviewState:
-    """Per-recording review data, frame cache and serialized background jobs."""
+    """One recording's review data, evidence rendering and saved answers."""
 
     def __init__(
-        self, video: Path, work: Path, calib: str, out: Path | None = None
+        self, video: Path, work: Path, layout: str, out: Path, processes: ProcessOwner
     ) -> None:
-        """Open saved review inputs and initialize per-recording jobs and locks."""
-        self.calib_name = calib
-        self.jobs: dict = {}
-        self.processes = ProcessOwner()
-        self._threads: list[threading.Thread] = []
-
+        """Bind a recording's work, label and output folders without touching them."""
         self.video = video
         self.name = video.stem
+        self.layout = layout
         self.work = work / self.name
-        self.out = (out or ROOT / "out") / self.name
+        self.out = out / self.name
         self.labels = ROOT / "labels" / self.name
-        (self.labels / "boxes").mkdir(parents=True, exist_ok=True)
-        self.cal = Calibration.load(calib, video)
-        # a video whose geometry has not been measured has not been converted either, so
-        # there is no
-        # header and no record yet: the tool still opens, on the Calibrate page, which
-        # needs neither
-        self.hands = self._read_json(self.work / "hands.json", list) or []
+        self.processes = processes
         self.lock = threading.Lock()
-        self._models = None
-        self._checks: dict[str, dict] = {}
-        self._frame_cache: dict[float, np.ndarray] = {}
-        self._review_views: dict[int, tuple[tuple, dict]] = {}
-        self.configuration_signature: str | None = None
+        self._model_lock = threading.Lock()
+        self._models: tuple[detector.Detector, Classifier] | None = None
+        self._frames: dict[float, np.ndarray] = {}
+        self._files: dict[Path, tuple[tuple[int, int], object]] = {}
+        self._views: dict[Path, tuple[tuple[int, int], dict]] = {}
+        self._cal: tuple[tuple[int, int] | None, Calibration] | None = None
+        self._reported_notes: set[str] = set()
 
-    def frame(self, t: float) -> np.ndarray:
-        """Seek a normalized BGR frame, reusing recent evidence requests."""
-        t = round(float(t), 2)
+    # -- cached inputs ---------------------------------------------------------
+
+    def _load(self, path: Path) -> object | None:
+        """Parse a JSON file, reusing it until the file changes; None when absent."""
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        key = (stat.st_mtime_ns, stat.st_size)
         with self.lock:
-            if t not in self._frame_cache:
-                if len(self._frame_cache) > FRAME_CACHE_LIMIT:
-                    self._frame_cache.clear()
-                self._frame_cache[t] = video.frame_at(self.video, t)
-            return self._frame_cache[t]
+            cached = self._files.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        value = json.loads(read_published_text(path))
+        with self.lock:
+            self._files[path] = (key, value)
+        return value
 
     @property
-    def models_loaded(self) -> bool:
-        """Report whether this review state owns inference models."""
+    def hands(self) -> list[dict]:
+        """Hands of the current analysis; none while its inputs await analysis."""
+        if (self.work / "inputs.changed").exists():
+            return []
+        hands = self._load(self.work / "hands.json")
+        if hands is not None and not isinstance(hands, list):
+            raise TypeError(f"Expected a JSON list in {self.work / 'hands.json'}")
+        return hands or []
+
+    def entry(self, hand: int) -> dict:
+        """Return a hand's metadata from the current analysis."""
+        found = next((h for h in self.hands if h["hand"] == hand), None)
+        if found is None:
+            raise KeyError("Unknown hand.")
+        return found
+
+    @property
+    def cal(self) -> Calibration:
+        """The layout with this recording's current fit applied."""
+        path = fit_path(self.video)
+        try:
+            stat = path.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            key = None
         with self.lock:
-            return self._models is not None
-
-    def models(self) -> tuple[detector.Detector, Classifier]:
-        """Load detector/classifier lazily for calibration and label prefill."""
+            cached = self._cal
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        cal = Calibration.load(self.layout, self.video)
         with self.lock:
-            if self._models is None:
-                from video2tenhou.perception.classifier import (  # noqa: PLC0415
-                    Classifier,
-                )
+            self._cal = (key, cal)
+        return cal
 
-                self._models = (detector.Detector(), Classifier())
-            return self._models
+    def decode_path(self, i: int) -> Path:
+        """Locate a hand's reconstruction within this recording's work directory."""
+        return self.work / "decode" / f"{i:02d}.json"
 
-    # -- calibration (stage 0)
-    # ------------------------------------------------------------
+    def decoded(self, hand: int) -> dict | None:
+        """Return a hand's reconstruction by the current decoder, else None.
 
-    def reload_calib(self) -> Calibration:
-        """Invalidate rendered evidence after geometry changes."""
-        previous = self.cal.data
-        self.cal = Calibration.load(self.calib_name, self.video)
-        self._frame_cache.clear()
-        if previous != self.cal.data:
-            self._checks.clear()
-            if self.hands:
-                self.work.mkdir(parents=True, exist_ok=True)
-                (self.work / "calibration.changed").write_text(
-                    (
-                        "Run full analysis to refresh observations after changing "
-                        "geometry.\n"
-                    ),
-                    encoding="utf-8",
-                )
-        return self.cal
+        A decode saved by another decoder version is stale: it is never shown or
+        assembled, and its hand needs a rebuild.
+        """
+        value = self._load(self.decode_path(hand))
+        if value is not None and not isinstance(value, dict):
+            raise TypeError(f"Expected a JSON object in {self.decode_path(hand)}")
+        if value is None or value.get("decoder_version") != DECODER_VERSION:
+            return None
+        return value
 
-    def revision(self) -> list:
-        """Return a disk change token for review refreshes across tabs/processes."""
+    def review_decode(self, hand: int) -> dict | None:
+        """Return a hand's reconstruction with its current export checks applied."""
+        path = self.decode_path(hand)
+        decoded = self.decoded(hand)
+        if not decoded:
+            return None
+        stat = path.stat()
+        key = (stat.st_mtime_ns, stat.st_size)
+        with self.lock:
+            cached = self._views.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        view = review_artifact(decoded, self.entry(hand))
+        with self.lock:
+            self._views[path] = (key, view)
+        return view
+
+    def all_facts(self) -> list[dict]:
+        """Read the append-only human evidence file for this recording."""
+        return load_facts(self.labels)
+
+    def facts(self, hand: int | None = None) -> list[dict]:
+        """Read human facts, optionally restricted to one hand's game and round."""
+        rows = self.all_facts()
+        if hand is None:
+            return rows
+        e = self.entry(hand)
+        return [r for r in rows if _round(r) == _round(e)]
+
+    # -- freshness -------------------------------------------------------------
+
+    def pending(self) -> list[int]:
+        """Return hands whose reconstruction or export lags the current inputs.
+
+        A hand is pending when it has no decode by the current decoder, when its
+        decode was made from other facts (dismissals excluded), metadata or site
+        result, or when the exports were not built from its current decode file.
+        """
+        hands = self.hands
+        record = self._load(self.work / "record.json")
+        if not isinstance(record, list):
+            return [h["hand"] for h in hands]
+        games = [from_dict(row) for row in record]
+        facts = self.all_facts()
+        built = export_inputs(self.out)
+        stale = []
+        for h in hands:
+            decoded = self.decoded(h["hand"])
+            current = decoded is not None and decoded.get(
+                "decode_context"
+            ) == decode_context(h, games[h["game"]].hands[h["site_index"]], facts)
+            if not current or built.get(str(h["hand"])) != decode_identity(
+                self.decode_path(h["hand"])
+            ):
+                stale.append(h["hand"])
+        return stale
+
+    def revision(self) -> str:
+        """Return a token that changes when review inputs or results change on disk."""
         paths = [
             self.work / "hands.json",
             self.labels / "facts.jsonl",
-            self.labels / "calib.json",
+            fit_path(self.video),
             self.work / "inputs.changed",
+            self.out / "export-inputs.json",
             *sorted((self.work / "decode").glob("*.json")),
         ]
+        stats = []
+        for p in paths:
+            with suppress(FileNotFoundError):
+                stat = p.stat()
+                stats.append((p.name, stat.st_mtime_ns, stat.st_size))
+        return hashlib.sha1(repr(stats).encode(), usedforsecurity=False).hexdigest()
+
+    # -- questions and answers -------------------------------------------------
+
+    def hand_summary(self) -> list[dict]:
+        """List hands with their review status and whether an update is pending."""
+        pending = set(self.pending())
+        rows = []
+        for h in self.hands:
+            d = self.review_decode(h["hand"])
+            status = None
+            if d:
+                status = (
+                    "conflict"
+                    if any(i["kind"] == "conflict" for i in d["items"])
+                    else "unresolvable"
+                    if d.get("solver", {}).get("status") == "unsolved"
+                    else ("review" if d["items"] else "complete")
+                )
+            rows.append(
+                {
+                    **{
+                        key: h.get(key)
+                        for key in (
+                            "hand",
+                            "game",
+                            "kyoku",
+                            "honba",
+                            "t_start",
+                            "t_end",
+                        )
+                    },
+                    "status": status,
+                    "pending": h["hand"] in pending,
+                    "turns": d["stats"]["turns"] if d else None,
+                    "score": (d["score"] or {}).get("match") if d else None,
+                }
+            )
+        return rows
+
+    def _dismissed(self, entry: dict, items: list[dict]) -> set[str]:
+        """Return the ids of a hand's questions the reviewer dismissed.
+
+        Saved `note` answers from earlier versions dismiss the single question with
+        the same text; ambiguous or unmatched notes are ignored and logged once.
+        The journal itself is never rewritten.
+        """
+        ids: set[str] = set()
+        for fact in self.all_facts():
+            if _round(fact) != _round(entry):
+                continue
+            if fact.get("kind") == "dismiss" and isinstance(fact.get("item"), str):
+                ids.add(fact["item"])
+            elif fact.get("kind") == "note":
+                same = [it for it in items if it.get("text") == fact.get("text")]
+                identity = json.dumps(fact, sort_keys=True)
+                if len(same) == 1:
+                    ids.add(item_id(same[0]))
+                elif identity not in self._reported_notes:
+                    self._reported_notes.add(identity)
+                    LOGGER.warning(
+                        "Ignoring a saved note for hand %s that matches %s questions.",
+                        entry["hand"] + 1,
+                        len(same),
+                    )
+        return ids
+
+    def all_items(self) -> list[dict]:
+        """List open questions with stable ids and certified confidence.
+
+        Dismissed questions are omitted. Review items can omit margin/coverage
+        fields present in their confidence rows; those are filled for navigation
+        without rewriting decoded evidence or using a feasible alternative's gap as
+        a confidence certificate.
+        """
+        out = []
+        for h in self.hands:
+            d = self.review_decode(h["hand"])
+            if d is None:
+                continue
+            dismissed = self._dismissed(h, d["items"])
+            for it in d["items"]:
+                row = dict(it)
+                row["id"] = item_id(it)
+                if row["id"] in dismissed:
+                    continue
+                field = row.get("kind")
+                turn = row.get("j")
+                if field in ("draw", "discard") and turn is not None:
+                    confidence = next(
+                        (
+                            c
+                            for c in d.get("confidence", [])
+                            if c.get("field") == field
+                            and c.get("seat") == row.get("seat")
+                            and c.get("turn") == turn
+                        ),
+                        None,
+                    )
+                    if confidence is not None:
+                        row.setdefault("lost", bool(confidence.get("lost")))
+                        if row.get("margin") is None:
+                            row["margin"] = confidence.get("margin")
+                if "choices" in row:
+                    row["choices"] = [
+                        {**c, "id": item_id(c, c.get("field") or c.get("kind"))}
+                        for c in row["choices"]
+                    ]
+                row.update(
+                    hand=h["hand"], kyoku=h["kyoku"], honba=h["honba"], game=h["game"]
+                )
+                out.append(row)
+        return out
+
+    def hand_view(self, hand: int) -> dict:
+        """Return a hand's metadata, its reconstruction and answers it ignored."""
+        entry = self.entry(hand)
+        d = self.review_decode(hand)
+        if d is None:
+            return {"entry": entry, "decode": None, "ignored": []}
+        return {
+            "entry": entry,
+            "decode": {k: v for k, v in d.items() if k not in PRIVATE_DECODE_KEYS},
+            "ignored": self._ignored(entry, d.get("ignored_facts", [])),
+        }
+
+    def _ignored(self, entry: dict, ignored: list[dict]) -> list[dict]:
+        """Attach each answer the reconstruction could not apply to its saved fact."""
+        facts = [f for f in self.all_facts() if _round(f) == _round(entry)]
+
+        def matches(fact: dict, row: dict) -> bool:
+            seat = entry["corner_wind"].get(fact.get("corner") or "", fact.get("seat"))
+            times = [fact.get(key) for key in ("t", "t_discard")]
+            return (
+                fact.get("kind") == row.get("kind")
+                and (row.get("seat") is None or seat == row["seat"])
+                and (
+                    row.get("t") is None
+                    or any(
+                        t is not None and abs(t - row["t"]) <= FACT_TIMESTAMP_TOLERANCE
+                        for t in times
+                    )
+                )
+            )
+
         return [
-            (str(p), str(p.stat().st_mtime_ns), p.stat().st_size)
-            for p in paths
-            if p.exists()
+            {
+                "ts": next((f.get("ts") for f in facts if matches(f, row)), None),
+                "kind": row.get("kind"),
+                "reason": row.get("reason"),
+            }
+            for row in ignored
         ]
 
-    def plate(self) -> np.ndarray:
-        """Return the cached median table image used to adjust calibration."""
-        return calibfit.table_plate(self.video, self.work)
+    def add_fact(self, f: dict) -> dict:
+        """Append a review answer with game identity, mapped corner and timestamp."""
+        if f.get("kind") not in FACT_KINDS:
+            raise ValueError("Unsupported answer.")
+        if f["kind"] == "dismiss" and not isinstance(f.get("item"), str):
+            raise ValueError("Choose the question to dismiss.")
+        e = self.entry(int(f["hand"]))
+        row = {
+            **f,
+            "game": e["game"],
+            "kyoku": e["kyoku"],
+            "honba": e["honba"],
+            "hand": e["hand"],
+            "author": "tool",
+        }
+        if row.get("seat") and "corner" not in row:
+            corner = next(
+                (c for c, s in e["corner_wind"].items() if s == row["seat"]), None
+            )
+            if corner is None:
+                raise ValueError(f"seat {row['seat']} is not at this table")
+            row["corner"] = corner
+        path = self.labels / "facts.jsonl"
+        with self.lock:
+            row["ts"] = time.time()
+            previous = path.read_text(encoding="utf-8") if path.exists() else ""
+            if previous and not previous.endswith("\n"):
+                previous += "\n"
+            # The decoder reads in another process. Publish a complete journal
+            # so an answer arriving mid-read cannot expose a partial JSON line.
+            atomic_write_text(
+                path,
+                previous + json.dumps(row, ensure_ascii=False) + "\n",
+                retry_windows=True,
+            )
+        return row
+
+    def delete_fact(self, ts: float) -> int:
+        """Remove an answer by its timestamp; the next rebuild reopens its question."""
+        p = self.labels / "facts.jsonl"
+        with self.lock:
+            rows = (
+                [
+                    line
+                    for line in p.read_text(encoding="utf-8").splitlines(keepends=True)
+                    if line.strip()
+                ]
+                if p.exists()
+                else []
+            )
+            keep = [
+                line
+                for line in rows
+                if abs(float(json.loads(line).get("ts") or -1) - ts)
+                > FACT_TIMESTAMP_TOLERANCE
+            ]
+            if len(keep) != len(rows):
+                atomic_write_text(
+                    p,
+                    "".join(keep)
+                    + ("\n" if keep and not keep[-1].endswith("\n") else ""),
+                    retry_windows=True,
+                )
+        return len(rows) - len(keep)
+
+    def context(self, hand: int, seat: str, t: float) -> dict:
+        """Compare nearby camera readings with the reconstruction around time t."""
+        e = self.entry(hand)
+        corner = next(c for c, s in e["corner_wind"].items() if s == seat)
+        obs = load_obs(self.work, hand).get(f"hand:{corner}", [])
+
+        def brief(o: dict) -> dict:
+            return {
+                "t0": o["t0"],
+                "t1": o["t1"],
+                "count": o["count"],
+                "n": o["n_used"],
+                "partial": bool(o.get("partial")),
+                "tiles": [
+                    {"tile": s["tile"], "conf": s["conf"], "disagree": s["disagree"]}
+                    for s in o["slots"]
+                ],
+            }
+
+        d = self.decoded(hand)
+        turn = next(
+            (
+                x
+                for x in (d or {}).get("turns", [])
+                if x["seat"] == seat and abs(x["t"] - t) < CONTEXT_TURN_WINDOW
+            ),
+            None,
+        )
+        return {
+            "corner": corner,
+            "read_before": [brief(o) for o in obs if o["t1"] <= t + 0.5][-2:],
+            "read_after": [brief(o) for o in obs if o["t0"] >= t - 0.5][:2],
+            "turn": turn,
+        }
+
+    # -- calibration (stage 0) -------------------------------------------------
+
+    def plate(self) -> np.ndarray | None:
+        """Return the prepared median table image, or None when missing or stale.
+
+        Only reads: the plate is (re)built by preparation, never by a request.
+        """
+        try:
+            current = calibfit.plate_current(self.video, self.work)
+        except FileNotFoundError:  # the recording is gone
+            return None
+        return cv2.imread(str(calibfit.plate_path(self.work))) if current else None
 
     def calib(self) -> dict:
-        """Return region quadrilaterals for the calibration editor.
+        """Return region quadrilaterals in frame coordinates for the calibration editor.
 
-        Every region as a quad in frame coordinates, so the page can draw and drag them
-        on the plate.
+        Border checks are included when they were measured on this geometry.
         """
         cal = self.cal
         out = {
@@ -199,20 +586,35 @@ class ReviewState:
             "quad": box_to_quad(cal.derotation(), u.xyxy),
             "rect": [u.x, u.y, u.w, u.h],
         }
-        out["checks"] = self._checks
+        saved = self._load(self.work / BORDER_CHECKS)
+        out["checks"] = (
+            saved["checks"]
+            if isinstance(saved, dict) and saved.get("geometry") == cal.data
+            else {}
+        )
         return out
 
+    def save_checks(self, checks: dict) -> None:
+        """Remember border checks together with the geometry they measured."""
+        atomic_write_json(
+            self.work / BORDER_CHECKS, {"geometry": self.cal.data, "checks": checks}
+        )
+
     def save_calib(self, body: dict) -> dict:
-        """Save changed table regions, preserving the rest of the fit."""
+        """Save changed table regions, preserving the rest of the fit.
+
+        Changing the geometry of an analyzed recording blocks review rebuilds until
+        analysis refreshes the readings.
+        """
+        previous = self.cal.data
         p = fit_path(self.video)
         fit: dict = (
             json.loads(p.read_text(encoding="utf-8"))
             if p.exists()
-            else {"video": self.name, "layout": self.calib_name}
+            else {"video": self.name, "layout": self.layout}
         )
-        for part in ("overhead", "hand", "meld", "cam"):
-            if part not in body:
-                continue
+        parts = [part for part in ("overhead", "hand", "meld", "cam") if part in body]
+        for part in parts:
             if part == "overhead":
                 fit["overhead"] = {
                     **(fit.get("overhead") or {}),
@@ -224,424 +626,102 @@ class ReviewState:
                 for c, v in body[part].items():
                     cur[c] = {**(cur.get(c) or {}), **v, "source": "human"}
                 fit[part] = cur
-        if any(part in body for part in ("overhead", "hand", "meld", "cam")):
+        if parts:
             fit["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             atomic_write_json(p, fit, indent=1)
-        self.reload_calib()
+        self.geometry_saved(previous)
+        return {"fit": self.cal.fit}
+
+    def geometry_saved(self, previous: dict) -> None:
+        """Block review rebuilds of an analyzed recording whose geometry changed."""
+        if self.cal.data != previous and (self.work / "hands.json").exists():
+            (self.work / "calibration.changed").write_text(
+                "Run full analysis to refresh observations after changing geometry.\n",
+                encoding="utf-8",
+            )
+
+    # -- evidence --------------------------------------------------------------
+
+    def frame(self, t: float) -> np.ndarray:
+        """Seek a normalized BGR frame, reusing recent evidence requests."""
+        t = round(float(t), 2)
+        with self.lock:
+            cached = self._frames.get(t)
+        if cached is not None:
+            return cached
+        frame = video.frame_at(self.video, t)
+        with self.lock:
+            if len(self._frames) >= FRAME_CACHE_LIMIT:
+                self._frames.clear()
+            self._frames[t] = frame
+        return frame
+
+    @property
+    def models_loaded(self) -> bool:
+        """Report whether this review state owns inference models."""
+        return self._models is not None
+
+    def models(self) -> tuple[detector.Detector, Classifier]:
+        """Load detector/classifier lazily for label prefill, once per state.
+
+        Prefill boxes are suggestions, never cached evidence, so the detector runs
+        eagerly: CUDA graphs would keep one model per crop shape until the project
+        closes.
+        """
+        with self._model_lock:
+            if self._models is None:
+                from video2tenhou.perception.classifier import (  # noqa: PLC0415
+                    Classifier,
+                )
+
+                eager = detector.InferenceOptions(cuda_graph=False)
+                self._models = (detector.Detector(settings=eager), Classifier())
+            return self._models
+
+    def render(self, t: float, region: str, scale: float = 1.0) -> bytes:
+        """Render a frame or calibrated upright region as JPEG evidence."""
+        cal = self.cal
+        if (
+            region not in ["frame", *cal.regions()]
+            or not MIN_PREVIEW_SCALE <= scale <= MAX_PREVIEW_SCALE
+        ):
+            raise ValueError("Unknown region or unsupported image scale.")
+        img = self.frame(t)
+        if region != "frame":
+            kind, _, corner = region.partition(":")
+            img, _ = region_upright(img, cal, kind, corner)
+        if scale != 1.0:
+            img = cv2.resize(
+                img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+            )
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if not ok:
+            raise OSError("Could not encode the evidence image")
+        return buf.tobytes()
+
+    def read(self, t: float, region: str) -> dict:
+        """Prefill editable boxes with model predictions and region coordinates."""
+        det, clf = self.models()
+        kind, _, corner = region.partition(":")
+        img, _ = region_upright(self.frame(t), self.cal, kind, corner)
+        rd = read_region(img, region, det, clf, t=t)
         return {
-            "saved": str(p),
-            "fit": self.cal.fit,
-        }
-
-    def start_job(
-        self,
-        key: str | int,
-        fn: Callable[[], object],
-        *,
-        hands: list[int] | None = None,
-    ) -> dict:
-        """Run one review operation in the background and expose its failure."""
-        with self.lock:
-            if self.processes.closing:
-                msg = "The app is closing. Restart it to continue."
-                raise ValueError(msg)
-            st = self.jobs.get(key)
-            if st and st.get("running"):
-                return st
-            if any(j.get("running") for j in self.jobs.values()):
-                msg = "Another review job is running. Wait for it to finish."
-                raise ValueError(msg)
-            st = {
-                "key": key,
-                "running": True,
-                "started": time.time(),
-                "done": None,
-                "error": None,
-                "result": None,
-            }
-            if hands is not None:
-                st["hands"] = list(hands)
-            self.jobs[key] = st
-
-        def run() -> None:
-            try:
-                st["result"] = fn()
-            except Exception as e:
-                LOGGER.exception("Review job %s failed", key)
-                st["error"] = str(e)
-            st["running"] = False
-            st["done"] = time.time()
-
-        thread = threading.Thread(target=run, daemon=True)
-        self._threads.append(thread)
-        thread.start()
-        return st
-
-    def run_calib_fit(self) -> dict:
-        """Refit measured geometry while preserving manual rectangles.
-
-        Re-measure this video's geometry. Rectangles a person drew here are marked
-        `human` and kept.
-        """
-        result = self.processes.run(
-            [
-                sys.executable,
-                "-u",
-                "-m",
-                "video2tenhou.cli",
-                "calib",
-                "fit",
-                str(self.video),
-                "--calib",
-                self.calib_name,
-                "--work",
-                str(self.work.parent),
-                "--out",
-                str(self.work / "calib"),
-            ],
-            env={**os.environ, "PYTHONUTF8": "1"},
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        self.reload_calib()
-        if result.returncode:
-            raise RuntimeError((result.stdout + result.stderr)[-2000:])
-        if self.cal.fit is None:
-            msg = "Calibration fitting completed without producing a fit"
-            raise RuntimeError(msg)
-        return self.cal.fit
-
-    def run_calib_check(self) -> dict[str, dict]:
-        """Check border cuts and retain the results for the UI."""
-        result = self.processes.run(
-            [
-                sys.executable,
-                "-m",
-                "video2tenhou.tool.check_calibration",
-                str(self.video),
-                self.calib_name,
-                str(self.work),
-            ],
-            env={**os.environ, "PYTHONUTF8": "1"},
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if result.returncode:
-            raise RuntimeError((result.stdout + result.stderr)[-2000:])
-        self._checks = json.loads(result.stdout)
-        return self._checks
-
-    def decode_path(self, i: int) -> Path:
-        """Locate a hand's reconstruction within this recording's work directory."""
-        return self.work / "decode" / f"{i:02d}.json"
-
-    def hand_summary(self) -> list[dict]:
-        """Combine hand metadata, open questions and facts awaiting reconstruction."""
-        out = []
-        all_facts = self.all_facts()
-        pending = set(self.pending_rebuilds())
-        for h in self.hands:
-            p = self.decode_path(h["hand"])
-            d = self.review_decode(h["hand"])
-            status = None
-            if d:
-                status = (
-                    "conflict"
-                    if any(i["kind"] == "conflict" for i in d["items"])
-                    else "unresolvable"
-                    if d.get("solver", {}).get("status") == "unsolved"
-                    else ("review" if d["items"] else "complete")
-                )
-            decoded_at = p.stat().st_mtime if p.exists() else None
-            # facts newer than what the last decode used: a job loads the facts when it
-            # starts, not when it ends
-            job = self.jobs.get(h["hand"])
-            cutoff = decoded_at
-            if (
-                decoded_at is not None
-                and job
-                and job.get("started")
-                and job.get("done")
-                and job["done"] >= decoded_at - 1
-            ):
-                cutoff = min(decoded_at, job["started"])
-            newer = sum(
-                1
-                for f in all_facts
-                if f.get("hand") == h["hand"]
-                and cutoff is not None
-                and (f.get("ts") or 0) > cutoff
-            )
-            decoded_at = cutoff
-            out.append(
+            "size": list(rd.size),
+            "boxes": [
                 {
-                    **h,
-                    "status": status,
-                    "items": len(d["items"]) if d else None,
-                    "notes": d.get("notes", []) if d else [],
-                    "t_last": d.get("t_last") if d else None,
-                    "decoded_at": decoded_at,
-                    "facts_newer": newer,
-                    "pending_rebuild": h["hand"] in pending,
-                    "job": self.redecode_status(h["hand"]),
-                    "play_window": d.get("play_window") if d else None,
-                    "score": (d["score"] or {}).get("match") if d else None,
-                    "turns": d["stats"]["turns"] if d else None,
+                    "xyxy": [round(v, 1) for v in b.xyxy],
+                    "conf": round(b.conf, 3),
+                    "sideways": b.sideways,
+                    "role": b.role,
+                    "tile": clf.classes[int(np.argmax(b.p))],
+                    "p": round(float(np.max(b.p)), 3),
+                    "row": b.row,
+                    "col": b.col,
+                    "group": b.group,
                 }
-            )
-        return out
-
-    def review_decode(self, hand: int) -> dict | None:
-        """Expose current export failures and notes alongside decoded evidence."""
-        path = self.decode_path(hand)
-        if not path.exists():
-            return None
-        stat = path.stat()
-        key = (stat.st_mtime_ns, stat.st_size)
-        cached = self._review_views.get(hand)
-        if cached and cached[0] == key:
-            return cached[1]
-        decoded = self._read_json(path, dict)
-        if not decoded:
-            return decoded
-        entry = next(h for h in self.hands if h["hand"] == hand)
-        view = review_artifact(decoded, entry)
-        self._review_views[hand] = key, view
-        return view
-
-    def all_items(self) -> list[dict]:
-        """Project review questions with stable indices and certified confidence.
-
-        Review items can omit margin/coverage fields present in their confidence
-        rows. Fill those for navigation without rewriting decoded evidence or
-        using a feasible alternative's gap as a confidence certificate.
-        """
-        out = []
-        for h in self.hands:
-            p = self.decode_path(h["hand"])
-            if not p.exists():
-                continue
-            d = self.review_decode(h["hand"])
-            if d is None:
-                continue
-            for k, it in enumerate(d["items"]):
-                row = dict(it)
-                field = row.get("kind")
-                if field in ("draw", "discard"):
-                    turn = row.get("j")
-                    confidence = next(
-                        (
-                            c
-                            for c in d.get("confidence", [])
-                            if turn is not None
-                            and c.get("field") == field
-                            and c.get("seat") == row.get("seat")
-                            and c.get("turn") == turn
-                        ),
-                        None,
-                    )
-                    if confidence is not None:
-                        row.setdefault("lost", bool(confidence.get("lost")))
-                        if row.get("margin") is None:
-                            row["margin"] = confidence.get("margin")
-                row.update(
-                    {
-                        "hand": h["hand"],
-                        "idx": k,
-                        "kyoku": h["kyoku"],
-                        "honba": h["honba"],
-                        "game": h["game"],
-                    }
-                )
-                out.append(row)
-        return out
-
-    def facts(self, hand: int | None = None) -> list[dict]:
-        """Read human facts, optionally restricted to one game's kyoku and honba."""
-        rows = self.all_facts()
-        if hand is None:
-            return rows
-        e = self.hands[hand]
-        return [
-            r
-            for r in rows
-            if r.get("game") == e["game"]
-            and r.get("kyoku") == e["kyoku"]
-            and r.get("honba") == e["honba"]
-        ]
-
-    @staticmethod
-    def _read_json[Container: (dict, list)](
-        p: Path, kind: type[Container]
-    ) -> Container | None:
-        """Read atomically published review data; absent outputs are not ready yet."""
-        try:
-            value = json.loads(p.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-        if not isinstance(value, kind):
-            message = f"Expected a JSON {kind.__name__} in {p}"
-            raise TypeError(message)
-        return value
-
-    def all_facts(self) -> list[dict]:
-        """Read the append-only human evidence file for this recording."""
-        return load_facts(self.labels)
-
-    def _review_changes(self) -> dict:
-        return self._read_json(self.work / "review-changes.json", dict) or {
-            "changes": {},
-            "rebuilds": {},
+                for b in rd.boxes
+            ],
         }
-
-    def _save_review_changes(self, data: dict) -> None:
-        path = self.work / "review-changes.json"
-        atomic_write_json(path, data, sort_keys=True)
-
-    def _fact_hand(self, fact: dict) -> int | None:
-        if all(key in fact for key in ("game", "kyoku", "honba")):
-            return next(
-                (
-                    h["hand"]
-                    for h in self.hands
-                    if all(h[key] == fact[key] for key in ("game", "kyoku", "honba"))
-                ),
-                None,
-            )
-        return next(
-            (h["hand"] for h in self.hands if h["hand"] == fact.get("hand")), None
-        )
-
-    def _mark_review_changes(self, hands: Iterable[int], changed_at: float) -> None:
-        # Caller holds self.lock: additions and deletions share one atomic ledger.
-        data = self._review_changes()
-        for hand in hands:
-            key = str(hand)
-            data["changes"][key] = max(changed_at, data["changes"].get(key, 0))
-        self._save_review_changes(data)
-
-    def _output_times(self, hand: dict) -> list[int]:
-        paths = (self.decode_path(hand["hand"]), self.out / f"g{hand['game']}.json")
-        return [p.stat().st_mtime_ns if p.exists() else 0 for p in paths]
-
-    def pending_rebuilds(self) -> list[int]:
-        """Return hands with saved corrections absent from reconstructed exports.
-
-        Both the hand decode and its game's JSON must postdate the correction.
-        Deletions are retained in a local ledger because the removed fact can
-        no longer carry its timestamp. Review rebuild receipts cap freshness at
-        job start, including after restart: an edit made during a rebuild must
-        survive its later output writes. A later external rebuild supersedes a
-        receipt when it replaces that hand's decode and game export.
-        """
-        with self.lock:
-            data = self._review_changes()
-            changes = dict(data["changes"])
-            for fact in self.all_facts():
-                hand = self._fact_hand(fact)
-                if hand is not None:
-                    key = str(hand)
-                    changes[key] = max(changes.get(key, 0), fact.get("ts") or 0)
-            pending = []
-            for hand in self.hands:
-                i = hand["hand"]
-                changed = changes.get(str(i), 0)
-                if not changed:
-                    continue
-                times = self._output_times(hand)
-                cutoff = min(times) / 1e9
-                receipt = data["rebuilds"].get(str(i))
-                if receipt and (
-                    times[0] == receipt["outputs"][0]
-                    or times[1] == receipt["outputs"][1]
-                ):
-                    cutoff = min(
-                        cutoff, receipt["started"] if receipt["success"] else 0
-                    )
-                for key in (i, "decode_all", "decode_pending"):
-                    job = self.jobs.get(key)
-                    if (
-                        job
-                        and job.get("running")
-                        and ("hands" not in job or i in job["hands"])
-                    ):
-                        cutoff = min(cutoff, job["started"])
-                if changed > cutoff:
-                    pending.append(i)
-            return sorted(pending)
-
-    def add_fact(self, f: dict) -> dict:
-        """Append a review answer with game identity, mapped corner and timestamp."""
-        e = self.hands[int(f["hand"])]
-        row = {
-            **f,
-            "game": e["game"],
-            "kyoku": e["kyoku"],
-            "honba": e["honba"],
-            "hand": e["hand"],
-            "author": "tool",
-            "ts": time.time(),
-        }
-        if row.get("seat") and "corner" not in row:
-            corner = next(
-                (c for c, s in e["corner_wind"].items() if s == row["seat"]), None
-            )
-            if corner is None:
-                msg = f"seat {row['seat']} is not at this table"
-                raise ValueError(msg)
-            row["corner"] = corner
-        with self.lock:
-            row["ts"] = time.time()
-            self._mark_review_changes([e["hand"]], row["ts"])
-            path = self.labels / "facts.jsonl"
-            previous = path.read_text(encoding="utf-8") if path.exists() else ""
-            if previous and not previous.endswith("\n"):
-                previous += "\n"
-            # The decoder reads in another process. Publish a complete journal
-            # so an answer arriving mid-read cannot expose a partial JSON line.
-            atomic_write_text(
-                path,
-                previous + json.dumps(row, ensure_ascii=False) + "\n",
-                retry_windows=True,
-            )
-        return row
-
-    def delete_fact(self, ts: float) -> int:
-        """Remove an answer by its timestamp; the next rebuild reopens its question."""
-        p = self.labels / "facts.jsonl"
-        with self.lock:
-            rows = (
-                [
-                    line
-                    for line in p.read_text(encoding="utf-8").splitlines(keepends=True)
-                    if line.strip()
-                ]
-                if p.exists()
-                else []
-            )
-            keep = [
-                line
-                for line in rows
-                if abs(float(json.loads(line).get("ts") or -1) - ts)
-                > FACT_TIMESTAMP_TOLERANCE
-            ]
-            removed = [
-                self._fact_hand(json.loads(line)) for line in rows if line not in keep
-            ]
-            if removed:
-                self._mark_review_changes(
-                    [i for i in removed if i is not None], time.time()
-                )
-            atomic_write_text(
-                p,
-                "".join(keep) + ("\n" if keep and not keep[-1].endswith("\n") else ""),
-                retry_windows=True,
-            )
-        return len(rows) - len(keep)
 
     def save_label(self, lab: dict) -> Path:
         """Store region-space tile boxes as frame-coordinate training labels."""
@@ -671,126 +751,38 @@ class ReviewState:
         if p.exists():
             old = json.loads(p.read_text(encoding="utf-8"))
             bak = p.with_suffix(".orig.json")
+            # keep the human label once
             if old.get("source") != "tool" and not bak.exists():
                 bak.write_text(
                     json.dumps(old, ensure_ascii=False, indent=1), encoding="utf-8"
-                )  # keep the human label once
+                )
         atomic_write_json(p, out, indent=1)
         return p
 
-    def render(self, t: float, region: str, scale: float = 1.0) -> bytes:
-        """Render a frame or calibrated upright region as JPEG evidence."""
-        if (
-            region not in ["frame", *self.cal.regions()]
-            or not MIN_PREVIEW_SCALE <= scale <= MAX_PREVIEW_SCALE
-        ):
-            msg = "Unknown region or unsupported image scale."
-            raise ValueError(msg)
-
-        frame = self.frame(t)
-        if region == "frame":
-            img = frame
-        else:
-            kind, _, corner = region.partition(":")
-            img, _ = region_upright(frame, self.cal, kind, corner)
-        if scale != 1.0:
-            img = cv2.resize(
-                img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
-            )
-        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
-        if not ok:
-            msg = "Could not encode the evidence image"
-            raise OSError(msg)
-        return buf.tobytes()
-
-    def read(self, t: float, region: str) -> dict:
-        """Prefill editable boxes with model predictions and region coordinates."""
-        det, clf = self.models()
-        kind, _, corner = region.partition(":")
-        frame = self.frame(t)
-        img, _ = region_upright(frame, self.cal, kind, corner)
-        rd = read_region(img, region, det, clf, t=t)
-        return {
-            "size": list(rd.size),
-            "boxes": [
-                {
-                    "xyxy": [round(v, 1) for v in b.xyxy],
-                    "conf": round(b.conf, 3),
-                    "sideways": b.sideways,
-                    "role": b.role,
-                    "tile": clf.classes[int(np.argmax(b.p))],
-                    "p": round(float(np.max(b.p)), 3),
-                    "row": b.row,
-                    "col": b.col,
-                    "group": b.group,
-                }
-                for b in rd.boxes
-            ],
-        }
-
     def clip(self, t0: float, t1: float, region: str) -> Path:
-        """Cache an MP4 of a camera region over the requested time interval.
+        """Return an MP4 of a camera region between t0 and t1, encoding it once.
 
-        An mp4 of one camera (or the whole frame) between t0 and t1, cached under
-        work/<video>/clips.
+        Clips are cached under work/<video>/clips with the geometry and source
+        identity in their names; an encode publishes only a complete file.
         """
-        if region not in ["frame", *self.cal.regions()]:
-            msg = "Unknown video region."
-            raise ValueError(msg)
-
-        d = self.work / "clips"
-        d.mkdir(parents=True, exist_ok=True)
+        cal = self.cal
+        if region not in ["frame", *cal.regions()]:
+            raise ValueError("Unknown video region.")
         t0, t1 = max(0.0, t0), max(t0 + 1.0, t1)
-
         geometry = hashlib.sha256(
-            json.dumps(
-                [self.cal.data, source_identity(self.video)], sort_keys=True
-            ).encode()
+            json.dumps([cal.data, source_identity(self.video)], sort_keys=True).encode()
         ).hexdigest()[:12]
-        p = d / f"{geometry}_{region.replace(':', '_')}_{t0:.1f}_{t1:.1f}.mp4"
-        if p.exists():
-            return p
-        kind, _, corner = region.partition(":")
-        # the same geometry as the still images (layout.Calibration.transform):
-        # de-rotate the table, cut the
-        # region, turn it upright, scale. ffmpeg's rotate turns clockwise, OpenCV's
-        # counter-clockwise.
-
-        if kind in ("hand", "meld", "cam"):
-            rect, scale = (
-                self.cal.hand[corner]
-                if kind == "hand"
-                else self.cal.meld[corner]
-                if kind == "meld"
-                else (self.cal.cam[corner], 1.0)
-            )
-            vf = f"crop={rect.w}:{rect.h}:{rect.x}:{rect.y}"
-            if scale and abs(scale - 1.0) > SCALE_CHANGE_TOLERANCE:
-                vf += f",scale=iw*{scale:g}:ih*{scale:g}"
-            roll = self.cal.roll(corner) if kind == "hand" else 0.0
-            if abs(roll) > MIN_ROLL_CORRECTION:
-                vf += (
-                    f",rotate={-roll * math.pi / 180:.5f}:ow=rotw("
-                    f"{-roll * math.pi / 180:.5f}):oh=roth("
-                    f"{-roll * math.pi / 180:.5f}):c=black"
-                )
-        elif kind in ("pond", "overhead"):
-            cx, cy, side = self.cal.center[0], self.cal.center[1], self.cal.side
-            vf = (
-                f"rotate={-self.cal.angle * math.pi / 180:.5f}:ow=iw:oh=ih:c=black,"
-                f"crop={side}:{side}:{cx - side / 2:.0f}:{cy - side / 2:.0f}"
-            )
-            if kind == "pond":
-                rect, k, scale = self.cal.pond[corner]
-                vf += f",crop={rect.w}:{rect.h}:{rect.x}:{rect.y}" + ",transpose=1" * (
-                    k % 4
-                )
-                if scale and abs(scale - 1.0) > SCALE_CHANGE_TOLERANCE:
-                    vf += f",scale=iw*{scale:g}:ih*{scale:g}"
-        else:
-            vf = "scale=960:-2"
+        path = (
+            self.work
+            / "clips"
+            / f"{geometry}_{region.replace(':', '_')}_{t0:.1f}_{t1:.1f}.mp4"
+        )
+        if path.exists():
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pending = path.with_name(f".{path.stem}.{uuid.uuid4().hex[:8]}.mp4")
         cmd = [
-            "ffmpeg",
+            executable("ffmpeg"),
             "-v",
             "error",
             "-nostdin",
@@ -801,7 +793,7 @@ class ReviewState:
             "-t",
             f"{t1 - t0:.2f}",
             "-vf",
-            vf + ",scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            _clip_filter(cal, region) + ",scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-r",
             "10",
             "-an",
@@ -816,229 +808,56 @@ class ReviewState:
             "-movflags",
             "+faststart",
             "-y",
-            str(p),
+            str(pending),
         ]
-        self.processes.run(cmd, check=True, capture_output=True)
-        return p
-
-    def context(self, hand: int, seat: str, t: float) -> dict:
-        """Collect nearby hand observations and reconstruction evidence.
-
-        What the camera read around time t (the seat's hand observations before and
-        after) and what the reconstruction assumes (hand before / after the turn at t).
-        """
-        e = self.hands[hand]
-        corner = next(c for c, s in e["corner_wind"].items() if s == seat)
-        obs = load_obs(self.work, hand).get(f"hand:{corner}", [])
-
-        def brief(o: dict) -> dict:
-            return {
-                "t0": o["t0"],
-                "t1": o["t1"],
-                "count": o["count"],
-                "n": o["n_used"],
-                "partial": bool(o.get("partial")),
-                "tiles": [
-                    {"tile": s["tile"], "conf": s["conf"], "disagree": s["disagree"]}
-                    for s in o["slots"]
-                ],
-            }
-
-        before = [brief(o) for o in obs if o["t1"] <= t + 0.5][-2:]
-        after = [brief(o) for o in obs if o["t0"] >= t - 0.5][:2]
-        p = self.decode_path(hand)
-        turn = None
-        if p.exists():
-            d = json.loads(p.read_text(encoding="utf-8"))
-            turn = next(
-                (
-                    x
-                    for x in d["turns"]
-                    if x["seat"] == seat and abs(x["t"] - t) < CONTEXT_TURN_WINDOW
-                ),
-                None,
-            )
-        return {
-            "corner": corner,
-            "read_before": before,
-            "read_after": after,
-            "turn": turn,
-        }
-
-    def start_redecode(self, i: int) -> dict:
-        """Start a hand rebuild in a fresh background process.
-
-        Start the re-decode of hand i in a background thread (fresh process); returns
-        its status.
-        """
-        return self.start_job(i, lambda: self._run_decode(str(i)))
-
-    def redecode_status(self, i: int) -> dict:
-        """Return a hand job's current state, including its last error."""
-        return self.jobs.get(i) or {
-            "key": i,
-            "running": False,
-            "started": None,
-            "done": None,
-            "error": None,
-            "result": None,
-        }
-
-    def start_redecode_all(self) -> dict:
-        """Rebuild every hand with saved facts in a background process.
-
-        Re-decode every hand with the facts saved so far, in the background (one fresh
-        process).
-        """
-        return self.start_job("decode_all", lambda: self._run_decode("all"))
-
-    def start_redecode_pending(self) -> dict:
-        """Rebuild the server's pending corrections in one child process.
-
-        Rebuild the server's pending corrections in one child, without client-selected
-        IDs.
-
-        The job retains its selected hands for progress and freshness receipts. A
-        no-change request is a no-op; completed hands are never forced merely because
-        another hand has a new or deleted answer.
-        """
-        selected = self.pending_rebuilds()
-        if not selected:
-            return self.redecode_pending_status()
-        self.start_job(
-            "decode_pending",
-            lambda: self._run_decode(
-                ",".join(map(str, selected)), job_key="decode_pending"
-            ),
-            hands=selected,
-        )
-        return self.redecode_pending_status()
-
-    def redecode_pending_status(self) -> dict:
-        """Report the pending-only job and corrections still absent from exports."""
-        st: dict = dict(
-            self.jobs.get("decode_pending")
-            or {
-                "key": "decode_pending",
-                "running": False,
-                "started": None,
-                "done": None,
-                "error": None,
-                "hands": [],
-            }
-        )
-        selected = st.get("hands", [])
-        done = sum(
-            1
-            for i in selected
-            if st.get("started")
-            and self.decode_path(i).exists()
-            and self.decode_path(i).stat().st_mtime >= st["started"]
-        )
-        return {
-            **st,
-            "hands_done": done,
-            "hands_total": len(selected),
-            "pending": self.pending_rebuilds(),
-        }
-
-    def redecode_all_status(self) -> dict:
-        """Report decode-job status and the count of rewritten hands.
-
-        The job's status, with how many hands were decoded since it started (the decode
-        files it rewrote).
-        """
-        st: dict = dict(
-            self.jobs.get("decode_all")
-            or {
-                "key": "decode_all",
-                "running": False,
-                "started": None,
-                "done": None,
-                "error": None,
-            }
-        )
-        done = 0
-        if st.get("started"):
-            done = sum(
-                1
-                for h in self.hands
-                if self.decode_path(h["hand"]).exists()
-                and self.decode_path(h["hand"]).stat().st_mtime >= st["started"]
-            )
-        return {**st, "hands_done": done, "hands_total": len(self.hands)}
-
-    def _run_decode(self, which: str, *, job_key: str | int | None = None) -> None:
-        """Decode selected hands in a fresh process using the current engine.
-
-        Decode selected comma-separated hand IDs or "all" in a fresh process, so engine
-        code on disk runs (the server may have been up for hours).
-        """
-        selected = (
-            None if which == "all" else {int(value) for value in which.split(",")}
-        )
-        if selected is not None and not selected <= {h["hand"] for h in self.hands}:
-            msg = "Unknown hand selected for rebuilding."
-            raise ValueError(msg)
-        if any(
-            (self.work / marker).exists()
-            for marker in ("calibration.changed", "inputs.changed")
-        ):
-            msg = (
-                "The table geometry or project settings changed. Close this view "
-                "and choose Analyze recording to refresh readings and alignment "
-                "before rebuilding logs."
-            )
-            raise ValueError(msg)
-        with self.lock:
-            started = time.time()
-            key = (
-                job_key
-                if job_key is not None
-                else ("decode_all" if which == "all" else int(which))
-            )
-            job = self.jobs.get(key)
-            if job and job.get("running"):
-                started = min(started, job["started"])
-        success = False
         try:
-            r = self.processes.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "video2tenhou.tool.rebuild",
-                    str(self.work),
-                    which,
-                    str(self.video),
-                    self.calib_name,
-                    str(self.out),
-                ],
-                env={**os.environ, "PYTHONUTF8": "1"},
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            if r.returncode != 0:
-                raise RuntimeError("re-decode failed: " + (r.stderr or "")[-800:])
-            success = True
+            with self.processes.spawn(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            ) as process:
+                _, errors = process.communicate()
+            if process.returncode:
+                LOGGER.error("Evidence clip encoding failed: %s", errors.strip())
+                raise OSError("Could not encode this evidence clip.")
+            pending.replace(path)
         finally:
-            with self.lock:
-                data = self._review_changes()
-                for hand in self.hands:
-                    if selected is None or hand["hand"] in selected:
-                        data["rebuilds"][str(hand["hand"])] = {
-                            "started": started,
-                            "success": success,
-                            "outputs": self._output_times(hand),
-                        }
-                self._save_review_changes(data)
+            pending.unlink(missing_ok=True)
+        return path
 
     def close(self) -> None:
-        """Stop child processes and release this state's inference models."""
-        self.processes.shutdown()
-        for thread in self._threads:
-            if thread is not threading.current_thread():
-                thread.join(timeout=5)
-        with self.lock:
-            self._models = None
+        """Release this state's inference models without waiting for a load."""
+        self._models = None
+
+
+def _clip_filter(cal: Calibration, region: str) -> str:
+    """Build the ffmpeg filter matching layout.Calibration.transform for a region.
+
+    De-rotate the table, cut the region, turn it upright and scale. ffmpeg's
+    rotate turns clockwise, OpenCV's counter-clockwise.
+    """
+    kind, _, corner = region.partition(":")
+    if kind in ("hand", "meld", "cam"):
+        rect, scale = cal.panel(region)
+        vf = f"crop={rect.w}:{rect.h}:{rect.x}:{rect.y}"
+        if scale and abs(scale - 1.0) > SCALE_CHANGE_TOLERANCE:
+            vf += f",scale=iw*{scale:g}:ih*{scale:g}"
+        roll = cal.roll(corner) if kind == "hand" else 0.0
+        if abs(roll) > MIN_ROLL_CORRECTION:
+            angle = -roll * math.pi / 180
+            vf += f",rotate={angle:.5f}:ow=rotw({angle:.5f}):oh=roth({angle:.5f})"
+            vf += ":c=black"
+        return vf
+    if kind in ("pond", "overhead"):
+        cx, cy, side = cal.center[0], cal.center[1], cal.side
+        vf = (
+            f"rotate={-cal.angle * math.pi / 180:.5f}:ow=iw:oh=ih:c=black,"
+            f"crop={side}:{side}:{cx - side / 2:.0f}:{cy - side / 2:.0f}"
+        )
+        if kind == "pond":
+            rect, k, scale = cal.pond[corner]
+            vf += f",crop={rect.w}:{rect.h}:{rect.x}:{rect.y}" + ",transpose=1" * (
+                k % 4
+            )
+            if scale and abs(scale - 1.0) > SCALE_CHANGE_TOLERANCE:
+                vf += f",scale=iw*{scale:g}:ih*{scale:g}"
+        return vf
+    return "scale=960:-2"

@@ -21,8 +21,7 @@ def check(wheel: Path) -> None:
                 name.startswith(("labels/", "work/", "models/", "out/"))
                 for name in names
             ):
-                msg = "Wheel contains private workspace data"
-                raise ValueError(msg)
+                raise ValueError("Wheel contains private workspace data")
             archive.extractall(root)
         script = """
 import os, sys

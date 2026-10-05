@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, provide, ref, watch } from "vue";
-import type { Job } from "../types";
 import { reviewKey } from "./context";
 import { useReviewState } from "./useReviewState";
-import { usePolling } from "../shared/usePolling";
+import { useJob } from "../shared/useJob";
+import { errorText } from "../shared/useAction";
+import { time } from "./format";
 import CalibrationEditor from "./CalibrationEditor.vue";
 import QuestionPanel from "./QuestionPanel.vue";
 import HandsPanel from "./HandsPanel.vue";
@@ -14,20 +15,18 @@ const props = defineProps({
   active: { type: Boolean, default: true },
 });
 const emit = defineEmits(["dirty", "results"]);
-const review = useReviewState(`/review/${props.projectId}`);
-const questionCount = computed(() => review.decisions.value.length);
+const status = useJob();
+const review = useReviewState(props.projectId, status);
 provide(reviewKey, review);
 const root = ref<HTMLElement | null>(null);
-const now = ref(Date.now());
 const elapsed = computed(() => {
-  const started = review.job.value.started;
-  if (!started) return "";
-  const seconds = Math.max(0, Math.floor(now.value / 1000 - started));
-  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  const job = review.job.value;
+  return job?.running ? time(status.now.value / 1000 - job.started) : "";
 });
-usePolling(() => {
-  now.value = Date.now();
-}, 1000);
+const updatingHands = computed(() => {
+  const numbers = review.pending.value.map((hand) => hand + 1);
+  return `${numbers.length === 1 ? "hand" : "hands"} ${numbers.join(", ")}`;
+});
 const view = ref(props.calibration ? "calib" : "questions"),
   hand = ref<number | null>(null),
   calibrationDirty = ref(false),
@@ -58,12 +57,7 @@ function go(next: string) {
   }
   view.value = next;
   review.message.value = "";
-  if (
-    next === "questions" &&
-    review.pending.value.length &&
-    !review.updating.value
-  )
-    review.rebuild();
+  if (next === "questions") review.maybeStart();
 }
 function dirty(value: boolean) {
   calibrationDirty.value = value;
@@ -73,25 +67,12 @@ function inspect(value: number | null) {
   hand.value = value;
   go("hands");
 }
-usePolling(review.poll, 5000, false);
 onMounted(async () => {
   try {
     await review.refresh();
-    if (review.job.value.running) await review.rebuild("decode_pending", true);
-    else {
-      const all = await review.api<Job>("decode_all", undefined, {
-        jobStatus: true,
-      });
-      if (all.running) await review.rebuild("decode_all", true);
-      else if (
-        review.guided.value &&
-        review.pending.value.length &&
-        !review.error.value
-      )
-        await review.rebuild();
-    }
+    review.maybeStart();
   } catch (error) {
-    review.error.value = error instanceof Error ? error.message : String(error);
+    review.error.value = errorText(error);
   } finally {
     loaded.value = true;
   }
@@ -100,22 +81,9 @@ onMounted(async () => {
 <template>
   <div ref="root" class="review-workspace">
     <header v-if="!calibration" class="review-heading">
-      <div>
-        <h2>
-          {{
-            view === "questions"
-              ? "Answer uncertain questions"
-              : "Advanced review"
-          }}
-        </h2>
-        <p v-if="view === 'questions'">
-          Most uncertain first. Answers update in the background; keep reviewing
-          other hands while related questions are recalculated.
-        </p>
-        <p v-else>
-          Inspect any hand and every action. Optional for normal review.
-        </p>
-      </div>
+      <h2>
+        {{ view === "questions" ? "Review questions" : "Advanced review" }}
+      </h2>
       <button
         v-if="view === 'questions'"
         :disabled="review.saving.value"
@@ -129,126 +97,60 @@ onMounted(async () => {
     </header>
     <p v-if="review.error.value" class="banner" role="alert">
       {{ review.error.value }}
+      <button
+        v-if="review.pending.value.length && !review.busy.value"
+        @click="review.rebuild()"
+      >
+        Retry update
+      </button>
     </p>
     <p v-if="review.message.value" role="status">{{ review.message.value }}</p>
     <p
       v-if="review.updates.value && !review.updating.value"
       class="banner update-notice"
     >
-      Updated results available.
-      <button @click="review.refresh()">Load updates</button>
+      Updated results are available.
+      <button @click="review.refresh(true)">Load updates</button>
     </p>
     <template v-if="view === 'questions'">
-      <section
-        v-if="!loaded || review.requesting.value || review.job.value.running"
+      <p v-if="!loaded" role="status">Loading review…</p>
+      <p
+        v-else-if="review.updating.value || review.requesting.value"
         class="review-progress"
         role="status"
       >
-        <h3>
-          {{
-            !loaded
-              ? "Loading review…"
-              : "Updating answered hands in the background"
-          }}
-        </h3>
-        <template v-if="loaded">
-          <p v-if="review.job.value.running">
-            You can answer questions from other hands below. Further questions
-            from an answered hand wait for its updated result.
-          </p>
-          <p v-else>Checking the updated record…</p>
-          <p
-            v-if="review.job.value.hands_total || elapsed"
-            class="update-progress"
-          >
-            <span v-if="review.job.value.hands_total"
-              >{{ review.job.value.hands_done || 0 }} of
-              {{ review.job.value.hands_total }} hands reconstructed</span
-            >
-            <span v-if="elapsed">Elapsed {{ elapsed }}</span>
-          </p>
-          <progress
-            v-if="review.job.value.running && review.job.value.hands_total"
-            aria-label="Hands reconstructed"
-            :value="review.job.value.hands_done || 0"
-            :max="review.job.value.hands_total"
-          />
-          <p
-            v-if="
-              review.job.value.running &&
-              review.job.value.hands_total &&
-              review.job.value.hands_done === review.job.value.hands_total
-            "
-          >
-            All selected hands are reconstructed. Finishing the record and
-            exports…
-          </p>
-        </template>
-      </section>
-      <section
-        v-if="
-          loaded &&
-          review.pending.value.length &&
-          !review.job.value.running &&
-          !review.requesting.value &&
-          review.error.value
-        "
-        class="review-progress"
-      >
-        <h3>Your saved answers still need to be applied</h3>
-        <p>
-          Answers are saved. Retry the update; other hands remain available
-          below.
-        </p>
-        <button class="primary" @click="review.rebuild()">Retry update</button>
-      </section>
+        Updating {{ updatingHands }}…
+        <span v-if="elapsed" class="update-progress">{{ elapsed }}</span>
+      </p>
       <template v-if="loaded && review.selection.value">
-        <p v-if="questionCount" class="question-count">
-          {{ questionCount }}
-          {{ questionCount === 1 ? "question" : "questions" }}
-          identified · answers may resolve several
+        <p class="question-count">
+          {{ review.questions.value.length }}
+          {{ review.questions.value.length === 1 ? "question" : "questions" }}
         </p>
         <fieldset class="question-content" :disabled="review.saving.value">
-          <QuestionPanel @inspect="inspect" />
+          <QuestionPanel />
         </fieldset>
       </template>
       <section
-        v-else-if="loaded && review.skipped.value.length"
+        v-else-if="loaded && review.deferred.value.length"
         class="review-progress"
       >
         <h3>
-          {{ review.skipped.value.length }}
-          {{ review.skipped.value.length === 1 ? "question" : "questions" }}
-          left for later
+          {{ review.deferred.value.length }} skipped
+          {{ review.deferred.value.length === 1 ? "question" : "questions" }}
         </h3>
-        <p>Skipped questions are still unresolved.</p>
         <button class="primary" @click="review.revisit">
           Return to skipped questions
         </button>
       </section>
-      <section
-        v-else-if="
-          loaded &&
-          (review.pending.value.length ||
-            review.job.value.running ||
-            review.requesting.value)
-        "
-        class="review-progress"
-      >
-        <p>
-          The remaining questions depend on hands being updated. They will
-          appear automatically when ready.
-        </p>
-      </section>
+      <p v-else-if="loaded && review.waiting.value" class="review-progress">
+        More questions may follow after updating {{ updatingHands }}.
+      </p>
       <section
         v-else-if="loaded && !review.error.value && review.hands.value.length"
         class="review-progress"
       >
         <h3>No more questions</h3>
-        <p>
-          No unresolved questions remain in the current reconstruction. Open the
-          results to check or download the record.
-        </p>
         <button class="primary" @click="emit('results')">Open results</button>
       </section>
       <p v-else-if="loaded && !review.error.value">
@@ -257,26 +159,22 @@ onMounted(async () => {
     </template>
     <template v-else-if="view === 'hands' || view === 'label'">
       <div class="actions">
-        <button v-if="view === 'label'" @click="go('hands')">
-          Inspect hands
-        </button>
+        <button v-if="view === 'label'" @click="go('hands')">All hands</button>
         <button
           v-if="review.pending.value.length || review.updating.value"
-          :disabled="review.updating.value"
+          :disabled="review.busy.value || review.requesting.value"
           @click="review.rebuild()"
         >
           {{
-            review.updating.value
-              ? "Updating the record…"
-              : "Apply saved changes"
+            review.updating.value ? "Updating hands…" : "Apply saved changes"
           }}
         </button>
         <details>
           <summary>Tools</summary>
           <button @click="go('label')">Label tiles for training</button>
           <button
-            :disabled="review.updating.value"
-            @click="review.rebuild('decode_all')"
+            :disabled="review.busy.value || review.requesting.value"
+            @click="review.rebuild('all')"
           >
             Rebuild all hands
           </button>
@@ -284,7 +182,6 @@ onMounted(async () => {
       </div>
       <HandsPanel
         v-if="view === 'hands'"
-        :key="review.revision.value"
         :hand="hand"
         @select="hand = $event"
       />

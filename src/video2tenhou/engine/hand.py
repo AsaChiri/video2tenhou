@@ -33,11 +33,7 @@ def site_seat(name: None, entry: dict) -> None: ...
 
 
 def site_seat(name: str | None, entry: dict) -> str | None:
-    """Map a site's starting-seat name to the wind held in this hand.
-
-    This hand's wind of the player the site record names (EAST..NORTH, the winds of the
-    first hand).
-    """
+    """Map a site's starting-seat name (EAST..NORTH) to the wind held in this hand."""
     if name is None:
         return None
     corner = next(c for c, n in entry["corner_site"].items() if n == name)
@@ -45,20 +41,15 @@ def site_seat(name: str | None, entry: dict) -> str | None:
 
 
 def site_seat_name(seat: str, entry: dict) -> str:
-    """Map a hand's wind to the site's starting-seat name.
-
-    The site record's name (EAST..NORTH) for the player who holds this wind in this
-    hand.
-    """
+    """Map a hand's wind to the site's starting-seat name (EAST..NORTH)."""
     return entry["corner_site"][corner_of(entry, seat)]
 
 
 def in_window(obs: list[dict], t0: float, t1: float) -> list[dict]:
-    """Select observations within the hand's clearing and play window.
+    """Select the observations of the hand's window.
 
-    The observations of the hand's window. The window starts with the clearing of the
-    previous hand (`ponds.play_window`): a view that began before it shows that hand's
-    tiles, or what the push left.
+    The window starts with the clearing of the previous hand (`ponds.play_window`): a
+    view that began before it shows that hand's tiles, or what the push left.
     """
     return [o for o in obs if t0 < o["t0"] <= t1]
 
@@ -68,11 +59,11 @@ MELD_LOOK = 30.0
 
 
 def melds_shown(obs: dict, entry: dict, seat: str, lo: float, hi: float) -> int | None:
-    """Infer the number of laid melds from the observed resting hand size.
+    """Infer how many melds (chi, pon, kan) were laid from the resting hand size.
 
-    How many melds (chi, pon, kan) the seat's hand camera says were laid by then: a
-    resting hand of 13, 10, 7 ... tiles (14, 11, 8 ... just after a draw) is 0, 1, 2 ...
-    melds. The most frequent over the full views in [lo, hi]; None when there is none.
+    A resting hand of 13, 10, 7 ... tiles (14, 11, 8 ... just after a draw) is 0, 1,
+    2 ... melds. The most frequent over the full views in [lo, hi]; None when there is
+    none.
     """
     if not obs:
         return None

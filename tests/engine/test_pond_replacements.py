@@ -3,11 +3,13 @@
 
 """Contradictory terminal readings remain reviewable without invented turns."""
 
+from __future__ import annotations
+
 from copy import deepcopy
 
 import numpy as np
 
-from tests.engine.helpers import obs, row
+from tests.builders import obs, row
 from video2tenhou.engine.melds import Call
 from video2tenhou.engine.pond_evidence import (
     consume_replacement,
@@ -18,18 +20,18 @@ from video2tenhou.engine.ponds import PondSlot, track_pond
 from video2tenhou.engine.turns import Turn
 
 
-def sequence() -> "list[dict]":
+def sequence() -> list[dict]:
     """Create a stable pond followed by a conflicting terminal tile reading."""
     return [obs(0, 2, row(["2p", "7m"])), obs(5, 6, row(["2p", "1m"]))]
 
 
 def requests(
-    log: "list[PondSlot]",
+    log: list[PondSlot],
     *,
-    call: "Call | None" = None,
-    facts: "dict | None" = None,
+    call: Call | None = None,
+    facts: dict | None = None,
     end: int = 6,
-) -> "list[dict]":
+) -> list[dict]:
     """Plan replacement acquisitions for a synthetic sequence of pond turns."""
     turns = [Turn(i, "N", "draw", s, s.t_first, call=call) for i, s in enumerate(log)]
     return replacement_requests(
@@ -38,7 +40,6 @@ def requests(
 
 
 def test_terminal_replacement_survives_serialization_without_extra_discard() -> None:
-    """Verify terminal replacement survives serialization without extra discard."""
     observations = sequence()
     log = track_pond(observations)
     assert [slot.tile for slot in log] == ["2p", "7m"]
@@ -65,7 +66,6 @@ def test_terminal_replacement_survives_serialization_without_extra_discard() -> 
 
 
 def test_returning_old_tile_resolves_transient_candidate() -> None:
-    """Verify returning old tile resolves transient candidate."""
     log = track_pond([*sequence(), obs(8, 10, row(["2p", "7m"]))])
     assert [slot.tile for slot in log] == ["2p", "7m"]
     assert log[-1].pending_replacement is None
@@ -73,36 +73,33 @@ def test_returning_old_tile_resolves_transient_candidate() -> None:
 
 
 def test_repeated_refill_preserves_removal_but_requires_independent_call() -> None:
-    """Verify repeated refill preserves removal but requires independent call."""
     log = track_pond([*sequence(), obs(8, 10, row(["2p", "1m"]))])
     assert [slot.tile for slot in log] == ["2p", "7m", "1m"]
     assert log[1].t_removed == 5
     hidden = Call(
-        "N",
-        5,
-        (2, 5),
-        "pon",
-        ["7m"] * 3,
-        0,
-        "kamicha",
-        "7m",
-        [],
-        0.9,
+        seat="N",
+        t_first=5,
+        t_window=(2, 5),
+        type="pon",
+        tiles=["7m"] * 3,
+        called_pos=0,
+        source="kamicha",
+        called_tile="7m",
+        conf=0.9,
         anchor="hidden",
         seen=10,
     )
     assert len(requests(log, call=hidden, end=10)) == 1
     independent = Call(
-        "N",
-        5,
-        (2, 5),
-        "pon",
-        ["7m"] * 3,
-        0,
-        "kamicha",
-        "7m",
-        [],
-        0.9,
+        seat="N",
+        t_first=5,
+        t_window=(2, 5),
+        type="pon",
+        tiles=["7m"] * 3,
+        called_pos=0,
+        source="kamicha",
+        called_tile="7m",
+        conf=0.9,
         anchor="discard",
         seen=2,
     )
@@ -110,7 +107,6 @@ def test_repeated_refill_preserves_removal_but_requires_independent_call() -> No
 
 
 def test_partial_or_long_gap_stays_uncertain_and_fact_suppresses_identity() -> None:
-    """Verify partial or long gap stays uncertain and fact suppresses identity."""
     observations = sequence()
     observations[-1]["partial"] = True
     log = track_pond(observations)
@@ -124,7 +120,7 @@ def test_partial_or_long_gap_stays_uncertain_and_fact_suppresses_identity() -> N
     assert not requests(log, facts={"discard": [{"seat": "N", "t": 0, "tile": "7m"}]})
 
 
-def dense_frames() -> "list[dict]":
+def dense_frames() -> list[dict]:
     """Create continuous dense evidence with a changing last-tile prediction."""
     frames = []
     for i in range(31):
@@ -138,7 +134,6 @@ def dense_frames() -> "list[dict]":
 
 
 def test_continuous_evidence_substitutes_once_without_changing_turns() -> None:
-    """Verify continuous evidence substitutes once without changing turns."""
     log = track_pond(sequence())
     (request,) = requests(log)
     before = log[-1].p.copy()
@@ -160,7 +155,6 @@ def test_continuous_evidence_substitutes_once_without_changing_turns() -> None:
 
 
 def test_occlusion_changed_prefix_or_possible_call_cannot_fuse() -> None:
-    """Verify occlusion changed prefix or possible call cannot fuse."""
     for defect in ("count", "gap", "geometry", "prefix", "call"):
         log = track_pond(sequence())
         (request,) = requests(log)

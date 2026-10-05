@@ -3,6 +3,8 @@
 
 """Observe real call results while preserving the wrapped callable's interface."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from functools import wraps
 

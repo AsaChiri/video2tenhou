@@ -1,39 +1,35 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Review questions, confidence rows and human reconstruction constraints.
+"""Review facts as reconstruction constraints, and the confidence of every decision.
 
-Review items and confidence rows (DESIGN.md 4.8 `review.py`), and the human facts that
-answer them.
-
-An item is a question for the tool about one decision the program could not settle and
-whose answer settles the most: its kind, the seat and time, the best guess, the
-candidates with their costs, and where to look (evidence: region and time). A confidence
-row records every decision of the log with its margin (and a draw's runner-up), whether
-a human fixed it and whether nothing covered it (`lost`). A tile nothing covered is a
-question until the reviewer supplies it or says Can't tell (DESIGN.md section 6).
-Covered choices with close competing alternatives are grouped for review. Unfinished
-searches are unresolvable and do not ask for retries. Facts are the tool's answers; the
-next decode applies them as constraints.
+The human facts that answer review questions (labels/<video>/facts.jsonl) are
+normalized per hand; the next decode applies them as constraints. A confidence row
+records every decision of the log with its margin (and a draw's runner-up), whether
+a human fixed it and whether nothing covered it (`lost`, DESIGN.md section 6).
+Unfinished searches are unresolvable and do not ask for retries. The questions
+themselves are written by questions.py.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .confidence import confidence_state, low_margin
+from .confidence import confidence_state
 from .hand import corner_of
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from video2tenhou.record import HandResult
+
+    from .confidence import Certificate
     from .melds import Call
     from .solver import HandModel, Solution
     from .turns import Turn
-
-DISCARD_FACT_WINDOW = 3
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -52,21 +48,20 @@ class ReviewContext:
 def draws_to_reread(
     sol: Solution, model: HandModel | None = None
 ) -> list[tuple[str, int]]:
-    """Select draws with a close competing candidate for video acquisition.
+    """Select ambiguous draws of a certified solution for video acquisition.
 
-    A distant feasible alternative or a search without a candidate does not by itself
-    justify re-reading the video. Proof bounds certify choices; close witnesses
-    establish review questions. An open-kan replacement without direct draw evidence
-    also needs a view around the kan: a certificate inferred from earlier hand states
-    cannot compensate for that acquisition gap. Self-kans have two draws and require
-    separate evidence mapping.
+    An unresolvable certificate does not by itself justify re-reading the video:
+    proof bounds certify choices; close witnesses establish review questions. An
+    open-kan replacement without direct draw evidence also needs a view around the
+    kan: a certificate inferred from earlier hand states cannot compensate for that
+    acquisition gap. Self-kans have two draws and require separate evidence mapping.
     """
     selected = [
-        key
-        for key, margin in sol.margins.items()
-        if low_margin(margin)
-        and low_margin(sol.alternative_gaps.get(key))
-        and key not in sol.draw_sources
+        (seat, j)
+        for (field, seat, j), certificate in sol.certificates.items()
+        if field == "draw"
+        and certificate.state == "ambiguous"
+        and (seat, j) not in sol.draw_sources
     ]
     if model is not None:
         observed = {(ev.seat, ev.j) for ev in model.draw_ev}
@@ -99,11 +94,31 @@ def load_facts(labels_dir: Path) -> list[dict]:
         return [json.loads(line) for line in stream if line.strip()]
 
 
-def facts_for_hand(all_facts: list[dict], entry: dict) -> dict:
-    """Separate confirmed constraints from soft hand evidence.
+def hand_facts(all_facts: list[dict], entry: dict) -> list[dict]:
+    """Return a hand's reconstruction inputs: its facts except question dismissals.
 
-    Normalize this hand's annotations, keeping soft evidence distinct from confirmed
-    facts.
+    A `dismiss` fact is review state (a question the reviewer closed without a tile
+    answer), so it never constrains or invalidates a reconstruction.
+    """
+    return [
+        fact
+        for fact in all_facts
+        if fact.get("kind") != "dismiss"
+        and all(fact.get(key) == entry[key] for key in ("game", "kyoku", "honba"))
+    ]
+
+
+def decode_context(entry: dict, result: HandResult, all_facts: list[dict]) -> dict:
+    """Bind a reconstruction to its seat map, authoritative result and human inputs."""
+    return {
+        "entry": entry,
+        "result": dataclasses.asdict(result),
+        "facts": hand_facts(all_facts, entry),
+    }
+
+
+def facts_for_hand(all_facts: list[dict], entry: dict) -> dict:
+    """Normalize a hand's facts, keeping soft hand evidence apart from constraints.
 
     Hand annotations may explicitly set boolean ``soft``. Unsourced review answers
     default to confirmed; imported annotations carrying a ``source`` must declare their
@@ -126,13 +141,7 @@ def facts_for_hand(all_facts: list[dict], entry: dict) -> dict:
         "lost_dora": False,
         "site_score": None,
     }
-    for f in all_facts:
-        if (
-            f.get("game") != entry["game"]
-            or f.get("kyoku") != entry["kyoku"]
-            or f.get("honba") != entry["honba"]
-        ):
-            continue
+    for f in hand_facts(all_facts, entry):
         # the corner is the identity: a fact keeps its meaning whatever the seat letters
         # were when it was saved
         seat = entry["corner_wind"].get(f.get("corner") or "", None)
@@ -164,16 +173,14 @@ def _apply_concealed_fact(out: dict, f: dict, seat: str | None) -> None:
         and "?" not in f["tiles"]
     ):
         if "source" in f and "soft" not in f:
-            msg = (
+            raise ValueError(
                 f"{kind} annotation from {f['source']!r} must explicitly "
                 "set soft=true for evidence or soft=false after human "
                 "confirmation. Review the annotation before rebuilding."
             )
-            raise ValueError(msg)
         soft = f.get("soft", False)
         if not isinstance(soft, bool):
-            msg = f"{kind} annotation soft must be a boolean."
-            raise ValueError(msg)
+            raise ValueError(f"{kind} annotation soft must be a boolean.")
         out[kind].append({"seat": seat, "tiles": f["tiles"], "soft": soft})
 
 
@@ -215,21 +222,19 @@ def _apply_turn_fact(out: dict, f: dict, seat: str | None) -> None:
     elif kind == "riichi_turn" and seat and f.get("t") is not None:
         out["riichi_turn"].append({"seat": seat, "t": float(f["t"])})
     elif kind == "kan_time" and f.get("t") is not None:
-        out["kan_time"].append(
-            {"seat": seat, "t": float(f["t"])}
-        )  # the seat is optional
+        # the seat is optional
+        out["kan_time"].append({"seat": seat, "t": float(f["t"])})
 
 
 def _apply_result_fact(out: dict, f: dict, seat: str | None) -> None:
     """Normalize result corrections, indicators and unresolved decisions."""
     kind = f.get("kind")
     if kind == "result":
-        msg = (
+        raise ValueError(
             "Unsupported result annotation. Save ura indicators as "
             "kind='ura' with tiles, or a confirmed concealed hand as "
             "kind='final_hand'. The saved journal was not changed."
         )
-        raise ValueError(msg)
     if kind == "ura" and f.get("tiles") is not None:
         out["ura"] = f["tiles"]
     elif kind == "dora" and f.get("tiles"):
@@ -237,26 +242,22 @@ def _apply_result_fact(out: dict, f: dict, seat: str | None) -> None:
     elif kind == "riichi" and f.get("seats") is not None:
         out["riichi"] = f["seats"]
     elif kind == "lost" and f.get("field") == "dora":
-        out["lost_dora"] = (
-            True  # Can't tell: the indicator(s) no view shows stay the rules' guess
-        )
+        # Can't tell: the indicator(s) no view shows stay the rules' guess
+        out["lost_dora"] = True
     elif kind == "lost" and f.get("field") == "haipai" and seat:
         out["lost_haipai"].append(seat)
     elif kind == "lost" and seat:
         out["lost"].append({"seat": seat, "t": f.get("t"), "j": f.get("j")})
     elif kind == "site_wrong" and f.get("han") is not None and f.get("fu") is not None:
-        out["site_score"] = {
-            "han": int(f["han"]),
-            "fu": int(f["fu"]),
-        }  # the reviewer's han/fu replace the site's
+        # the reviewer's han/fu replace the site's
+        out["site_score"] = {"han": int(f["han"]), "fu": int(f["fu"])}
 
 
 def turn_key(model: HandModel, f: dict, tol: float) -> tuple[str, int] | None:
-    """Find the draw whose discard time is nearest a review fact.
+    """Return (seat, j) of the draw a draw or Can't-tell fact is about.
 
-    (seat, j) of the draw a draw / lost fact is about: the turn whose discard is nearest
-    the fact's time (within tol), else the turn index the fact carries (the tsumo
-    winner's final draw has no discard, so its index is its only key).
+    The turn whose discard is nearest the fact's time (within tol), else the turn
+    index the fact carries: the tsumo winner's final draw has no discard.
     """
     seat = f["seat"]
     mine = model.turns.get(seat, [])
@@ -277,10 +278,9 @@ def turn_key(model: HandModel, f: dict, tol: float) -> tuple[str, int] | None:
 def _draw_span(
     model: HandModel, turns: list[Turn], seat: str, j: int, t0: float
 ) -> tuple[float, float]:
-    """Find the interval from the seat's previous turn to this discard.
+    """Return the span from the seat's previous turn to the discard of turn j.
 
-    From the seat's previous turn to the discard of turn j (the tsumo winner's last
-    draw: to its reveal).
+    The tsumo winner's last draw spans to its reveal.
     """
     st = model.turns[seat][j] if j < len(model.turns[seat]) else None
     t_end = st.t_discard if st else (turns[-1].t + 5.0 if turns else t0)
@@ -291,9 +291,8 @@ def _draw_span(
 def _covered(model: HandModel, seat: str, j: int) -> bool:
     """Check whether a draw has direct or complete neighbouring hand evidence.
 
-    Is a draw covered by any evidence: a direct observation, or a full row of the hand
-    next to it (a row short of the hand by a hidden tile is not: the hidden one may be
-    the draw)?
+    A row short of the hand by a hidden tile does not cover it: the hidden one may be
+    the draw.
     """
     if any(ev.seat == seat and ev.j == j for ev in model.draw_ev):
         return True
@@ -304,165 +303,31 @@ def _covered(model: HandModel, seat: str, j: int) -> bool:
 
 
 def unseen_draw(model: HandModel, sol: Solution, seat: str, j: int) -> bool:
-    """Identify a low-margin draw without supporting observations.
+    """Identify a draw that neither an observation nor certification pins.
 
-    A draw nothing covers (section 6, `lost`): the solver's margin is low and no reading
-    shows it.
+    Section 6, `lost`: its certificate is ambiguous, unresolvable or missing.
     """
-    margin = sol.margins.get((seat, j))
+    certificate = sol.certificates.get(("draw", seat, j))
     return (
         (seat, j) not in sol.draw_sources
-        and low_margin(margin)
+        and (certificate is None or certificate.state != "resolved")
         and not _covered(model, seat, j)
     )
 
 
-# Individual questions first; covered but uncertified tile choices are grouped
-# after them, so a hand cannot look complete merely because images cover it.
-PRIORITY = [
-    "ura",
-    "conflict",
-    "result",
-    "call",
-    "order",
-    "riichi",
-    "dora",
-    "kan",
-    "draw",
-]
-
-
-def ranked(items: list[dict]) -> list[dict]:
-    """Order review questions by their effect on resolving the hand.
-
-    The questions of a hand in the order they settle it: the ura first, then a conflict,
-    a result, a call.
-    """
-    return sorted(
-        items,
-        key=lambda it: (
-            PRIORITY.index(it["kind"]) if it["kind"] in PRIORITY else len(PRIORITY)
-        ),
-    )
-
-
-def uncertain_tiles(rows: list[dict], items: list[dict]) -> dict | None:
-    """Group covered tiles with close witnesses, without duplicating questions or facts.
-
-    Neither image coverage nor an unfinished search establishes ambiguity.
-    Preserve explicit Can't tell answers.
-    """
-    asked = {
-        (item.get("seat"), item.get("j"))
-        for item in items
-        if item.get("kind") == "draw"
-    }
-    pending = [
-        row
-        for row in rows
-        if row.get("field") in ("draw", "haipai")
-        and confidence_state(row.get("margin"), row.get("alternative_gap"))
-        == "ambiguous"
-        and not row.get("human")
-        and not row.get("lost")
-        and not row.get("inferred_from")
-        and (row.get("seat"), row.get("turn")) not in asked
-    ]
-    if not pending:
-        return None
-    return {
-        "kind": "uncertain_tiles",
-        "count": len(pending),
-        "choices": [
-            {
-                "field": row["field"],
-                "seat": row["seat"],
-                "j": row["turn"],
-                "value": row["value"],
-                "runner_up": row.get("runner_up"),
-                "margin": row["margin"],
-                "t": next(
-                    (e["t"] for e in row.get("evidence", []) if e.get("t") is not None),
-                    None,
-                ),
-            }
-            for row in pending
-        ],
-        "text": (
-            "The evidence allows competing tile choices. Review the most uncertain "
-            "choice first."
-        ),
-    }
-
-
-def changed_discard(
-    key: tuple[str, int], t: float, observed: str, chosen: str, facts: list[dict]
-) -> dict | None:
-    """Question pond-contradicting repairs unless a reviewer confirmed the tile."""
-    seat, j = key
-    if not chosen or chosen == observed:
-        return None
-    if any(
-        f["seat"] == seat
-        and abs(float(f["t"]) - t) <= DISCARD_FACT_WINDOW
-        and f["tile"] == chosen
-        for f in facts
-    ):
-        return None
-    return {
-        "kind": "discard",
-        "seat": seat,
-        "j": j,
-        "t": t,
-        "tile": chosen,
-        "observed": observed,
-        "text": (
-            f"The pond read {observed}, but the reconstruction uses {chosen}. Check"
-            " this discard before accepting the log."
-        ),
-    }
-
-
-def uncertain_discards(rows: list[dict], items: list[dict]) -> list[dict]:
-    """Ask about competing pond choices, even when the solver keeps the raw reading."""
-    asked = {
-        (item.get("seat"), item.get("j"))
-        for item in items
-        if item.get("kind") == "discard"
-    }
-    return [
-        {
-            "kind": "discard",
-            "seat": row["seat"],
-            "j": row["turn"],
-            "tile": row["value"],
-            "runner_up": row.get("runner_up"),
-            "margin": row["margin"],
-            "t": next(
-                (e["t"] for e in row.get("evidence", []) if e.get("t") is not None),
-                None,
-            ),
-            "text": (
-                "The evidence allows two discard identities. Check this tile in the"
-                " pond."
-            ),
-        }
-        for row in rows
-        if row.get("field") == "discard"
-        and confidence_state(row.get("margin"), row.get("alternative_gap"))
-        == "ambiguous"
-        and not row.get("human")
-        and (row.get("seat"), row.get("turn")) not in asked
-    ]
+def _certificate_fields(certificate: Certificate | None) -> dict:
+    """Confidence-row fields of a certificate; an uncertified decision is unmeasured."""
+    if certificate is None:
+        return {"margin": None, "alternative_gap": None}
+    return {"margin": certificate.margin, "alternative_gap": certificate.gap}
 
 
 def confidence_rows(
     model: HandModel, sol: Solution, *, context: ReviewContext
 ) -> list[dict]:
-    """Build confidence rows for every reconstructed decision.
+    """Build one confidence row per decision of the log (section 5).
 
-    One row per decision of the log (section 5): draws, discards, haipai, calls,
-    indicators.
+    Draws, discards, haipai, calls and indicators.
     """
     turns, calls, inds, entry, facts, lost_keys, t0 = (
         context.turns,
@@ -477,16 +342,15 @@ def confidence_rows(
     for (s, j), tile in sorted(sol.draws.items()):
         a, b = _draw_span(model, turns, s, j, t0)
         corner = corner_of(entry, s)
-        margin = sol.margins.get((s, j))
+        certificate = sol.certificates.get(("draw", s, j))
         rows.append(
             {
                 "seat": s,
                 "turn": j,
                 "field": "draw",
                 "value": tile,
-                "margin": margin,
-                "alternative_gap": sol.alternative_gaps.get((s, j)),
-                "runner_up": sol.runner_up.get((s, j)),
+                **_certificate_fields(certificate),
+                "runner_up": certificate.runner_up if certificate else None,
                 "inferred_from": sol.draw_sources.get((s, j)),
                 "human": (s, j) in model.facts.draws,
                 "lost": (s, j) in lost_keys or unseen_draw(model, sol, s, j),
@@ -512,6 +376,7 @@ def confidence_rows(
         # solve; that solution then has no variable-discard override. Keep
         # confidence values aligned with the actual exported reconstruction.
         chosen = sol.discards.get((t.seat, st.j), st.discard) if st else None
+        certificate = sol.certificates.get(("discard", t.seat, st.j)) if st else None
         # a virtual discard was never seen in the pond, but its tile is the called tile
         # the meld camera shows
         caller = t.slot.t_removed if t.virtual else None
@@ -526,11 +391,8 @@ def confidence_rows(
                 "turn": st.j if st else None,
                 "field": "discard",
                 "value": chosen or t.slot.tile,
-                "margin": sol.discard_margins.get((t.seat, st.j)) if st else None,
-                "alternative_gap": sol.discard_alternative_gaps.get((t.seat, st.j))
-                if st
-                else None,
-                "runner_up": sol.discard_runner_up.get((t.seat, st.j)) if st else None,
+                **_certificate_fields(certificate),
+                "runner_up": certificate.runner_up if certificate else None,
                 "conf": round(t.slot.conf, 3),
                 "human": (t.seat, round(t.t)) in fact_discards,
                 "lost": False,
@@ -539,15 +401,13 @@ def confidence_rows(
             }
         )
     for s, tiles in sorted(sol.haipai.items()):
-        margin = sol.haipai_margins.get(s)
         rows.append(
             {
                 "seat": s,
                 "turn": -1,
                 "field": "haipai",
                 "value": tiles,
-                "margin": margin,
-                "alternative_gap": sol.haipai_alternative_gaps.get(s),
+                **_certificate_fields(sol.certificates.get(("haipai", s, -1))),
                 "human": s in model.facts.haipai,
                 "lost": s in facts.get("lost_haipai", []),
                 "evidence": [{"region": f"hand:{corner_of(entry, s)}", "t": t0}],

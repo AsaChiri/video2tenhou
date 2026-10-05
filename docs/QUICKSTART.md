@@ -52,17 +52,21 @@ if the automatically selected GPU cannot run, it uses CPU mode and tells you
 that processing will be slower.
 
 The first launch needs internet access and enough disk space for large PyTorch
-downloads. Each launch asks uv to select a compatible current PyTorch/torchvision
-pair; uv reuses installed packages and cached downloads where possible. Keep uv
-and your graphics driver up to date. Leave the launcher running while using the studio.
+downloads. Later launches reuse the installed environment and start without
+network access; setup runs again only if it did not finish or the application's
+requirements changed. Keep uv and your graphics driver up to date. Leave the
+launcher running while using the studio.
 
 To repair a failed or outdated installation, update your NVIDIA driver, then
 open PowerShell in the extracted folder and run:
 
 ```powershell
 winget upgrade --id astral-sh.uv --exact
-.\Start.cmd
+.\Start.cmd --update
 ```
+
+`--update` selects a current compatible PyTorch build. A new PyTorch build makes
+the next analysis of each recording read its video again; saved answers are kept.
 
 To use CPU mode explicitly:
 
@@ -71,13 +75,13 @@ $env:VIDEO2TENHOU_DEVICE = 'cpu'
 .\Start.cmd
 ```
 
-These settings apply to that terminal session. Close it and launch normally to
-return to automatic selection. On Linux update uv using your installation method
-and rerun `sh start.sh`, or use `VIDEO2TENHOU_DEVICE=cpu sh start.sh`.
+Add `--update` to replace an installed GPU build with the CPU build. These
+settings apply to that terminal session. Close it and launch normally to return
+to automatic selection. On Linux update uv using your installation method and
+rerun `sh start.sh --update`, or use `VIDEO2TENHOU_DEVICE=cpu sh start.sh`.
 The launch window prints the chosen GPU, device and package versions for support.
-After a successful initial setup, set `UV_OFFLINE=1` to use uv's local cache
-without network access. If required packages are absent from the cache, reconnect
-and launch normally to finish setup.
+After a successful setup, launches do not use the network. `UV_OFFLINE=1` makes
+setup or an update use only uv's local cache.
 
 ## Convert a recording
 
@@ -87,6 +91,8 @@ IDs and layout. **Rename** changes the display name without moving files.
 **Delete** asks for confirmation and removes the project from the library while
 keeping videos, saved review data and outputs on disk. Projects with a running
 analysis or review job cannot be deleted. Use **All projects** to return here.
+While the app identifies a new or changed recording file, which can take a
+while for a long broadcast, the project shows **Checking recording**.
 
 1. Select **New project**, then choose **Video file** to pick a recording from your computer, or **Video URL**
    to paste its video link. Local files are copied into `samples/` for processing.
@@ -111,8 +117,9 @@ analysis or review job cannot be deleted. Use **All projects** to return here.
    changes**, then return to Settings and click **Prepare recording** again.
    Saving does not start processing. Calibration checks visible table tiles
    and does not require scores, names or wind labels from the broadcast.
-3. Select **Analyze recording**. Progress and errors appear in the project.
-   Geometry and video/site round alignment are checked before reconstruction.
+3. Select **Analyze recording**. Progress and errors appear in the project; an
+   error says what to do, and **Processing log** shows the full output when you
+   open it. Geometry and video/site round alignment are checked before reconstruction.
    Keep the server running while a job runs.
 4. **Review** opens after processing with one question beside its video.
    Questions run from most uncertain to least uncertain across all hands.
@@ -121,9 +128,12 @@ analysis or review job cannot be deleted. Use **All projects** to return here.
    with other hands while the update runs; further questions from an answered hand
    wait for its new result so inferred answers do not need separate input.
    Answers collected during an update are applied together in the next batch.
-   Unfinished confidence checks remain in the confidence data and appear as a
-   processing note; they do not block review completion. **Skip for now** leaves
-   a question unresolved; you can return to skipped
+   A question that needs no tile answer can be closed with **Dismiss**, **Leave
+   as conflict** or **Nothing is missing**; this does not update the hand. For a
+   call, **It is right** saves the shown meld as your answer. Unfinished
+   confidence checks remain in the confidence data and the report's diagnostics;
+   they are not questions and do not block review completion. **Skip for now**
+   leaves a question unresolved; you can return to skipped
    questions later. Additional camera views are under **Additional evidence**.
    **Advanced review** is optional: it lets you inspect every action in every
    hand, edit saved answers and apply those changes. Normal review does not
@@ -152,9 +162,12 @@ the observed tiles to constrain the next reconstruction.
 **Can't tell** applies only to that particular draw or starting hand. A hand stays
 in review while any of these choices remain unresolved.
 
-When an automatic check reaches its time limit, the hand carries a processing
-note. This is not a tile question or a confidence proof. A legal reconstruction
-can still be exported; a hand with no legal reconstruction remains excluded.
+When an automatic check reaches its time limit, the report lists it under
+**Diagnostics**. This is not a tile question or a confidence proof. A legal
+reconstruction can still be exported; a hand with no legal reconstruction
+remains excluded. The hand page shows short notes worth checking (for example a
+tile that left a pond without a call), and an answer the reconstruction could
+not use shows the reason on its row so you can delete or correct it.
 
 ## Resume and storage
 
@@ -191,14 +204,15 @@ require network access.
 | FFmpeg missing | Fix PATH, restart the terminal and relaunch. |
 | Geometry check fails | Open Calibration, inspect the named region and save corrected borders. |
 | Video/site mismatch | Verify IDs/order, recording completeness and pond calibration. |
-| GPU incompatible / no kernel image / CUDA unavailable | Update the NVIDIA driver and uv, then use the repair command above. The launcher chooses and checks a compatible build; CPU mode is available as a slower fallback. |
+| GPU incompatible / no kernel image / CUDA unavailable | Update the NVIDIA driver and uv, then run `.\Start.cmd --update` (or `sh start.sh --update`). The launcher chooses and checks a compatible build; CPU mode is available as a slower fallback. |
 | Setup download interrupted or disk full | Free disk space or restore internet access and relaunch. Incomplete setup is retried automatically. |
 | xFormers not available | This optional acceleration message alone is not a setup failure. Read the final error in the log. |
 | Correction not in Results | Rebuild after saving review answers, then refresh Results. |
 | Project could not be saved | Check that the active data directory is writable and available, then retry the action. The previous project file is retained. |
 
-For scripts, commands remain `download`, `calib fit`, `convert --game ID`,
-and `review`; see `--help` on each command.
+For scripts, the commands are `download`, `trim`, `calib fit`, `calib check`,
+`convert --game ID` and `rebuild`; see `--help` on each command. Results and
+errors that need action are reported as a final JSON line on stdout.
 
 ## Source setup
 
@@ -262,5 +276,5 @@ and upstream license supplied in the bundle. A generic YOLO checkpoint cannot
 replace this trained pair. Inference uses local weights without downloading an
 ImageNet checkpoint.
 
-To distribute a trained set, `uv run python tools/package_models.py` creates
-a matching bundle with checksums; see the [release checklist](RELEASING.md).
+To distribute a trained set, `uv run python tools/package_release.py models`
+creates a matching bundle with checksums; see the [release checklist](RELEASING.md).

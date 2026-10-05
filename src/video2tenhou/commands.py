@@ -11,6 +11,5 @@ def executable(name: str) -> str:
     """Return an absolute executable from PATH, or fail before starting work."""
     path = shutil.which(name)
     if path is None:
-        message = f"Required executable {name!r} was not found on PATH"
-        raise FileNotFoundError(message)
+        raise FileNotFoundError(f"Required executable {name!r} was not found on PATH")
     return str(Path(path).resolve())

@@ -1,37 +1,43 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import type { Decode, FactBody } from "../types";
+import type { Decode, FactBody, HandEntry, ReviewItem } from "../types";
 import type { PropType } from "vue";
 import { useReview } from "./context";
-import { cornerOf, seats, seatName, time } from "./format";
+import { cornerOf, parseTime, seats, seatName, time } from "./format";
+import { confirmedMeld } from "./meld";
+import { useAction } from "../shared/useAction";
 import TilePalette from "./TilePalette.vue";
 import TileSetAnswer from "./TileSetAnswer.vue";
 import EvidenceDetails from "./EvidenceDetails.vue";
 import MeldEditor from "./MeldEditor.vue";
 import ConflictEditor from "./ConflictEditor.vue";
 const props = defineProps({
-  item: { type: Object, required: true },
-  entry: { type: Object, required: true },
+  item: {
+    type: Object as PropType<ReviewItem & { t: number }>,
+    required: true,
+  },
+  entry: { type: Object as PropType<HandEntry>, required: true },
   decode: { type: Object as PropType<Decode>, default: () => ({}) },
 });
 const review = useReview(),
-  busy = ref(false),
-  error = ref("");
+  { busy, error, run } = useAction();
 const missingSeat = ref(props.item.seat || "E"),
-  missingTime = ref(props.item.t || 0);
-const kind = computed(() =>
-  props.item.kind === "conflict" &&
-  ["meld", "result", "riichi"].includes(props.item.culprit)
-    ? props.item.culprit === "meld"
-      ? "call"
-      : props.item.culprit
-    : props.item.kind,
-);
+  missingTime = ref(time(props.item.t));
+// A conflict whose culprit is one meld, result or riichi is answered there.
+const kind = computed(() => {
+  const { kind, culprit } = props.item;
+  if (kind !== "conflict" || !culprit) return kind;
+  return culprit === "meld"
+    ? "call"
+    : ["result", "riichi"].includes(culprit)
+      ? culprit
+      : kind;
+});
 const fromSeats = computed(() =>
   props.item.source
     ? [
         seats[
-          (seats.indexOf(props.item.seat) +
+          (seats.indexOf(props.item.seat || "") +
             ({ kamicha: 3, toimen: 2, shimocha: 1 } as Record<string, number>)[
               props.item.source
             ]) %
@@ -41,19 +47,27 @@ const fromSeats = computed(() =>
     : seats.filter((seat) => seat !== props.item.seat),
 );
 async function answer(body: FactBody) {
-  if (busy.value) return;
-  busy.value = true;
-  error.value = "";
-  try {
-    await review.save({ hand: props.item.hand, ...body });
-    return true;
-  } catch (failure) {
-    error.value = failure instanceof Error ? failure.message : String(failure);
-    return false;
-  } finally {
-    busy.value = false;
-  }
+  const saved = await run(() =>
+    review.save({ ...body, hand: props.item.hand }),
+  );
+  return saved !== undefined;
 }
+const dismiss = () => run(() => review.dismiss(props.item));
+/** Save the shown call as a meld fact, so the update keeps it. */
+const confirmMeld = () =>
+  run(() => {
+    const { hand, seat, t, type, tiles, source } = props.item;
+    return review.save({
+      ...confirmedMeld({
+        seat,
+        t,
+        type: type || "",
+        tiles: tiles || [],
+        source,
+      }),
+      hand,
+    });
+  });
 function tileAnswer(tile: string) {
   const item = props.item;
   return answer({
@@ -77,6 +91,14 @@ function lost() {
         }),
   });
 }
+function missedDiscard(tile: string) {
+  const t = parseTime(missingTime.value);
+  if (t === null) {
+    error.value = "Enter the time as m:ss.";
+    return;
+  }
+  void answer({ kind: "missing_discard", seat: missingSeat.value, t, tile });
+}
 </script>
 <template>
   <div @input="review.dirty.value = true" @change="review.dirty.value = true">
@@ -85,12 +107,11 @@ function lost() {
       ><p>
         {{
           kind === "draw"
-            ? "What was drawn before this discard"
+            ? "Which tile was drawn before the discard"
             : "Which tile was discarded"
         }}
         at {{ time(item.t) }}?
       </p>
-      <p>Choose a tile to save your answer.</p>
       <TilePalette
         :guess="item.tile"
         :disabled="busy"
@@ -113,6 +134,13 @@ function lost() {
         kind === 'call' || (kind === 'kan' && item.seat && item.t != null)
       "
       ><p>{{ item.text }}</p>
+      <button
+        v-if="item.source && item.type && item.tiles?.length"
+        :disabled="busy"
+        @click="confirmMeld"
+      >
+        It is right
+      </button>
       <MeldEditor
         :hand="item.hand"
         :seat="item.seat"
@@ -122,22 +150,14 @@ function lost() {
           item.tiles ||
           (item.tile ? Array(kind === 'kan' ? 4 : 3).fill(item.tile) : [])
         "
-        :source="item.source"
-      /><EvidenceDetails
+        :source="item.source || undefined" /><EvidenceDetails
         v-for="seat in kind === 'call' ? fromSeats : []"
         :key="seat"
         :region="`pond:${cornerOf(entry, seat)}`"
         :start="item.t - 15"
         :end="item.t + 2"
         :label="`${seatName(entry, seat)}'s pond before the call`"
-      /><button
-        v-if="item.source"
-        :disabled="busy"
-        @click="answer({ kind: 'note', text: item.text })"
-      >
-        It is right
-      </button></template
-    >
+    /></template>
     <template v-else-if="kind === 'riichi' || kind === 'kan'"
       ><p>{{ item.text }}</p>
       <h3>
@@ -189,9 +209,9 @@ function lost() {
       ><ConflictEditor :item="item" :entry="entry" :decode="decode" /><button
         v-if="item.stage !== 'export'"
         :disabled="busy"
-        @click="answer({ kind: 'note', text: item.text })"
+        @click="dismiss"
       >
-        Acknowledge (leave as conflict)
+        Leave as conflict
       </button></template
     >
     <template v-else-if="kind === 'order'"
@@ -220,43 +240,24 @@ function lost() {
           </tr>
         </tbody>
       </table>
-      <h3>Add a missed discard</h3>
+      <h3>Add the missed discard</h3>
       <label
         >Seat<select v-model="missingSeat">
           <option v-for="seat in seats" :key="seat" :value="seat">
             {{ seatName(entry, seat) }}
           </option>
         </select></label
-      ><label
-        >Time<input
-          v-model.number="missingTime"
-          type="number"
-          min="0"
-          step="any" /></label
-      ><TilePalette
+      ><label>Time<input v-model="missingTime" placeholder="m:ss" /></label
+      ><TilePalette :disabled="busy" @pick="missedDiscard" /><button
         :disabled="busy"
-        @pick="
-          Number.isFinite(missingTime) && missingTime >= 0
-            ? answer({
-                kind: 'missing_discard',
-                seat: missingSeat,
-                t: missingTime,
-                tile: $event,
-              })
-            : (error = 'Enter a valid time.')
-        "
-      /><button @click="answer({ kind: 'note', text: item.text })">
-        Acknowledge (no change)
+        @click="dismiss"
+      >
+        Nothing is missing
       </button></template
     >
     <template v-else
       ><p>{{ item.text }}</p>
-      <button
-        :disabled="busy"
-        @click="answer({ kind: 'note', text: item.text })"
-      >
-        OK
-      </button></template
+      <button :disabled="busy" @click="dismiss">Dismiss</button></template
     >
     <div class="actions">
       <button :disabled="busy" @click="review.next">Skip for now</button>

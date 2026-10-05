@@ -13,8 +13,8 @@ score-delta inference. It supplies all names, seats and hand metadata.
 
     uv run python -m video2tenhou.record --game 21938 21939
 
-Game ids are visible in the site URLs (`/games/<id>`); `walk_container` lists
-the games of an event / week when the id is not known.
+Game ids are visible in the site URLs (`/games/<id>`). The result types and parsing
+need no HTTP client; only `gql` loads it.
 """
 
 from __future__ import annotations
@@ -22,8 +22,6 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import asdict, dataclass, field
-
-import httpx
 
 from video2tenhou.logging_setup import command_logging
 
@@ -40,24 +38,16 @@ Q_GAME = (
     " } }"
 )
 
-Q_CONTAINER = (
-    "query ViewGameContainer($gameContainerId: Int!, $withGames: Boolean!) {\n  "
-    "gameContainer(id: $gameContainerId) { id type name startsAt children { id name"
-    " startsAt }\n  games @include(if: $withGames) { id createdAt status "
-    "tableNumber\n    players { startingDirection user { username id } } score { "
-    "EAST SOUTH WEST NORTH } } } }"
-)
-
-
 LOGGER = logging.getLogger("video2tenhou.record")
 
 
 def gql(query: str, variables: dict, timeout: float = 30) -> dict:
-    """Query scoremj, propagating transport errors and rejecting query errors.
+    """Execute a read query against scoremj.
 
-    Execute a read query against scoremj; HTTP errors propagate and GraphQL errors raise
-    RuntimeError.
+    HTTP errors propagate and GraphQL errors raise RuntimeError.
     """
+    import httpx  # noqa: PLC0415  the engine imports the result types without HTTP
+
     response = httpx.post(
         ENDPOINT,
         json={"query": query, "variables": variables},
@@ -74,11 +64,7 @@ def gql(query: str, variables: dict, timeout: float = 30) -> dict:
 
 @dataclass
 class HandResult:
-    """Authoritative hand result using the hanchan's starting-seat names.
-
-    Authoritative result of one hand; seat identifiers refer to the hanchan starting
-    winds.
-    """
+    """Authoritative result of one hand, seats named by the hanchan's starting winds."""
 
     kyoku: int  # 0 = East 1 ... 7 = South 4 (site "round")
     honba: int  # site "honba" ("repeat" is the dealer-repeat count)
@@ -122,11 +108,7 @@ def _tenpai_seats(mask: int | None) -> list[str]:
 
 
 def parse_game(g: dict) -> Game:
-    """Translate a scoremj game without changing authoritative results.
-
-    Translate a scoremj game payload into reconstruction inputs, preserving
-    starting-seat deltas.
-    """
+    """Translate a scoremj game payload, preserving its starting-seat deltas."""
     hands = []
     for h in g["handResults"]:
         hr = HandResult(
@@ -165,17 +147,6 @@ def parse_game(g: dict) -> Game:
 def fetch_game(game_id: int) -> Game:
     """Fetch a game by numeric scoremj ID, propagating network failures."""
     return parse_game(gql(Q_GAME, {"gameId": game_id})["game"])
-
-
-def walk_container(container_id: int) -> list[dict]:
-    """All games (site summaries) under a container, depth first."""
-    c = gql(Q_CONTAINER, {"gameContainerId": container_id, "withGames": True})[
-        "gameContainer"
-    ]
-    games = [dict(g, container=c["name"]) for g in c["games"]]
-    for ch in c["children"]:
-        games += walk_container(ch["id"])
-    return games
 
 
 def to_dict(g: Game) -> dict:

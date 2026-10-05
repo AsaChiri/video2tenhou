@@ -24,7 +24,8 @@ points, cache contracts and validation commands.
 | `g<k>.html` | links for `g<k>.json`: the whole hanchan in tenhou's viewer, `https://tenhou.net/5/#json=<URL-encoded JSON>` (`&ts=N` starts at kyoku N), and one `https://tenhou.net/6/#json=` URL per kyoku carrying that kyoku alone, each with a copy button plus one that copies them all (one per line). tenhou.net/6 is tenhou's log *editor*: it loads only `log[ts]`, and the analysis tools that take its URLs take one kyoku per URL |
 | `g<k>.confidence.json` | per event: margin, evidence, `human` flag, `lost` flag |
 | `review.json` | open questions for the tool, each with evidence crops and a prefilled best guess |
-| `report.md` | per hand: status (`complete` / `review` / `conflict`), counts, checksum results |
+| `report.md` | per hand, numbered from one: status (`complete` / `review` / `conflict`), whether it was written, counts, open questions, lost tiles and the score check; developer diagnostics in a collapsed section |
+| `export-inputs.json` | the decode file (modification time and size) each hand's export was built from, so the tool can tell when exports lag the reconstructions |
 
 **Definition of done for a video**: every hand is `complete` (nothing open:
 every tile of its log is backed by evidence or by a reviewer's answer), or a
@@ -204,8 +205,11 @@ open, settings, rename and confirmed delete actions. Display names are separate
 from recording storage identities. Deletion removes only an idle project's
 manifest; recordings, cached work, human evidence and exports remain on disk.
 Local file uploads stream to disk and video downloads
-run in a child process. Only one analysis job runs at a time so competing
-videos cannot exhaust GPU memory. Progress comes from real pipeline output;
+run in a child process. One job runs at a time across all projects
+(preparation, analysis, hand updates and calibration measurements share the
+slot) so competing videos cannot exhaust GPU memory. Jobs run CLI child
+processes, each ending with one outcome line; the studio shows that message,
+and the full log only on request. Progress comes from real pipeline output;
 failed and interrupted jobs remain visible and can be retried using caches.
 
 Preparation measures the fit. The user opens the calibration view, checks
@@ -232,21 +236,28 @@ A pipeline of stages with a file artifact between each, all under
 video ─► [0 fit]        plate.png, labels/<video>/calib.json (where the table and the panels are in THIS video)
       ─► [1 header]     table-timing.json, hands.json (table clearings, fixed chairs, site metadata)
       ─► [2 calm]       calm.jsonl (per region: calm intervals, occlusion score)
-      ─► [3 read]       reads/<hand>/<region>.jsonl (per calm frame: boxes + class posteriors)
-      ─► [4 observe]    obs/<hand>.json (per region per calm interval: one voted observation)
+      ─► [3 read]       reads/<hand>/<region>.jsonl (per calm frame: boxes + class posteriors) + done.json
+      ─► [4 observe]    obs/<hand>.json (per region per calm interval: one voted observation) + obs/provenance/<hand>.json
       ─► [5 decode]     decode/<hand>.json (events, solver margins, review items)
-      ─► [6 write]      out/<video>/g<k>.json + confidence + review + report
+      ─► [6 write]      out/<video>/g<k>.json + confidence + review + report + export-inputs.json
       ◄─ [7 review tool] labels/<video>/facts.jsonl (human answers → hard constraints → rerun 5–6)
                         labels/<video>/boxes/*.json (human box/tile labels → retrain models)
 ```
 
 Recognition in stage 3 and targeted video rereads in stage 5 can use the GPU;
 geometry preparation and its checks also use recognition. Stage 5 combines
-those readings with CPU constraint solving and alternative searches, so a
+those readings with CPU constraint solving and certification searches, so a
 rebuild can require substantial work even when sparse recognition is cached.
+A rebuild resolves model identities without loading weights; a model loads only
+when a hand rereads the video.
 Each stage validates the provenance relevant to its own artifacts, including
 source, geometry, sampling, model/runtime and evidence-policy identities where
-applicable. Review answers invalidate the affected reconstruction; changing
+applicable. The source identity is the recording's SHA-256, computed once and
+kept in `work/source-digests.json` until the file's size, timestamps, index or
+device change. A stage's completion manifest records digests of what it wrote,
+and the next stage binds to that manifest rather than hashing the files again
+(see [maintenance](MAINTENANCE.md#data-and-caches)). Review answers invalidate
+the affected reconstruction; dismissing a question does not. Changing
 recognition inputs requires Analyze to refresh earlier evidence before Rebuild
 can use it. Calibration is reused for its recording and can be adjusted by the
 reviewer. Later stages use that geometry, and conversion checks it before tile
@@ -256,7 +267,8 @@ Package layout:
 
 ```
 src/video2tenhou/
-  cli.py            video2tenhou web | download | convert | calib
+  cli.py            video2tenhou web | download | trim | calib fit/check | convert | rebuild
+  cache.py          the recording's content digest, persisted and keyed by file identity
   video.py          frame access: sequential sampler (ffmpeg pipe) and seek
   layout.py         Calibration geometry, layout + per-video fit, contact sheet
   calibfit.py       stage 0: the table plate, the fit of this video, the geometry checks
@@ -264,24 +276,32 @@ src/video2tenhou/
   timeline.py       table clearing windows, fixed chairs, scoremj metadata
   calm.py           motion / occlusion scoring, calm intervals per region
   perception/
-    detector.py     tile box detector (YOLO, classes face / back), one model for all views
+    detector.py     tile face detector (LibreYOLO YOLO9, one class: face), one model for all views
+    yolo9_direct.py the detector's direct input path (pinned LibreYOLO 1.5 internals)
     classifier.py   tile face classifier (CNN on crops, 39 classes, calibrated posteriors)
-    reader.py       read_region(frame, region) → boxes with posteriors and orientation
+    reader.py       read_region(img, region) → boxes with posteriors and orientation
+  read.py           stage 3: calm-frame reads per hand, dense reads on request
   observe.py        calm-interval voting → observations (ponds, hands, melds, indicators)
   engine/
     rules.py        invariants of section 1 as checkable functions
     ponds.py        pond slot tracking → per-seat discard log with times, sideways, removals
     melds.py        meld observations → call events (type, tiles, source)
     calls.py        the call anchor: a meld event is a call only if a discard was taken (or a kan pattern)
+    indicators.py   the dead-wall row: dora / kan indicators and the kans they imply
+    turns.py        merge of four discard logs into the turn sequence with calls
     dense.py        5 fps pond and hand reads on demand: taken discards, skipped turns, uncertain draws
     hand.py         seats, corners and the site's seat names of one hand
-    turns.py        merge of four discard logs into the turn sequence with calls
-    solver.py       haipai / draw reconstruction as a constraint program (CP-SAT)
+    events.py       stage 5a: discard logs, anchored calls, the dead wall, the turn sequence, riichi
+    solver.py       haipai / draw reconstruction as a constraint program (CP-SAT) and its certification
+    reconstruct.py  stage 5b: the model, first fit and rereads, repair, every kan's indicator
+    score_reconcile.py  the site's result as a constraint, the score check, tenpai and ura
     scoring.py      yaku / han / fu check against the site record (mahjong library)
-    indicators.py   the dead-wall row: dora / kan indicators and the kans they imply
-    review.py       margins → review items and confidence rows; facts → constraints
-    decode.py       orchestration per hand
+    questions.py    every question, note and ignored answer a decode reports
+    review.py       facts → constraints; certificates → confidence rows
+    decode.py       orchestration per hand and the decode artifact
+    validation.py, assemble.py  the export check of a decode; decodes → tenhou.net/6 games
   tenhou6.py        log model, writer, and replayer (legality check of a finished log)
+  export.py         stage 6: logs, confidence, review queue, report and export inputs
   tool/             browser projects, owned processing jobs, review and labeling
   train/            dataset builders from local labels, detector and classifier training
   eval.py           metrics per stage on labels; end-to-end against verified logs
@@ -296,12 +316,17 @@ work/, out/, samples/   caches, outputs, video (ignored)
 
 ### 4.1 `video.py`
 
-- `probe(path) -> VideoInfo(fps, width, height, duration)`.
-- `sample(path, fps=2.0, start=0, end=None, scale=(1920,1080)) -> Iterator[(t, frame)]`:
-  one sequential ffmpeg decode, frames rescaled to 1080p, never seeks; this
-  is the only way stages 2–3 read video (a 2.4 h VOD is 17k frames at 2 fps).
-- `frame_at(path, t) -> frame`: seek, for evidence crops and the tool.
-- `download(url, out, start=None, end=None)`: yt-dlp best 1080p.
+- `probe(path) -> VideoInfo(path, width, height, fps, duration)`.
+- `sample(path, fps=2.0, start=0, end=None, size=(1920,1080)) -> Iterator[(t, frame)]`:
+  one ffmpeg decode per window, frames rescaled to 1080p; a window starts with
+  one input seek to `start` and then decodes sequentially. A reader thread keeps
+  up to 16 decoded frames ahead of the consumer; closing the iterator stops
+  ffmpeg and joins the reader. This is how stages 1–3 and dense rereads read
+  video (a 2.4 h VOD is 17k frames at 2 fps).
+- `frame_at(path, t) -> frame`: seek, for stage 0, evidence crops and the tool.
+- `download(url, out, start=None, end=None)`: yt-dlp best 1080p;
+  `trim(source, out, start, end)`: an accurately cut separate clip of a local
+  recording.
 
 Why 2 fps: placing a tile takes over a second; a discard is visible for many
 seconds before the next; motion between two samples 0.5 s apart is enough to
@@ -313,10 +338,12 @@ tell calm from disturbed.
 rectangles and, inside each, the hand row band and the meld inset; overhead
 centre, angle, scale; the four pond rectangles in the de-rotated overhead
 frame, each with its upright rotation (0/90/180/270) and its row growth
-direction; the wall ring for indicators; corner ↔ pond mapping. Functions:
-`load(name_or_path)`, `region(frame, calib, name) -> (image, transform)` where
-the transform maps region pixels back to frame pixels (used for evidence
-crops and for converting labels), and `contact_sheet(frame, calib)` for
+direction; corner ↔ pond mapping. Each pond rectangle reaches past its
+discard rows to the wall row in front of the player, where the dora
+indicators lie, so the indicators are read inside the ponds. Functions:
+`Calibration.load(name_or_path, video)`, `cal.region(frame, name) -> (image,
+transform)` where the transform maps frame pixels to region pixels (its inverse
+places evidence crops and converts labels), and `contact_sheet(frame, cal)` for
 `video2tenhou calib check <video> --t <s>`.
 
 A calibration has two layers. The **layout** (`src/video2tenhou/assets/calib/pml.json`) is
@@ -358,7 +385,7 @@ then finds the (centre, angle, scale) whose de-rotation maps that mask onto
 the layout's stored unit mask (`src/video2tenhou/assets/calib/pml_unit.png`, cut from the
 reference plate through the reference fit), maximising IoU: a coarse sweep
 over angle and scale, then a hill climb. On the reference video this
-recovers its own calibration to 0.05 px and 0.01°; a fit under IoU 0.6 is
+recovers its own calibration to 0.08 px and 0.03°; a fit under IoU 0.6 is
 reported as a failure, not a number. Because the pond rectangles are table
 constants, fitting the unit fits the ponds.
 
@@ -381,8 +408,9 @@ calibration, then click Prepare recording. Saving does not start a job.
 tile is either wholly inside it or wholly outside; a tile split by the border
 is the definition of a bad crop, and it is what produces a missing first row,
 a neighbour's discard and a half-read meld. Stage 0 therefore runs the
-detector on K = 8 frames spread over play, over the *whole* overhead and the
-*whole* corner camera, and for every region reports:
+detector on K = 8 of those table frames, over each region grown by a margin
+(30 px for a pond, 40 px for a hand band or meld inset) so a tile its border
+cuts is seen whole, and for every region reports:
 
 - `cut`: boxes that straddle the region's border (> 15 % of the box on each
   side). A region fails when a third of the tiles at its border are cut, or
@@ -406,8 +434,10 @@ and must not win for that.
 `video2tenhou calib fit <video>` writes the fit and prints this table;
 `calib check <video>` prints it for the current fit and exits non-zero on a
 failure; `convert` runs it before stage 1 and refuses to start when it fails,
-naming the region and the command to fix it. The checks are cheap (one plate,
-eight frames) against a decode that takes an hour.
+naming the region to fix. The checks are cheap (one plate,
+eight frames, each decoded once per run) against a decode that takes an hour.
+The studio keeps the latest results in `work/<video>/border-checks.json` with
+the geometry they measured, and shows them only while that geometry is current.
 
 ### 4.3 `record.py`
 
@@ -438,15 +468,17 @@ winner, loser, han, fu, riichi seats, tenpai seats)])`. Pure data; cached to
 
 ### 4.5 `calm.py`
 
-For every region of interest (4 ponds, 4 hand bands, 4 meld insets, indicator
-ring), per sampled frame: `motion` = mean absolute difference to the previous
-sample after blur; `occlusion` = fraction of skin-coloured pixels plus a
-"tile-like structure" score (edge density in the tile band). A frame is calm
-for a region when motion < τm and occlusion < τo. A **calm interval** is a
-maximal run of ≥ 3 calm samples (≥ 1 s). Output per region: intervals with
-start, end, mean scores, and the **disturbed intervals** between them.
-Thresholds are set on the reference VOD and reported as a histogram in
-`calib check`.
+For each of the 12 regions (4 ponds, 4 hand bands, 4 meld insets; the
+indicators lie inside the pond regions), per 2 fps sample of the region at
+half size: `motion` = mean absolute difference of its blurred grey image to the
+previous sample's; `skin` = fraction of skin-coloured pixels. A frame is calm for
+a region when motion < τm (4.0 grey levels) and skin is less than 0.05 above
+the region's own baseline (its 20th percentile over the video: static content
+that merely looks like skin). A **calm interval** is a maximal run of ≥ 3 calm
+samples (≥ 1 s). Output per region: intervals with start, end, mean scores, and
+the **disturbed intervals** between them. Scores are computed once per
+recording and geometry (`calm_scores.npz`), so new thresholds only re-derive
+intervals; `convert` prints each region's calm coverage.
 
 **Read floor.** No region may go longer than `MAX_GAP` = 15 s (one turn
 cycle) without a read; a blind span longer than that is where calls and
@@ -483,10 +515,12 @@ fallback windows and evidence weighting.
 ### 4.6 Perception
 
 **Detector** (`perception/detector.py`): one local checkpoint serves all views.
-Its hash-verified metadata selects the backend and inference settings.
-The LibreYOLO YOLO9 adapter localizes face-up tiles and returns boxes in
-region coordinates. Inputs are region crops scaled so tiles are 60–120 px wide
-(scale factor per region in the calibration). Human labels span ponds, melds,
+Its hash-verified metadata names LibreYOLO and the inference settings. The
+YOLO9 model has one class, `face`: it localizes face-up tiles and returns boxes
+in region coordinates. Each upright region crop (cut at the calibration's
+per-region scale) is resized so its long side is 1024 px and padded at the
+bottom and right to a multiple of 32, so the detector sees a pond, hand band or
+meld inset at its own proportions. Human labels span ponds, melds,
 hands and indicators; hand labels use raw camera space, with rectified
 labels mapped back through their stored matrices. See
 [detector training and backend contracts](DETECTOR_BACKENDS.md) for the
@@ -503,8 +537,10 @@ views, evaluated per view on held-out hands. Posteriors
 are temperature-calibrated on the held-out set so the solver's costs mean
 something.
 
-**Reader** (`perception/reader.py`): `read_region(frame, calib, name) ->
-Reading(t, region, boxes=[Box(xyxy, det_conf, sideways, posterior[39])])`. For
+**Reader** (`perception/reader.py`): `read_region(img, name, detector,
+classifier, t=...) -> Reading(t, region, size, boxes=[Box(xyxy, conf, sideways,
+p[39], role, row, col, group)], rejected)` for one upright region image;
+`read_regions` reads a batch of them the same way. For
 hands, boxes are ordered along the row line fitted through box centres; for
 ponds, boxes are assigned to rows and columns in the upright pond frame
 (rows = clusters along the growth axis, a column = the rank along the row:
@@ -527,8 +563,16 @@ batching classifier work. Stage 3 buffers at most 48 upright region crops;
 tile crops share a classifier call, still including both rotations of
 sideways tiles. Detector calls stay at batch size one: larger CUDA batches
 changed box coordinates enough to alter tile crop pixels in measurements.
-The detector's multi-image API therefore also uses individual calls. Buffers
-are flushed at each hand/window boundary and caches retain their time order.
+The detector's multi-image API therefore also uses individual calls. Its
+direct input path (`perception/yolo9_direct.py`) letterboxes the uint8 pixels
+exactly as LibreYOLO's public `predict` does, uploads bytes and maps them
+through the same float32 division, then calls the model's own graph dispatch
+and postprocessing; inputs and detections are bit-identical to `predict`.
+With CUDA graphs, each padded input shape has its own model that captures once
+and then only replays. Buffers are flushed at each hand/window boundary and
+caches retain their time order. In `convert`, one detector and one classifier
+serve the geometry check, table timing and reading; decoding resolves the same
+identities and loads its own pair only when a hand rereads the video.
 Dense cache identity includes sampling rate and millisecond window bounds:
 a 2 fps result cannot satisfy a later 5 fps request. Observation construction
 filters and restructures each interval's readings once, sharing that prepared
@@ -568,7 +612,8 @@ Turns per-frame readings into one observation per region per calm interval:
   full distribution instead of an argmax.
 - **Meld observation**: groups of 3–4 boxes with their sideways position and
   `X` tiles; per group the summed posteriors.
-- **Indicator observation**: face-up boxes in the wall ring with posteriors.
+- **Indicator observation**: face-up boxes in a pond region's wall row (the
+  reader's `indicator` role), with posteriors.
 
 An observation carries its interval, frame count, a quality score and the
 `partial` flag of a read-floor interval (see 4.5: absence is then unknown). The
@@ -704,7 +749,7 @@ on its own. **A call is anchored on the discard it took** (the user's rule:
    leaves the resting hand three tiles shorter, so a hand that still holds
    as many tiles as the seat's known calls allow says the camera re-read a
    meld already counted (meld insets regroup their tiles from view to view),
-   and that is a note.
+   and that is only a diagnostic.
 
 Every removal is a call, too: a tile that left a pond (step 2 of the pond
 tracker) that no event explains was called by a seat whose camera missed the
@@ -760,17 +805,17 @@ they never hide an observed later indicator.
 (5 fps, every sampled frame, a short window) at the
 place and time that decides it, before asking the human: a called tile that
 no pond shows (below), a turn the merge had to skip (that player's pond over
-the gap), or a draw with a close feasible alternative (below).
+the gap), a riichi whose turned tile no read found (that player's pond as each
+tile was laid), or an ambiguous draw (below).
 Dense reads are cached under `work/<video>/dense/`.
-The 0.5 boundary is inclusive, with a small floating-point tolerance. Acquisition
-tests the cost gap of an alternative actually found; review requires a close
-competing witness as well as a weak certified margin. A distant candidate with
-a weak proof bound is recorded as unresolvable within the processing budget.
-Margin reuse additionally requires the
-same model, baseline objective and preferred draw.
-Excluding the boundary can skip the additional resting-hand evidence needed
-to distinguish adjacent draw orders; the recorded draw-order regression fixture
-covers this case.
+A draw is ambiguous when certification finds a reconstruction that changes it
+within the review gap of 0.5 (inclusive, with a small floating-point
+tolerance): a close competing witness. Only ambiguous draws, and the open-kan
+replacements below, are reread; a weak proof bound without a close witness is
+unresolvable within the processing budget and triggers no reread. Excluding the
+boundary can skip the additional resting-hand evidence needed to distinguish
+adjacent draw orders; the recorded draw-order regression fixture covers this
+case.
 
 Hand observations also obey the merged turn order: a player cannot draw
 before the preceding player discards. The preceding pond's last view without
@@ -780,13 +825,13 @@ that bound cannot be an after-draw state or identify a drawn end. It remains
 soft partial evidence of the resting state, so misdetections cost disagreement
 without moving genuine persistent tiles into a future draw.
 Decode artifacts carry `decoder_version`; results from an older or unversioned
-decoder are recomputed from observations rather than silently reused. Model
-initialization is deferred when all requested artifacts have the current version.
+decoder are never shown or exported and are recomputed from observations. Model
+identities are resolved only when a hand needs decoding, and weights load only
+when a hand rereads the video.
 
 **Uncertain draws: the hand before, the hand after, the discard.** A draw
 is the hand after the turn, less the hand before it, plus the discard; so
-for a draw with an alternative cost gap at or below 0.5, or no candidate before
-timeout, the player's hand row is read at 5 fps
+for an ambiguous draw of the first fit the player's hand row is read at 5 fps
 over the whole stretch that shows both hands at rest — from the seat's own
 previous discard to the next player's discard (at most 60 s before the
 discard and 20 s after it); the draws of one seat whose stretches overlap
@@ -803,8 +848,8 @@ tile at an end, one or two short is an all-but-one (two) row, anything
 else a sub-multiset.
 
 An open-kan replacement with no direct draw posterior and no human draw fact
-also requests this bounded window, even when its inferred choice has a large
-alternative gap. Its tile may otherwise be determined entirely by uncertain
+also requests this bounded window, even when its inferred choice is
+certified. Its tile may otherwise be determined entirely by uncertain
 earlier hand counts. The pre-kan resting view and post-discard resting view
 constrain the replacement through the existing tile-removal rules; a kan is
 not treated as an ordinary draw when mapping intermediate hand states. The
@@ -818,7 +863,7 @@ the extra acquisition.
 **Called tiles never seen calm.** A tile that is called lies in the pond for
 a second or two, often inside a disturbed interval, so the calm reads miss
 it: that is step 2 of the call anchor. The three other ponds are read on
-every frame at 5 fps over the 15 s before the meld appeared
+every frame at 5 fps over the 25 s before the meld appeared
 (`read.dense_pond_reads`, cached); a tile of *any* kind that appears in at
 least two consecutive frames after the pond's last known tile and then
 vanishes is the discard taken. It enters the log with its time, position and
@@ -851,8 +896,12 @@ dealer's first included, and every skip), no sequence draws more than the
 live wall less the kans (less the winning draw of a tsumo), and an
 exhaustive draw ends with the discard of the last draw — that one cannot
 be called — so whatever the ponds show after it was laid after the hand
-ended (the reveal) and is dropped like a trailing tile after a win. Every
-inversion over the tolerance, skip and dropped slot is a note. The
+ended (the reveal) and is dropped like a trailing tile after a win. The
+merge returns its findings as data: every inversion over the tolerance, skip
+and dropped slot is a diagnostic, and a skip that remains after the dense read
+of that pond is also an `order` question (add the missed discard, or confirm
+nothing is missing). A seen meld that no turn owns (no discard follows it) is
+an `order` question too. The
 riichi turn per seat is its sideways slot; the site record identifies who
 declared but does not provide the declaration time (section 1).
 
@@ -860,14 +909,17 @@ declared but does not provide the declaration time (section 1).
 Per seat s and kind k (37): integer `h0[s,k]` (haipai count, Σk = 13, or 14
 for the dealer whose first turn then has no draw variable); per turn j of s
 with a draw: booleans `d[s,j,k]` with Σk = 1; discards are known kinds from the
-pond (a slot with a weak margin is a small choice set with costs); meld tiles
-are known. Hand after turn j: `h[s,j,k] = h0 + Σ draws − Σ discards − Σ meld
-removals`, all ≥ 0, Σk = 13 − 3·melds (14 after a kan set). Constraints: the
-counting rule Σs(h0 + Σ draws) + indicators ≤ 4 per kind, red fives ≤ 1,
-plain fives ≤ 3; after riichi `d = discard`; a call turn has no draw; a kan
-has a rinshan draw; the winner's final hand must contain the tiles the site
-result implies (checked by `scoring.py` afterwards; on failure the solver is
-rerun with the failing hand excluded from the solution pool).
+pond (a slot whose second reading is plausible is a two-way choice with a
+cost); a call's tiles from the hand are known or a choice among its legal
+compositions. The hand after turn j is a named variable `h[s,j,k]` in 0..4:
+the previous state plus the turn's draws, less its discard and meld removals,
+with Σk = 13 − 3·melds (14 after a kan set). Naming each state keeps every
+later evidence constraint short. Constraints: the counting rule
+Σs(h0 + Σ draws) + indicators ≤ 4 per kind, red fives ≤ 1, plain fives ≤ 3;
+after riichi `d = discard`; a call turn has no draw; a kan has a rinshan
+draw; the winner's final hand is a winning hand and the site's tenpai seats
+are tenpai ("The result as a constraint" below). `scoring.py` checks the score
+afterwards.
 
 Evidence enters as costs, in this order of strength:
 1. **direct draw observations** (a hand row with its newly drawn end tile): cost `w_d · (1 − p_k)` on `d[s,j,k]`, high weight;
@@ -899,54 +951,66 @@ Evidence enters as costs, in this order of strength:
 Merged discard and call chronology bounds which turn an observation can
 describe; an observation cannot show a draw before that player can act.
 
-Facts from the review tool fix variables. Margin of a decision = objective
-increase when that decision is forbidden; the re-solve's own choice is the runner-up, which the
-review item offers next to the best guess. A timed-out feasible re-solve uses
-its certified objective lower bound, never the cost of its current candidate:
-that candidate can be much worse than an undiscovered equal-cost alternative.
-An UNKNOWN search can also supply a certified lower bound without finding a
-candidate. Retain that bound; the model's nonnegative costs make an uninitialized
-zero bound conservative. Invalid models do not supply confidence.
-The candidate still supplies a possible runner-up. A haipai gets a margin the same
-way, per seat, by forbidding that exact multiset. Variable pond identities are
-also certified by forbidding the selected discard, including when that choice
-matches the original pond reading. A low lower bound alone does not establish
-ambiguity. Only a feasible alternative within the inclusive 0.5 cost threshold
-creates a tile question; a draw with no direct
-observation, no calm state on either side and no later discard or reveal
-that pins it is a `lost` candidate (section 6).
+Facts from the review tool fix variables; a decision a fact fixes needs no
+search and carries an infinite margin.
 
-Acquisition uses a separate `alternative_gap`: the cost of the best feasible
-alternative found, an upper bound on its true minimum cost gap. A close candidate
-(including exactly 0.5) requests a dense video read. An UNKNOWN solve or a distant
-candidate with only a weak proof bound is unresolvable within the processing
-budget and does not trigger another video read or an automatic retry.
-An infeasible alternative has infinite separation. No candidate is represented
-by a null gap, never zero. Draws, starting hands and variable discards all retain
-both the proof bound and the feasible candidate gap. A high candidate gap cannot
-certify a choice; a close candidate can establish a genuine competing answer.
+**Certification.** The confidence of a decision (a draw, a variable discard or
+a seat's starting hand) is its margin: a certified lower bound on the objective
+cost that any reconstruction changing that decision adds. Decisions are
+certified in groups. One search asks for the cheapest reconstruction that
+changes at least one pending decision. A proven bound above the review gap
+(0.5, inclusive, with a small floating-point tolerance) certifies every pending
+decision at once, since the group's minimum is at most each decision's own. A
+reconstruction within the gap is a close witness for every decision it changes:
+those become ambiguous, with the witness's cost increase as their
+`alternative_gap` and, for a tile, its value in the witness as the runner-up
+the review item offers next to the best guess, and the search repeats without
+them. A search stops at the first proof above the gap or witness within it;
+neither optimum is needed.
+A candidate's cost never certifies anything: it can be far above an undiscovered
+equal-cost alternative. A search that ends without a proof keeps the bound it
+proved; model costs are nonnegative, so a zero bound is conservative, and an
+infeasible search gives an infinite margin. A resolved decision has no
+`alternative_gap` (null) unless no reconstruction can change it (infinite).
+Decisions still pending at the deadline are `unresolvable` with the last proven
+bound: they neither create questions nor block review completion, never become
+false confidence proofs and trigger no reread. A low bound alone does not
+establish ambiguity; only a close witness creates a tile question. A draw with
+no direct observation, no calm state on either side and no later discard or
+reveal that pins it is a `lost` candidate (section 6). Invalid models fail
+processing explicitly.
 
-Checks stop on either a separation proof or a close witness. Each runs once.
-After riichi, an ordinary draw is the following discard. It reuses that
-discard's confidence without a separate search, hand-camera reread, or draw
+A hand is certified at most twice, each pass with its own 60 s budget
+(`DecodeOptions.confidence_timeout`) and ending as soon as every decision is
+classified: the first fit, only when the video can be reread, to choose the
+ambiguous draws to reread; and the final solution once, after the kans'
+indicators and the score reconciliation. Certification searches a copy of the
+program the solution was found in, so later model edits cannot change what it
+measured. Main solves and certification searches use CP-SAT's eight-worker
+portfolio (`DecodeOptions.workers`).
+
+After riichi, an ordinary draw is the following discard. It shares that
+discard's certificate without a separate search, hand-camera reread, or draw
 question. If the pond identity is ambiguous, review asks about the discard
 once. A named concealed kan determines its incoming draw (except red/plain
 fives); its replacement draw remains separate and is discarded when play
 continues. The declaration turn and a winning draw are not inferred from a
 later discard.
-The decoder shares a 10-second alternative-checking budget across all solves of
-a hand, with CPU allocation shared across checks. Starting hands and variable
-discards precede draws, which are interleaved across seats. The Python
-`decode_hand(confidence_timeout=...)` option allows a longer budget. Expired
-checks are recorded as `unresolvable`; they neither create questions nor block
-review completion, and never become false confidence proofs. A legal feasible
-hand is retained even without an optimality proof. Main-solve timeouts do not
-trigger repair or conflict diagnosis; those require proved infeasibility.
-If no legal hand was found, the hand is marked unresolvable. Processing-limit
-messages, including those in saved older results, are notes on the hand page
-and never enter the question queue. Invalid
-models fail processing explicitly. Human facts and missing-evidence answers
-retain their existing behavior.
+
+The main solve has a 60-second ceiling (`DecodeOptions.time_limit`); simple
+hands finish as soon as optimality is proved. A legal feasible hand is retained
+even without an optimality proof; `solver.optimal` preserves that distinction
+even when discard repair changes the display status to `repaired`. Main-solve
+timeouts do not trigger repair or conflict diagnosis; those require proved
+infeasibility. A search that ends without any legal hand leaves the solution
+`unsolved`, and the hand is listed as unresolvable. Processing
+limits are diagnostics: report.md lists them, the studio does not show them,
+and they never enter the question queue. A later main solve of the same hand
+uses the previous haipai, draws and repair/meld choices as hints, never
+constraints: a timed search gets a useful starting assignment after dense
+evidence arrives while new facts can override it. Evidence expansion can require
+multiple solves, so the main-search ceiling is not a limit on the total time to
+reconstruct a hand.
 
 Score reconciliation is part of construction. A possible missed red five or
 other winning-hand alternative must be within the review gap (0.5) and solve
@@ -956,21 +1020,6 @@ returned hand is replay-validated before publication. Review and export share
 the validation results, including correction locations for duplicated tiles;
 an export-rejected hand cannot appear complete in the browser.
 
-Draw alternatives clone the model built for that solve, inserting the exclusion
-at exactly the same constraint position as a full rebuild. Variables, objective,
-constraint order and hints are unchanged. Haipai alternatives rebuild because
-they introduce variables. A confident prior draw, discard or starting-hand margin
-is reusable only if the entire model fingerprint, baseline objective and selected
-tile or multiset match; changing soft
-evidence can change relative confidence even when the preferred tiles stay put.
-The next main solve uses the previous haipai, draws and available repair/meld
-choices as hints, never constraints. This gives a timed search a useful starting
-assignment after dense evidence arrives while letting new facts override it.
-Transient hints are excluded from the model fingerprint; cloned alternatives
-clear inherited hints before adding their own, so every variable is hinted once.
-A legal incumbent whose optimality was not proved remains exportable and carries
-a processing-limit note. `solver.optimal` preserves that distinction
-even when discard repair changes the display status to `repaired`.
 Covered draws and starting hands with close competing alternatives are grouped into
 one `uncertain_tiles` review item. Human-fixed choices, explicit Can't tell
 answers and existing individual questions are excluded. Image coverage alone
@@ -981,14 +1030,8 @@ invented margins, and human-confirmed discards stay hard constraints in repair.
 An explicit Can't tell answer for a starting hand uses `lost` with
 `field=haipai`, scoped to that seat. It marks only the starting-hand confidence
 row as lost; it neither supplies tiles nor answers that player's first draw.
-The main solve has a 60-second ceiling; simple hands finish as soon as optimality
-is proved. Alternative solves keep their four-second ceiling and conservative
-bounds. They can stop earlier once a certified objective lower bound exceeds
-the inclusive review threshold: further optimization of a rejected candidate
-cannot change that confidence decision. An incumbent cost never triggers this
-stop. Exported margins can therefore be lower-bound certificates rather than
-exact alternative cost differences. Evidence expansion can require multiple solves, so the
-main-search ceiling is not a limit on the total time to reconstruct a hand.
+Exported margins are lower-bound certificates, not exact alternative cost
+differences.
 
 **Repair.** A pond reading is evidence too, not a fact: when the hand has no
 legal reconstruction with every discard as read (the fifth tile of a kind,
@@ -1058,14 +1101,14 @@ The site's han and fu constrain the construction alongside legality: the
 reconstruction is the cheapest one whose winning hand scores the site's
 value. When the best one scores otherwise, the alternatives are tried in
 order of the evidence they cost, and the first that scores the site's
-value is taken (a note, not a question):
+value is taken (a diagnostic, not a question):
 1. an unseen tsumo tile: the tiles that complete the hand with that score,
    ranked by what the reveal shows beyond the concealed hand (a 6s the hand
    already holds is no evidence that 6s won; the 14th tile read 9p for 9s
    is), a question only when two of them rank close;
 2. the next-best reconstructions: the solver is run again with the
-   winner's final hand forbidden, then that one too, up to a few times
-   and within a cost budget — the hand whose tiles the views read
+   winner's final hand forbidden, then that one too, up to six times
+   and only within the 0.5 review gap of the best — the hand whose tiles the views read
    ambiguously (a 5s that is also read 8s) is one of them, and the reveal
    frames usually price it close;
 3. a five read plain for red or the reverse — the aka dora is one han,
@@ -1078,7 +1121,7 @@ solved again, so the draws that brought it follow. What none of them
 explains is a `result` question, unless the unknown ura of a riichi win
 can.
 
-**`review.py`** — questions are the scarcest resource: the program solves
+**`questions.py`** — questions are the scarcest resource: the program solves
 what the video and the rules settle, and asks a person only the question
 whose answer settles the most. Uncertain covered draws and starting hands
 appear in one grouped `uncertain_tiles` item and individually in the confidence
@@ -1113,22 +1156,48 @@ question per uncertain draw. The kinds, in that order of priority:
    read found, or a hidden call): its type, tiles and source.
 
 Item kinds: `ura`, `conflict`, `result`, `call`, `discard`, `dora`, `kan`,
-`riichi`, `order`, `draw`, `uncertain_tiles`. Each item: hand, seat, time(s),
-question, candidates with costs, evidence crops (region, t), the best guess,
-and the control it is answered with. Starting-hand choices appear inside
+`riichi`, `order`, `draw`, `uncertain_tiles`. Each item is a short prompt
+(`text`) with structured fields the browser renders without parsing the text:
+seat, turn (`j`) or time, the best guess, tiles, candidates or runner-up,
+margin, and for a conflict its culprit. Starting-hand choices appear inside
 `uncertain_tiles`; unseen draws use `draw` items. Review answers are stored as
 facts, including `haipai` confirmations and `lost` acknowledgements. Confirmed
-tiles constrain the next decode. Imported hand annotations must explicitly
+tiles constrain the next decode. "It is right" on a call question saves the
+shown call as a `meld` fact. A question with no tile answer can be dismissed
+(**Dismiss**, **Leave as conflict**, **Nothing is missing**): a `dismiss` fact
+names the question's stable id (its kind, seat and turn, or rounded time) and is
+review state, never reconstruction input, so it hides the question without a
+rebuild. Imported hand annotations must explicitly
 declare `soft: true` for uncertain evidence or `soft: false` for confirmed tiles;
 their source names do not determine trust. The confidence rows of section 5 hold
 every decision: one per draw, discard, haipai, call and indicator, with its
 margin, the evidence it rests on, `human` when a fact fixed it and `lost`
 when nothing did.
 
-**`indicators.py`** — the dead-wall row and the kans it implies (above).
+Besides its questions, a decode reports three kinds of message. **Notes** are
+the few statements a reviewer benefits from on the hand page: the turn sequence
+uses more wall tiles than the live wall holds (or fewer at an exhaustive draw),
+a tile left a pond and no call explains it, a kan's indicator has no discard
+after it, the site's han/fu were replaced by a confirmed correction.
+**Ignored answers** (`ignored_facts`) are reviewer facts the decoder could not
+apply, each with its kind, seat, time and reason; the studio shows the reason
+on that answer's row with its Delete action. **Diagnostics** are developer
+reasoning (repairs, inversions, re-read melds, processing limits): kept in the
+artifact and in a collapsed section of report.md, never shown in the studio.
+No code parses any of these strings.
 
-**`decode.py`** — runs ponds → melds → indicators → turns → solver →
-scoring → review for one hand and writes `decode/<hand>.json`.
+`review.py` normalizes a hand's facts into constraints (dismissals excluded)
+and turns certificates into confidence rows. **`indicators.py`** — the
+dead-wall row and the kans it implies (above).
+
+**`decode.py`** — runs the stages in order for one hand: `events.py` (pond
+logs, anchored calls, the dead wall, reviewer meld facts, the turn sequence,
+riichi, pond replacements), `reconstruct.py` (the model, the first fit and its
+rereads, repair or a conflict, riichi on a called tile, every kan's indicator),
+the site's score as a constraint (`score_reconcile.py`), the final
+certification, the score, tenpai and ura checks, then the unseen-tile questions
+and the artifact. `decode_hand` never writes; `run_decode` reuses or publishes
+`decode/<hand>.json`.
 
 ### 4.9 `tenhou6.py`
 
@@ -1148,13 +1217,22 @@ seat's draw list naming that tile from that seat takes the turn) and
 reports violations: haipai and final hand sizes, a draw or discard out of
 turn, a discard not in hand, more discards than draws, a call on a tile
 that is not the last discard or from the wrong seat (chi only from
-kamicha), a call without its tiles in hand, count over four with the
-indicators, riichi with an open hand, a hand-tile discard after riichi, a
-winner whose hand does not win, wall draws plus kans over 70, and
-deltas that do not balance. `convert` replays each kyoku on its own, leaves
-out of the log every kyoku that is a conflict or that the replayer rejects
-(section 6: nothing is written for it), and files each violation as a
-review item of that hand.
+kamicha), a call whose tiles do not form its meld (a chi is three consecutive
+tiles of one numbered suit, a pon or kan one kind, a red five counting as a
+five), a call without its tiles in hand, a kan without its replacement draw,
+count over four with the indicators, a dora (or ura) indicator count that does
+not match the kans, riichi with an open hand, a call, added kan or hand-tile
+discard after riichi, a ron on a discard that was not the last or a tsumo the
+hand did not end on, a winner whose hand does not win, wall draws plus kans
+over 70 (or short of it at an exhaustive draw), and deltas that do not
+balance. Each violation is data: a kind (`missing_tile`, `bad_meld`,
+`out_of_turn`, `over_count`, `wall`, ...), a text that names no player, and
+the player, tile and draw or discard position where the replay found it.
+`convert` replays each kyoku on its own and leaves out of the log every kyoku
+that is a conflict or that the replayer rejects (section 6: nothing is written
+for it). A rejected hand gets one export-conflict question listing its
+violations as rows with the seat's wind and the time of the turn where each was
+found; the question opens at the earliest of them.
 
 Dealer split: the dealer's 14-tile haipai is written as 13 tiles plus a
 first draw. The first draw is the dealer's first discard when that tile is
@@ -1164,43 +1242,50 @@ marks the split as arbitrary.
 
 ### 4.10 Review and label tool (`tool/`)
 
-The local studio is one Vue application served by one standard-library HTTP
-backend. `video2tenhou web` is the sole browser entry point. The recording
-selector and Review, Results and Settings components own navigation; review
-and calibration render directly in the application without an iframe.
+The local studio is one Vue application served by one loopback Starlette
+application under Uvicorn. `video2tenhou web` is the sole browser entry point.
+The recording selector and Review, Results and Settings components own
+navigation; review and calibration render directly in the application without
+an iframe. The browser follows the workspace through one status poll,
+`GET /api/job[?project=<key>]`, every second while a job runs and every five
+seconds otherwise; it returns the job and the open project's review revision,
+which changes when hands, answers, calibration, decodes or exports change on
+disk. The processing log is fetched only while it is open.
 
 - **Review** opens directly for processed recordings with a single global queue
   and one full-frame video beside the relevant answer controls.
   Tile palettes, starting/final-hand editors, indicators and meld editors save
   explicit human facts. Additional crops and less common corrections stay
   collapsed. Review prioritizes blocking conflicts, then choices without observed
-  evidence, then increasing certified confidence margin. Unscored diagnostics
-  follow; equally uncertain starting hands precede single draws because they can
-  constrain multiple turns. Other ties retain stable hand/item order. Grouped draws and
-  starting hands keep their original choice identifiers. Search
-  incompleteness is a processing note, never a tile question or retry action.
-- Covered draws with weak certified bounds but only distant feasible alternatives,
-  or no alternative found, remain unresolved confidence checks. They are not
-  expanded into individual video questions. Candidate gaps never certify a
-  choice as correct; these checks remain in confidence data without blocking
-  review completion.
+  evidence, then increasing certified confidence margin. Questions without a
+  margin follow; equally uncertain starting hands precede single draws because
+  they can constrain multiple turns. Other ties retain stable hand/item order.
+  Questions and grouped choices carry stable server ids. Search incompleteness
+  is a diagnostic, never a tile question or retry action.
+- Covered draws with weak certified bounds but no close witness remain
+  unresolvable confidence checks. They are not expanded into individual video
+  questions. Candidate gaps never certify a choice as correct; these checks
+  remain in confidence data without blocking review completion.
   The queue reads confidence from each hand's decoded artifact, cached by its
-  modification time.
+  modification time and size.
 - Each answer saves immediately and starts a background update if none is running.
-  The queue holds related questions from pending hands and offers the most uncertain
-  eligible question in another hand. Answers collected during a running job are
-  applied together in the next batch. Completion refresh preserves an unrelated
-  question's draft and video. New results remove questions resolved by inference.
-  An update failure retains the saved
-  answer and offers a retry. Skipped questions remain unresolved and can be
-  revisited; skipping every question never displays completion. A hanchan with
-  pending changes withholds replay/download links until its changes are applied.
+  A hand with new or deleted answers shows as updating: its questions wait until
+  the update asks again what is still open, and the queue offers the most
+  uncertain eligible question in another hand. Answers collected during a
+  running job are applied together in the next batch. Completion refresh
+  preserves an unrelated question's draft and video. An update failure retains
+  the saved answer and offers a retry. Skipped questions remain unresolved and
+  can be revisited; skipping every question never displays completion. A
+  hanchan with pending hands withholds replay/download links until they are
+  updated.
 - **Advanced review** contains the full hand inspector, editable starting hands,
   saved answers and a chronological turn table. Selecting a turn opens its
-  evidence. Manual changes can be batched with **Apply saved changes**; returning
+  evidence. The hand page lists the decode's notes, and each saved answer the
+  reconstruction could not apply shows the reason on its row beside **Delete**.
+  Manual changes can be batched with **Apply saved changes**; returning
   to the main queue applies them before asking another question. Displayed
-  hand/hanchan numbers are one-based; stored IDs remain zero-based. Low-confidence
-  draws remain marked until their particular choice has a human answer.
+  hand/hanchan numbers are one-based and times are m:ss; stored IDs remain
+  zero-based.
 - **Results** provides hanchan replay/download actions and individual hand links.
   Reports are collapsed below them.
 - **Calibration** is the first step after a new recording is prepared, and is
@@ -1209,18 +1294,25 @@ and calibration render directly in the application without an iframe.
   before testing them. An unchanged check does not write a human fit. **Discard
   changes** reloads saved geometry. Overhead controls and crop previews are
   collapsed. Unsaved geometry blocks navigation and analysis; saved geometry
-  changes require analysis to refresh the affected video evidence.
+  changes require analysis to refresh the affected video evidence. Border check
+  results are kept with the geometry they measured. The plate is built only by
+  preparation; showing it never builds one.
 - **Training labels** remain an advanced feature of the Review tab. Region
-  views can prefill model boxes; a human corrects identities and geometry before
-  saving frame-coordinate annotations. Existing human labels retain an
-  `.orig.json` backup. These annotations are training inputs, not review answers.
+  views can prefill model boxes (eager inference, never cached evidence); a human
+  corrects identities and geometry before saving frame-coordinate annotations.
+  Existing human labels retain an `.orig.json` backup. These annotations are
+  training inputs, not review answers.
 
-Storage: `labels/<video>/facts.jsonl` (kinds draw, discard, haipai,
-final_hand, ura, dora, riichi, lost, site_wrong, note) and `labels/<video>/boxes/*.json`.
-The API (`/api/hands`, `/api/items`, `/api/hand/<i>`, `/api/frame`,
-`/api/read`, `/api/facts`, `/api/label`, `/api/decode/<i>`) returns JSON free
-of NaN so the browser can parse it; static files are served with
-`Cache-Control: no-store`.
+Storage: `labels/<video>/facts.jsonl` (kinds haipai, final_hand, draw,
+discard, missing_discard, meld, meld_remove, riichi, riichi_turn, kan_time,
+ura, dora, lost, site_wrong, dismiss) and `labels/<video>/boxes/*.json`.
+Project review routes live under `/review/<key>/api/`: `hands`, `items`,
+`hand/<i>`, `frame`, `clip`, `plate`, `read`, `context`, `facts` (GET and
+POST), `facts/delete`, `label`, `calib` (GET and POST), `calib/fit`,
+`calib/check` and `rebuild`. Workspace routes include `/api/job` and
+`/api/projects/<key>/log`. JSON responses are free of NaN so the browser can
+parse them. Pages and API responses are `Cache-Control: no-store`;
+content-hashed bundles and tile art are cacheable as immutable.
 
 ### 4.11 Training (`train/`)
 
@@ -1237,8 +1329,13 @@ and expected inputs in [maintenance](MAINTENANCE.md#training).
 
 `python -m video2tenhou.eval` exposes detector, perception and observation
 checks against local annotations. `convert` runs stages 1–6 with caching;
-`web` opens the full workflow, `calib check`
-renders calibration checks, and `download` fetches a VOD.
+`rebuild` reconstructs hands from the existing readings with the saved answers
+and rewrites the exports; `web` opens the full workflow; `calib fit` and
+`calib check` measure and check the geometry; `download` fetches a VOD and
+`trim` cuts a local recording's time range into a separate clip. Every command
+except `web` ends with one JSON outcome line on stdout when it has an outcome
+to report: `{"result": ...}` or `{"error": "..."}`, the error telling the user
+what to do; tracebacks stay in the log on stderr.
 
 ## 5. Data formats (all JSON / JSONL, times in seconds of the video)
 
@@ -1251,33 +1348,43 @@ renders calibration checks, and `download` fetches a VOD.
 - `labels/<video>/calib.json`: this video's fit —
   `{video, layout, overhead:{center:[x,y], angle, scale, iou}, hand:{corner:{rect,roll}}, meld:{corner:{rect}}, cam:{corner:rect}, source, ts}`.
   Absent means the layout's own numbers are used, which is only right for the video the layout was drawn on.
-- `calm.jsonl`: `{region, t0, t1, n, motion, skin, calm: bool, partial: bool}`; `calm_scores.npz` carries
-  region geometry (`calm.geometry_key`) and source-content SHA-256. The source hash is refreshed at
-  stage entry, so replacing bytes at the same path invalidates scores even if size/timestamps match.
+- `work/source-digests.json` (under the data directory): `{<resolved path>: {file:[size, mtime_ns, ctime_ns, inode, device], sha256}}`,
+  one record per recording; a record whose file identity no longer matches is hashed again.
+- `calm.jsonl`: `{region, t0, t1, n, motion, skin, calm: bool, partial: bool}`, published atomically; `calm_scores.npz` carries
+  region geometry (`calm.geometry_key`) and the source-content SHA-256 from `work/source-digests.json`.
   Changed geometry, changed source or missing provenance requires recomputation; threshold
   changes can reuse the same proven scores. Scores are published by atomic replacement after a
   complete write; corrupt or incomplete arrays are cache misses, and a failed recomputation leaves
   the previous complete score file intact.
 - `reads/<hand>/<region>.jsonl`: `{t, region, size:[w, h], rejected, boxes:[{xyxy, conf, sideways, role, row?, col?, group?, p:[39 floats]}]}`;
   `role` ∈ tile | indicator | extra (a hand's meld beside the row) | other (not of this region); `rejected`
-  marks a pond reading whose rows cannot exist (seven positions). `reads/<hand>/done.json`:
-  `{hand, readings, detector, classifier, cap, geometry, identity}`; cache validation also binds source,
-  exact sampling plan and recognition/runtime identity. A changed recognition input re-reads the hand.
+  marks a pond reading whose rows cannot exist (seven positions). `reads/<hand>/done.json`, written last:
+  `{hand, readings, detector, classifier, identity:{source, fps, preprocessing, classifier_metadata}, cap, geometry, window, plan, outputs:{region: sha256}}`.
+  A changed source, recognition identity, cap or decode window re-reads the hand; a moved region re-reads that region.
   `dense/<t0>_<t1>_<hash>.json`: the signature binds the exact window, frame rate, requested regions,
   source, recognition/runtime identity, geometry and dense-stage evidence policy.
 - `obs/<hand>.json`: `{region: [{t0, t1, iv_t0, iv_t1, n_readings, n_used, count, quality, partial, slots:[{key, tile, p:[39], sideways, disagree, xyxy}], indicators:[..], extra:[[slot]]}]}`;
   `t0`/`t1` are the first and last reading used (reads are clipped to the hand window), `iv_t0`/`iv_t1`
   the calm interval; `extra` holds the groups a hand reading found beside the row (melds moved at a reveal).
-- `decode/<hand>.json`: `{decoder_version, hand, play_window, turns:[{i, seat, j, kind, t, draw, margin, discard, tsumogiri, riichi, call?, own_call?}], haipai:{seat:[..]}, haipai_margin:{seat:m}, dora:[..], ura:[..], indicators:[..], result, score, solver:{status ∈ optimal|feasible|repaired|infeasible}, items:[...], confidence:[...]}`;
-  an item is `{kind, seat?, t?, j?, text, tile?, candidates?:[{tile, cost}], evidence?:[{region, t}]}`
-- `labels/<video>/facts.jsonl`: `{kind, hand, seat?, turn?, slot?, tile|tiles|order, note, author, ts}`
+  `obs/provenance/<hand>.json`, removed before a rewrite and written last:
+  `{inputs:{version, window, reads (digest of done.json), intervals, classes, evidence_policy, persist}, output_sha256}`.
+- `decode/<hand>.json`: `{decoder_version, hand, game, kyoku, honba, play_window, t_last, dealer, turns:[{i, seat, j, kind, t, draw, margin, discard, tsumogiri, riichi, call?, own_call?, ...}], haipai:{seat:[..]}, haipai_margin:{seat:m}, draws, dora:[..], ura:[..], indicators:[..], riichi, result, score:{han, fu, yaku:[{name, han}], match, ...}, solver:{status ∈ optimal|feasible|repaired|infeasible|unsolved, objective, optimal, low_margin}, calls, notes:[str], ignored_facts:[{kind, seat, t, reason}], diagnostics:[str], items:[...], confidence:[...], stats, validation, decode_inputs, decode_context}`;
+  an item is `{kind, seat?, t?, j?, text, tile?, tiles?, candidates?, runner_up?, margin?, ...}` with a short
+  prompt in `text`; a confidence row is `{seat, turn, field, value, margin, alternative_gap, runner_up?, state ∈ resolved|ambiguous|unresolvable|unmeasured, human, lost, evidence, ...}`.
+  `decode_inputs` binds the observation record and dense policy, `decode_context` the hand metadata, site result and facts (dismissals excluded).
+  `validation` is `{ok, errors:[{kind, seat, tile, t, text}]}`, the replayer's violations of the hand's log; when there are any,
+  the items include one `{kind: "conflict", stage: "export", text, violations: [the same rows], over, t?}` question,
+  `t` being the earliest violation time and `over` the over-counted kinds with their sources.
+- `labels/<video>/facts.jsonl`: `{kind, hand, game, kyoku, honba, seat?, corner?, t?, j?, tile|tiles|type|source|seats|item|han|fu, author, ts}`;
+  the corner, not the seat letter, identifies the player. A `dismiss` fact names a question id.
 - `labels/<video>/boxes/<kind>_<corner>_<t>.json` (kind = pond | hand | meld):
   `{video, t, kind, corner, boxes:[{quad:[[x,y]×4] in 1080p frame pixels, tile, sideways, role: tile|indicator, row?, col?}], rows? (pond tokens, "-" = gap), tiles? (hand, left to right), melds?, revealed?, occluded?, source}`.
   Frame coordinates keep the labels independent of any panel geometry; the
   dataset builder maps quads into the current calibration's regions.
-- `g<k>.confidence.json`: `{hand:[{seat, turn, field ∈ draw|discard|haipai|call|dora, value, margin, human, lost, evidence:[{region,t}]}]}`
-  (a margin of `null` means none was computed; the dealer's 13 + 1 split is a `first_draw` row marked arbitrary).
+- `g<k>.confidence.json`: `{hand:[{seat, turn, field ∈ draw|discard|haipai|call|dora, value, margin, alternative_gap?, state, human, lost, evidence:[{region,t}]}]}`,
+  the decode's confidence rows (a margin of `null` means none was computed; the dealer's 13 + 1 split is a `first_draw` row marked arbitrary).
   A hand left out of the log (a conflict, or rejected by the replayer) has no rows.
+- `export-inputs.json`: `{decodes:{<hand>: [mtime_ns, size] | null}}`, written after every other export file.
 
 Tiles in all internal files use the notation of section 1; tenhou numbers
 appear only in the log.
@@ -1306,7 +1413,9 @@ appear only in the log.
 - **Conflict** (constraints unsatisfiable even after repair: site record and
   video disagree, replayer rejects the log, calibration does not fit): the
   run stops for that hand with a `conflict` entry in the report; nothing is
-  written for it.
+  written for it. The reviewer sees one `conflict` question: the decision the
+  diagnosis blames, or the violations the replayer found, listed with seat
+  and time.
 
 ## 7. Validation
 

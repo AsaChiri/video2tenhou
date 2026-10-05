@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { api, upload } from "../shared/api";
+import { useAction } from "../shared/useAction";
 import { gameIds, timeRange } from "./validation";
 
 const emit = defineEmits(["created", "error"]);
@@ -12,35 +13,33 @@ const kind = ref("local"),
   layout = ref("");
 const start = ref(""),
   end = ref(""),
-  busy = ref(false),
-  progress = ref<number | null>(null);
-async function submit() {
-  if (busy.value) return;
-  busy.value = true;
+  progress = ref<number | null>(null),
+  { busy, run } = useAction((message) => emit("error", message));
+function submit() {
   emit("error", "");
-  try {
-    // Capture the form before copying a large file; changing tabs cannot change this import.
-    const body = {
-      ...(name.value.trim() ? { display_name: name.value.trim() } : {}),
-      kind: kind.value,
-      games: gameIds(games.value),
-      layout: layout.value.trim(),
-      ...timeRange(start.value.trim(), end.value.trim()),
-    };
-    let source = url.value.trim();
-    if (body.kind === "local") {
-      if (!file.value) throw new Error("Choose a video file.");
-      progress.value = 0;
-      source = await upload(file.value, (value) => (progress.value = value));
+  return run(async () => {
+    try {
+      // Capture the form before copying a large file; changing tabs cannot
+      // change this import.
+      const body = {
+        ...(name.value.trim() ? { display_name: name.value.trim() } : {}),
+        kind: kind.value,
+        games: gameIds(games.value),
+        layout: layout.value.trim(),
+        ...timeRange(start.value.trim(), end.value.trim()),
+      };
+      let source = url.value.trim();
+      if (body.kind === "local") {
+        if (!file.value) throw new Error("Choose a video file.");
+        progress.value = 0;
+        source = await upload(file.value, (value) => (progress.value = value));
+      }
+      if (!source) throw new Error("Enter a remote video URL.");
+      emit("created", await api("/api/projects", { ...body, source }));
+    } finally {
+      progress.value = null;
     }
-    if (!source) throw new Error("Enter a remote video URL.");
-    emit("created", await api("/api/projects", { ...body, source }));
-  } catch (error) {
-    emit("error", error instanceof Error ? error.message : String(error));
-  } finally {
-    busy.value = false;
-    progress.value = null;
-  }
+  });
 }
 </script>
 

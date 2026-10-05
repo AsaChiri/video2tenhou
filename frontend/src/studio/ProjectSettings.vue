@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { api } from "../shared/api";
+import { useAction } from "../shared/useAction";
+import { time } from "../review/format";
 import type { Project } from "../types";
 import { gameIds } from "./validation";
-const props = defineProps<{ project: Project }>();
+// `locked`: a job is running somewhere in the workspace.
+const props = defineProps<{ project: Project; locked?: boolean }>();
 const emit = defineEmits([
   "updated",
   "error",
@@ -14,11 +17,9 @@ const emit = defineEmits([
 const games = ref(props.project.games.join(", ")),
   layout = ref(props.project.layout),
   saved = ref(""),
-  busy = ref(false);
-async function save() {
-  if (busy.value) return;
-  busy.value = true;
-  try {
+  { busy, run } = useAction((message) => emit("error", message));
+const save = () =>
+  run(async () => {
     emit(
       "updated",
       await api(`/api/projects/${props.project.id}/settings`, {
@@ -27,20 +28,15 @@ async function save() {
       }),
     );
     saved.value = "Saved";
-  } catch (error) {
-    emit("error", error instanceof Error ? error.message : String(error));
-  } finally {
-    busy.value = false;
-  }
-}
+  });
 </script>
 <template>
   <div class="panel settings">
     <section class="settings-section">
       <h2>Recording settings</h2>
       <p v-if="project.start || project.end != null" class="hint">
-        Selected range: {{ project.start || 0 }}s to
-        {{ project.end == null ? "end of recording" : project.end + "s" }}.
+        Selected range: {{ time(project.start) }} to
+        {{ project.end == null ? "end of recording" : time(project.end) }}.
         Review times start at zero. Add a recording to use a different range.
       </p>
       <form @submit.prevent="save">
@@ -52,29 +48,23 @@ async function save() {
           <label for="settings-layout">Layout</label
           ><input id="settings-layout" v-model="layout" />
         </div>
-        <button class="primary" :disabled="project.job.running || busy">
-          Save settings</button
+        <button class="primary" :disabled="locked || busy">Save settings</button
         ><span role="status">{{ saved }}</span>
       </form>
     </section>
     <section class="settings-section">
       <h3>Processing</h3>
       <div class="actions">
-        <button :disabled="project.job.running" @click="emit('prepare')">
+        <button :disabled="locked || project.checking" @click="emit('prepare')">
           Prepare recording
         </button>
         <button
-          :disabled="
-            !(project.can_calibrate ?? project.has_fit) || project.job.running
-          "
+          :disabled="!project.can_calibrate || locked"
           @click="emit('calibrate')"
         >
           Calibration
         </button>
-        <button
-          :disabled="!project.has_fit || project.job.running"
-          @click="emit('analyze')"
-        >
+        <button :disabled="!project.has_fit || locked" @click="emit('analyze')">
           Analyze again
         </button>
       </div>

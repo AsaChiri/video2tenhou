@@ -1,21 +1,50 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useReview } from "./context";
-import { cornerOf, decisionLabel, roundName, seatName } from "./format";
+import { cornerOf, decisionLabel, roundName, seatName, time } from "./format";
+import { handEnd, questionWindow } from "./evidence";
+import { errorText } from "../shared/useAction";
 import AnswerEditor from "./AnswerEditor.vue";
 import EvidencePlayer from "./EvidencePlayer.vue";
 import EvidenceDetails from "./EvidenceDetails.vue";
 import CameraContext from "./CameraContext.vue";
-import type { HandData, HandEntry, ReviewItem, Turn, Decode } from "../types";
+import type {
+  Decision,
+  HandData,
+  HandEntry,
+  ReviewItem,
+  Decode,
+} from "../types";
 interface Loaded {
+  key: string;
   item: ReviewItem & { t: number };
   entry: HandEntry;
-  turn?: Turn;
   decode: Decode;
+  span: [number, number];
 }
 const review = useReview(),
   loaded = ref<Loaded | null>(null),
   loading = ref(false);
+
+/** The question as one item: a grouped choice carries its own field and value. */
+function question({ item, choice }: Decision): ReviewItem {
+  if (!choice) return { ...item };
+  const kind = choice.field || choice.kind || "";
+  return {
+    ...choice,
+    id: choice.id || item.id,
+    hand: item.hand,
+    kind,
+    tile:
+      kind === "draw" && typeof choice.value === "string"
+        ? choice.value
+        : undefined,
+    tiles:
+      kind === "haipai" && Array.isArray(choice.value)
+        ? choice.value
+        : undefined,
+  };
+}
 watch(
   review.selection,
   async (selection, _, cleanup) => {
@@ -28,80 +57,48 @@ watch(
     try {
       const result = await review.api<HandData>(`hand/${selection.item.hand}`);
       if (!current) return;
-      const item: ReviewItem =
-        selection.choice === null
-          ? { ...selection.item }
-          : {
-              ...selection.decision,
-              hand: selection.item.hand,
-              idx: selection.item.idx,
-              kind: selection.decision.field || selection.decision.kind || "",
-              tile:
-                selection.decision.field === "draw" &&
-                typeof selection.decision.value === "string"
-                  ? selection.decision.value
-                  : undefined,
-              tiles:
-                selection.decision.field === "haipai" &&
-                Array.isArray(selection.decision.value)
-                  ? selection.decision.value
-                  : undefined,
-            };
-      const turn = result.decode?.turns?.find(
+      const item = question(selection);
+      const decode = result.decode || {};
+      const turn = decode.turns?.find(
         (turn) => turn.seat === item.seat && turn.j === item.j,
       );
-      item.t ??=
-        turn?.t ??
-        result.entry.t_last ??
-        result.entry.play_window?.[1] ??
-        result.entry.t_end;
-      if (item.kind === "haipai")
-        item.t = selection.decision.t ?? result.entry.t_start;
+      const t =
+        item.kind === "haipai"
+          ? (item.t ?? result.entry.t_start)
+          : (item.t ?? turn?.t ?? handEnd(decode, result.entry));
+      const placed = { ...item, t };
       loaded.value = {
-        item: { ...item, t: item.t ?? 0 },
+        key: selection.key,
+        item: placed,
         entry: result.entry,
-        decode: result.decode || {},
-        turn,
+        decode,
+        span: questionWindow(placed, result.entry, decode, turn),
       };
     } catch (error) {
-      if (current)
-        review.error.value =
-          error instanceof Error ? error.message : String(error);
+      if (current) review.error.value = errorText(error);
     } finally {
       if (current) loading.value = false;
     }
   },
   { immediate: true },
 );
-const span = computed(() => {
-  if (!loaded.value) return [0, 0];
-  const { item, entry, turn, decode } = loaded.value,
-    t = item.t ?? 0;
-  if (item.kind === "draw")
-    return [
-      Math.max(entry.t_start || 0, (turn?.t_prev ?? t - 15) - 6),
-      t + (t >= (decode.t_last ?? 0) - 1 ? 30 : 4),
-    ];
-  if (item.kind === "discard") return [t - 8, t + 6];
-  if (item.kind === "result" || item.kind === "ura" || item.kind === "dora")
-    return item.guess
-      ? [t - 5, t + 25]
-      : [(entry.t_last ?? t) - 3, (entry.t_last ?? t) + 30];
-  return [Math.max(entry.t_start || 0, t - 10), t + 10];
-});
+const end = computed(() =>
+  loaded.value ? handEnd(loaded.value.decode, loaded.value.entry) : 0,
+);
 </script>
 <template>
   <p v-if="loading" role="status">Loading evidence…</p>
   <p v-else-if="!loaded">Evidence could not be loaded.</p>
   <template v-else
     ><p class="question-context">
-      Hanchan {{ loaded.entry.game + 1 }} · {{ roundName(loaded.entry) }}
+      Hand {{ loaded.entry.hand + 1 }} · Hanchan {{ loaded.entry.game + 1 }} ·
+      {{ roundName(loaded.entry) }}
     </p>
     <div class="workbench">
       <EvidencePlayer
-        :key="`${loaded.item.hand}:${loaded.item.idx}:${review.selection.value?.choice}`"
-        :start="span[0]"
-        :end="span[1]"
+        :key="loaded.key"
+        :start="loaded.span[0]"
+        :end="loaded.span[1]"
       />
       <div class="answer-panel">
         <h2>
@@ -112,7 +109,7 @@ const span = computed(() => {
           }}{{ decisionLabel(loaded.item) }}
         </h2>
         <AnswerEditor
-          :key="`${loaded.item.hand}:${loaded.item.idx}:${review.selection.value?.choice}`"
+          :key="loaded.key"
           :item="loaded.item"
           :entry="loaded.entry"
           :decode="loaded.decode"
@@ -125,8 +122,8 @@ const span = computed(() => {
         <template v-if="loaded.item.seat"
           ><EvidenceDetails
             :region="`hand:${cornerOf(loaded.entry, loaded.item.seat)}`"
-            :start="span[0]"
-            :end="span[1]"
+            :start="loaded.span[0]"
+            :end="loaded.span[1]"
             label="Hand camera" /><EvidenceDetails
             :region="`pond:${cornerOf(loaded.entry, loaded.item.seat)}`"
             :at="loaded.item.t + 2"
@@ -141,8 +138,8 @@ const span = computed(() => {
           v-for="offset in [6, 14, 22]"
           :key="offset"
           region="overhead"
-          :at="(loaded.entry.t_last ?? loaded.item.t) + offset"
-          :label="`Overhead at end + ${offset}s`"
+          :at="end + offset"
+          :label="`Overhead at ${time(end + offset)}`"
         />
       </details></div
   ></template>

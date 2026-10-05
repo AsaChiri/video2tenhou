@@ -13,8 +13,7 @@ The format (as consumed by tenhou.net/6, mjai-reviewer, Mortal, tensoul, ...):
     }
 
     <kyoku> = [
-      [kyoku_index, honba, riichi_sticks],   # kyoku_index: 0=E1 .. 3=E4, 4=S1 .. 7=S4,
-      8=W1 ..
+      [kyoku_index, honba, riichi_sticks],   # kyoku_index: 0=E1 .. 3=E4, 4=S1 ..
       [score0, score1, score2, score3],      # scores at the start of the hand
       [dora indicators...],
       [ura dora indicators...],              # empty unless someone won with riichi
@@ -39,15 +38,12 @@ from (left = kamicha, middle = toimen, right = shimocha):
     pon    "p<called><a><b>" | "<a>p<called><b>" | "<a><b>p<called>"
     daiminkan  "m<called><a><b><c>" | "<a>m<called><b><c>" | "<a><b><c>m<called>"
     ankan  "<t><t><t>a<t>"
-    kakan  "k<t><a><b><c>" | "<a>k<t><b><c>" | "<a><b>k<t><c>"   (position = original
-    pon)
+    kakan  "k<t><a><b><c>" | "<a>k<t><b><c>" | "<a><b>k<t><c>"   (the pon's position)
 
-Result:
+Result (the ruleset has no abortive draws):
     ["和了", [delta...],
      [winner, from, pao, "<fu>符<han>飜<pts>点", "yaku(1飜)", ...], ...]
     ["流局", [delta...]]
-    ["九種九牌"] / ["四風連打"] / ["四家立直"] / ["四開槓"] / ["三家和"]
-    ["流し満貫", [delta...]]
 """
 
 from __future__ import annotations
@@ -70,6 +66,8 @@ MAX_SUIT_RANK = 9
 SHIMOCHA_SOURCE_OFFSET = 2
 RESULT_FIELD_INDEX = 16
 STARTING_HAND_SIZE = 13
+MELD_SIZE = 3  # tiles of a chi or pon
+KAN_SIZE = 4
 
 
 TSUMOGIRI = 60
@@ -82,39 +80,30 @@ RYUKYOKU = "流局"
 # ---------------------------------------------------------------------------
 
 _SUIT_BASE = {"m": 10, "p": 20, "s": 30, "z": 40}
-_AKA = {"m": 51, "p": 52, "s": 53}
+RED_ID = {15: 51, 25: 52, 35: 53}  # plain five -> the red five of its suit
+PLAIN_ID = {red: five for five, red in RED_ID.items()}  # red five -> plain five
 
 
 def tile(s: str) -> int:
-    """Parse a tile token, distinguishing ordinary and red fives.
-
-    Parse a tile in mjai/tenhou short notation: '5m', '0p' (red 5p), '1z' (E) ... '7z'
-    (R).
-    """
+    """Parse a tile in short notation: '5m', '0p' (red 5p), '1z' (E) ... '7z' (R)."""
     if len(s) != TILE_TOKEN_LENGTH or s[1] not in _SUIT_BASE or not s[0].isdigit():
-        msg = f"bad tile {s!r}"
-        raise ValueError(msg)
+        raise ValueError(f"bad tile {s!r}")
     n, suit = int(s[0]), s[1]
     if n == 0:
         if suit == "z":
-            msg = "no red honor tile"
-            raise ValueError(msg)
-        return _AKA[suit]
+            raise ValueError("no red honor tile")
+        return RED_ID[_SUIT_BASE[suit] + 5]
     if suit == "z" and not 1 <= n <= MAX_HONOR_RANK:
-        msg = f"bad honor {s!r}"
-        raise ValueError(msg)
+        raise ValueError(f"bad honor {s!r}")
     if suit != "z" and not 1 <= n <= MAX_SUIT_RANK:
-        msg = f"bad number {s!r}"
-        raise ValueError(msg)
+        raise ValueError(f"bad number {s!r}")
     return _SUIT_BASE[suit] + n
 
 
 def tile_str(t: int) -> str:
     """Inverse of :func:`tile`."""
-    if t in (51, 52, 53):
-        return "0" + "mps"[t - 51]
-    suit = {1: "m", 2: "p", 3: "s", 4: "z"}[t // 10]
-    return f"{t % 10}{suit}"
+    suit = {1: "m", 2: "p", 3: "s", 4: "z"}[deaka(t) // 10]
+    return f"0{suit}" if t in PLAIN_ID else f"{t % 10}{suit}"
 
 
 def tiles(spec: str) -> list[int]:
@@ -127,17 +116,15 @@ def tiles(spec: str) -> list[int]:
             out.extend(tile(d + ch) for d in digits)
             digits = ""
         elif not ch.isspace():
-            msg = f"bad char {ch!r} in {spec!r}"
-            raise ValueError(msg)
+            raise ValueError(f"bad char {ch!r} in {spec!r}")
     if digits:
-        msg = f"trailing digits in {spec!r}"
-        raise ValueError(msg)
+        raise ValueError(f"trailing digits in {spec!r}")
     return out
 
 
 def deaka(t: int) -> int:
     """Map a red-five ID to its ordinary kind for shape checks, preserving other IDs."""
-    return {51: 15, 52: 25, 53: 35}.get(t, t)
+    return PLAIN_ID.get(t, t)
 
 
 # ---------------------------------------------------------------------------
@@ -176,18 +163,14 @@ def pon(called: int, a: int, b: int, rel: Rel) -> str:
 
 
 def daiminkan(called: int, a: int, b: int, c: int, rel: Rel) -> str:
-    """Encode an open kan with its called tile's relative source seat.
-
-    Encode an open kan with the called-tile position identifying its relative source
-    seat.
-    """
+    """Encode an open kan with the called-tile position identifying its source."""
     return _place("m", called, (a, b, c), rel, kan=True)
 
 
 def ankan(t: int, *, has_aka: bool = False) -> str:
     """Encode a concealed kan with an optional red-five substitution."""
     n = deaka(t)
-    first = {15: 51, 25: 52, 35: 53}[n] if has_aka else n
+    first = RED_ID[n] if has_aka else n
     return f"{first}{n}{n}a{n}"
 
 
@@ -202,10 +185,7 @@ def kakan(added: int, a: int, b: int, c: int, rel: Rel) -> str:
 
 
 def discard(t: int, *, tsumogiri: bool = False, riichi: bool = False) -> int | str:
-    """Consume a discard after any self-kans and their replacement draws.
-
-    Encode a tile discard, using 60 for tsumogiri and an r prefix for riichi.
-    """
+    """Encode a tile discard, using 60 for tsumogiri and an r prefix for riichi."""
     v: int | str = TSUMOGIRI if tsumogiri else t
     return f"r{v}" if riichi else v
 
@@ -217,29 +197,20 @@ def discard(t: int, *, tsumogiri: bool = False, riichi: bool = False) -> int | s
 
 @dataclass
 class Win:
-    """Winner, point deltas and yaku in starting-seat order.
-
-    One winner in an agari result, with starting-seat indices, point deltas and yaku
-    text.
-    """
+    """One winner of an agari result: starting-seat indices, point deltas and yaku."""
 
     winner: int
     from_seat: int  # == winner for tsumo
     delta: list[int]
     score_text: str = ""  # e.g. "30符4飜7700点" or "満貫8000点" / "跳満12000点"
     yaku: list[str] = field(default_factory=list)  # e.g. "立直(1飜)", "断幺九(1飜)"
-    pao: int | None = None
 
     def dump(self) -> list:
-        """Serialize a replay-validated hand to the positional Tenhou format.
+        """Serialize as the [deltas, winner details] pair of an agari block.
 
-        Tenhou result pair [deltas, winner details], ready to append to an agari block.
+        The ruleset has no pao: the responsible seat is the winner.
         """
-        head = [
-            self.winner,
-            self.from_seat,
-            self.pao if self.pao is not None else self.winner,
-        ]
+        head = [self.winner, self.from_seat, self.winner]
         return [self.delta, [*head, self.score_text, *list(self.yaku)]]
 
 
@@ -250,10 +221,7 @@ class Agari:
     wins: list[Win]
 
     def dump(self) -> list:
-        """Serialize a replay-validated hand to the positional Tenhou format.
-
-        Serialize all wins in the order expected by the Tenhou viewer.
-        """
+        """Serialize all wins in the order expected by the Tenhou viewer."""
         out: list = [AGARI]
         for w in self.wins:
             out.extend(w.dump())
@@ -262,21 +230,13 @@ class Agari:
 
 @dataclass
 class Ryukyoku:
-    """Draw result; only exhaustive/nagashi draws include point deltas."""
+    """An exhaustive draw with its tenpai payments."""
 
     delta: list[int] = field(default_factory=lambda: [0, 0, 0, 0])
-    kind: str = (
-        RYUKYOKU  # 流局 / 流し満貫 / 九種九牌 / 四風連打 / 四家立直 / 四開槓 / 三家和
-    )
 
     def dump(self) -> list:
-        """Serialize a replay-validated hand to the positional Tenhou format.
-
-        Serialize a draw result, omitting point deltas for abortive draw kinds.
-        """
-        if self.kind in (RYUKYOKU, "流し満貫"):
-            return [self.kind, self.delta]
-        return [self.kind]
+        """Serialize as Tenhou's draw result."""
+        return [RYUKYOKU, self.delta]
 
 
 Result = Agari | Ryukyoku
@@ -315,11 +275,7 @@ class Kyoku:
         return f"{WINDS[self.kyoku // 4]}{self.kyoku % 4 + 1}局"
 
     def dump(self) -> list:
-        """Serialize a replay-validated hand to the positional Tenhou format.
-
-        Serialize the positional Tenhou hand array; callers should replay-validate
-        before export.
-        """
+        """Serialize the positional Tenhou hand array; replay it before export."""
         out: list = [
             [self.kyoku, self.honba, self.riichi_sticks],
             list(self.scores),
@@ -335,11 +291,7 @@ class Kyoku:
 
 @dataclass
 class Game:
-    """Tenhou game container with consistent starting-seat order.
-
-    Tenhou export container; names and every hand stream use the same starting-seat
-    order.
-    """
+    """Tenhou export container; names and every hand stream use starting-seat order."""
 
     names: list[str]
     title: list[str] = field(default_factory=lambda: ["", ""])
@@ -348,9 +300,11 @@ class Game:
     kyokus: list[Kyoku] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        # the fields tenhou's own logs carry; the viewer (tenhou.net/5) reads
-        # title/name/rule/log
-        """Produce the Tenhou viewer envelope with conservative default metadata."""
+        """Produce the Tenhou viewer envelope with conservative default metadata.
+
+        These are the fields tenhou's own logs carry; the viewer (tenhou.net/5) reads
+        title / name / rule / log.
+        """
         return {
             "ver": "2.3",
             "ref": "",
@@ -370,28 +324,22 @@ class Game:
         return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":"))
 
     def viewer_url(self, kyoku_index: int = 0) -> str:
-        """Build the viewer URL for a complete game and selected hand.
-
-        URL that opens the whole log in tenhou's viewer (tenhou.net/5), starting at
-        kyoku `kyoku_index`.
-        """
+        """URL opening the whole log in tenhou's viewer (tenhou.net/5) at a kyoku."""
         return viewer_url(self.to_dict(), kyoku_index)
 
     def editor_url(self, kyoku_index: int) -> str:
-        """Build the Tenhou editor URL for one kyoku.
+        """Build the tenhou.net/6 URL of one kyoku.
 
-        tenhou.net/6 URL of one kyoku. tenhou.net/6 is the log editor: it loads only
-        log[ts], and the tools that take its URLs take one kyoku per URL, so the URL
-        carries that kyoku alone, in the editor's own export shape (title / name / rule
-        / log).
+        tenhou.net/6 is the log editor: it loads only log[ts], and the tools that take
+        its URLs take one kyoku per URL, so the URL carries that kyoku alone, in the
+        editor's own export shape (title / name / rule / log).
         """
         return editor_url(self.to_dict(), kyoku_index)
 
     def links_html(self) -> str:
-        """Build viewer and per-hand editor links for a hanchan.
+        """Build a page with the hanchan in the viewer and each kyoku's editor URL.
 
-        A page with the whole hanchan in the viewer and the editor URL of each kyoku,
-        one by one or all at once.
+        The editor URLs can be copied one by one or all at once.
         """
         rows = [
             (
@@ -421,18 +369,14 @@ class Game:
 
 
 def viewer_url(data: dict, kyoku_index: int = 0) -> str:
-    """Build the viewer URL for a complete game and selected hand.
-
-    Open a serialized Tenhou game at a zero-based hand, preserving its metadata.
-    """
+    """Open a serialized Tenhou game in the viewer at a zero-based hand."""
     return "https://tenhou.net/5/#json=" + _url_json(data) + f"&ts={kyoku_index}"
 
 
 def editor_url(data: dict, kyoku_index: int) -> str:
-    """Build the Tenhou editor URL for one kyoku.
+    """Build a single-hand editor link from a serialized game.
 
-    Build a single-hand editor link from a serialized game; invalid indices raise
-    IndexError.
+    Invalid indices raise IndexError.
     """
     hand = {key: data[key] for key in ("title", "name", "rule") if key in data}
     hand["log"] = [data["log"][kyoku_index]]
@@ -440,11 +384,7 @@ def editor_url(data: dict, kyoku_index: int) -> str:
 
 
 def _url_json(d: dict) -> str:
-    """Encode log JSON for the Tenhou editor's URL fragment.
-
-    JSON for a tenhou #json= URL, encoded as the editor does it (encodeURIComponent,
-    commas kept).
-    """
+    """Encode JSON for a tenhou #json= URL as the editor does (commas kept)."""
     return quote(
         json.dumps(d, ensure_ascii=False, separators=(",", ":")), safe="-_.!~*'(),"
     )
@@ -467,26 +407,39 @@ def _parse_call(s: str) -> tuple[str, list[int], int]:
 
 
 def _feeder(kind: str, pos: int) -> Rel:
-    """Infer a call's relative source from its encoded tile placement.
-
-    relative_seat of the player a chi / pon / daiminkan took its tile from, by the
-    marked position.
-    """
+    """Return the relative_seat a chi / pon / daiminkan took its tile from."""
     if kind == "c":
         return 0
     return {0: 0, 1: 1, 2: 2, 3: 2}[pos]
 
 
+CALL_NAMES = {"c": "chi", "p": "pon", "m": "daiminkan", "a": "ankan", "k": "kakan"}
+
+
+def _shape_ok(kind: str, tiles: list[int]) -> bool:
+    """Whether a call's tiles form its meld.
+
+    A chi is three consecutive tiles of one numbered suit, a pon three of one kind and
+    every kan four of one kind (red fives count as fives).
+    """
+    kinds = sorted(deaka(t) for t in tiles)
+    if kind == "c":
+        return (
+            len(kinds) == MELD_SIZE
+            and kinds[-1] < _SUIT_BASE["z"]
+            and kinds[0] // 10 == kinds[-1] // 10
+            and kinds == list(range(kinds[0], kinds[0] + MELD_SIZE))
+        )
+    size = MELD_SIZE if kind == "p" else KAN_SIZE
+    return len(kinds) == size and len(set(kinds)) == 1
+
+
 def _limit(t: int) -> int:
-    return 1 if t in (51, 52, 53) else (3 if t in (15, 25, 35) else 4)
+    return 1 if t in PLAIN_ID else (3 if t in RED_ID else 4)
 
 
 def _wins(concealed: Counter) -> bool:
-    """Check whether the concealed tiles form a complete winning hand.
-
-    Is this concealed part (melds taken out) a complete hand? Shanten -1 with the
-    mahjong library.
-    """
+    """Is the concealed part (melds taken out) a complete hand? Shanten -1."""
     arr = [0] * 34
     for t, n in concealed.items():
         if n > 0:
@@ -496,6 +449,29 @@ def _wins(concealed: Counter) -> bool:
     if sum(arr) not in (2, 5, 8, 11, 14):
         return False
     return Shanten().calculate_shanten(arr) == -1
+
+
+@dataclass(frozen=True)
+class Violation:
+    """One rule of play a replayed kyoku breaks.
+
+    ``player`` is the tenhou player index (None for the whole kyoku); ``draw`` and
+    ``discard`` index that player's streams where the replay found it. ``text``
+    describes it without naming the player.
+    """
+
+    kyoku: str
+    kind: str
+    text: str
+    player: int | None = None
+    tile: str | None = None
+    draw: int | None = None
+    discard: int | None = None
+
+    def __str__(self) -> str:
+        """Describe the violation with its kyoku and player index."""
+        who = "" if self.player is None else f"seat {self.player} "
+        return f"{self.kyoku}: {who}{self.text}"
 
 
 class _Replay:
@@ -511,44 +487,85 @@ class _Replay:
         self.draws = [list(k[5 + 3 * i]) for i in range(4)]
         self.discards = [list(k[6 + 3 * i]) for i in range(4)]
         self.result = k[RESULT_FIELD_INDEX] if len(k) > RESULT_FIELD_INDEX else None
-        self.problems: list[str] = []
+        self.violations: list[Violation] = []
         self.hands = [Counter(h) for h in self.haipai]
         self.di, self.ki = [0] * 4, [0] * 4  # next draw / discard entry of each seat
-        self.sets, self.open = (
-            [0] * 4,
-            [0] * 4,
-        )  # melds (a kakan is its pon), open melds
+        # melds (a kakan is its pon), open melds
+        self.sets, self.open = [0] * 4, [0] * 4
         self.riichi = [False] * 4
         self.last_draw: list[int | None] = [None] * 4
         self.wall = self.kans = self.declared = 0
-        self.last: tuple[int, int, bool] | None = (
-            None  # (seat, tile, a riichi declaration)
-        )
-        self.ended_on_draw: int | None = (
-            None  # the seat whose draw ended the hand (a tsumo)
+        self.last: tuple[int, int, bool] | None = None  # seat, tile, a declaration
+        # the seat whose draw ended the hand (a tsumo)
+        self.ended_on_draw: int | None = None
+
+    def bad(
+        self,
+        kind: str,
+        text: str,
+        player: int | None = None,
+        *,
+        draw: int | None = None,
+        discard: int | None = None,
+    ) -> None:
+        """Record a violation at the player's draw or discard index, when known."""
+        self.violations.append(
+            Violation(self.name, kind, text, player, draw=draw, discard=discard)
         )
 
-    def bad(self, text: str) -> None:
-        self.problems.append(f"{self.name}: {text}")
-
-    def take(self, i: int, t: int, what: str) -> None:
+    def take(
+        self,
+        i: int,
+        t: int,
+        verb: str,
+        *,
+        draw: int | None = None,
+        discard: int | None = None,
+    ) -> None:
         if self.hands[i][t] <= 0:
-            self.bad(f"seat {i} {what} without {tile_str(t)} in hand")
+            self.violations.append(
+                Violation(
+                    self.name,
+                    "missing_tile",
+                    f"{verb} {tile_str(t)} without it in hand",
+                    i,
+                    tile_str(t),
+                    draw=draw,
+                    discard=discard,
+                )
+            )
         self.hands[i][t] -= 1
 
-    def draw(self, i: int, *, rinshan: bool = False) -> bool:
-        """Consume the seat's next draw, returning false for a call or no entry.
+    def check_shape(
+        self, i: int, call: str, *, draw: int | None = None, discard: int | None = None
+    ) -> tuple[str, list[int], int]:
+        """Parse a call of seat i and report it when its tiles do not form its meld."""
+        kind, tiles, pos = _parse_call(call)
+        if not _shape_ok(kind, tiles):
+            self.bad(
+                "bad_meld",
+                f"has a meld that is not a {CALL_NAMES[kind]}",
+                i,
+                draw=draw,
+                discard=discard,
+            )
+        return kind, tiles, pos
 
-        Seat i draws its next entry; False when there is none (or the entry is a call:
-        out of turn).
+    def draw(self, i: int, *, rinshan: bool = False) -> bool:
+        """Consume seat i's next draw; False when there is none or it is a call.
+
+        A call where a draw is due is out of turn.
         """
         if self.di[i] >= len(self.draws[i]):
             return False
         x = self.draws[i][self.di[i]]
         if isinstance(x, str):
+            due = "replacement draw" if rinshan else "draw"
             self.bad(
-                f"seat {i} has the call {x} where a "
-                f"{('rinshan ' if rinshan else '')}draw is due (out of turn)"
+                "out_of_turn",
+                f"calls where a {due} is due (out of turn)",
+                i,
+                draw=self.di[i],
             )
             return False
         self.di[i] += 1
@@ -559,23 +576,23 @@ class _Replay:
 
     def _self_kan(self, i: int, dsc: str) -> None:
         """Consume a self-kan and require its replacement draw before proceeding."""
-        kind, tiles, pos = _parse_call(dsc)
+        at = self.ki[i] - 1  # the kan's entry in the discards
+        kind, tiles, pos = self.check_shape(i, dsc, discard=at)
         if kind == "a":
             for t in tiles:
-                self.take(i, t, f"ankan {dsc}")
+                self.take(i, t, "kans", discard=at)
             self.sets[i] += 1
         else:
-            self.take(i, tiles[pos], f"kakan {dsc}")
+            self.take(i, tiles[pos], "adds", discard=at)
             if self.riichi[i]:
-                self.bad(f"seat {i} kakan after riichi")
+                self.bad("riichi_kan", "adds a kan tile after riichi", i, discard=at)
         self.kans += 1
         if not self.draw(i, rinshan=True) and self.ki[i] < len(self.discards[i]):
-            self.bad(f"seat {i} has no rinshan draw after {dsc}")
+            self.bad("no_rinshan", "has no replacement draw after a kan", i, discard=at)
 
     def discard(self, i: int) -> tuple[int, bool] | None:
-        """Consume a discard after any self-kans and their replacement draws.
+        """Consume seat i's discard after any self-kans and their rinshan draws.
 
-        Seat i's discard after any ankan / kakan (each followed by its rinshan draw);
         None when the hand ended on its draw.
         """
         while self.ki[i] < len(self.discards[i]):
@@ -586,28 +603,42 @@ class _Replay:
                 continue
             is_r = isinstance(dsc, str) and dsc.startswith("r")
             v = int(str(dsc).lstrip("r"))
+            at = self.ki[i] - 1
             if v == 0:
-                self.bad(f"seat {i} has a daiminkan placeholder where a discard is due")
+                self.bad(
+                    "out_of_turn",
+                    "has a kan placeholder where a discard is due",
+                    i,
+                    discard=at,
+                )
                 continue
             if v == TSUMOGIRI:
                 tile = self.last_draw[i]
                 if tile is None:
                     self.bad(
-                        f"seat {i} tsumogiri without a draw (discard {self.ki[i] - 1})"
+                        "no_draw", "discards a drawn tile without a draw", i, discard=at
                     )
                     continue
             else:
                 tile = v
                 if self.riichi[i]:
                     self.bad(
-                        f"seat {i} discards a hand tile {tile_str(v)} after riichi"
+                        "riichi_discard",
+                        f"discards {tile_str(v)} from the hand after riichi",
+                        i,
+                        discard=at,
                     )
-            self.take(i, tile, f"discards {tile_str(tile)} (discard {self.ki[i] - 1})")
+            self.take(i, tile, "discards", discard=at)
             if is_r:
                 if self.open[i]:
-                    self.bad(f"seat {i} riichi with an open hand")
+                    self.bad(
+                        "open_riichi",
+                        "declares riichi with an open hand",
+                        i,
+                        discard=at,
+                    )
                 if self.riichi[i]:
-                    self.bad(f"seat {i} declares riichi twice")
+                    self.bad("riichi_twice", "declares riichi twice", i, discard=at)
                 self.riichi[i] = True
                 self.declared += 1
             self.last_draw[i] = None
@@ -615,11 +646,7 @@ class _Replay:
         return None
 
     def caller(self, cur: int, tile: int) -> int | None:
-        """Find the next caller, giving pon and kan priority over chi.
-
-        The seat whose next draw entry is a call on this discard (a pon or kan before a
-        chi).
-        """
+        """Find the seat whose next draw calls this discard (pon or kan before chi)."""
         found = []
         for j in ((cur + 1) % 4, (cur + 2) % 4, (cur + 3) % 4):
             if self.di[j] < len(self.draws[j]) and isinstance(
@@ -635,24 +662,32 @@ class _Replay:
         return min(found)[1] if found else None
 
     def call(self, j: int) -> None:
-        call = self.draws[j][self.di[j]]
+        at = self.di[j]  # the call's entry in the draws
+        call = str(self.draws[j][at])
         self.di[j] += 1
-        kind, tiles, pos = _parse_call(call)
+        kind, tiles, pos = self.check_shape(j, call, draw=at)
         for q, t in enumerate(tiles):
             if q != pos:
-                self.take(j, t, f"calls {call}")
+                self.take(j, t, "calls with", draw=at)
         self.sets[j] += 1
         self.open[j] += 1
         if self.riichi[j]:
-            self.bad(f"seat {j} calls {call} after riichi")
+            self.bad("riichi_call", "calls after riichi", j, draw=at)
         if kind == "m":
             self.kans += 1
             if self.ki[j] < len(self.discards[j]) and self.discards[j][self.ki[j]] == 0:
                 self.ki[j] += 1
             else:
-                self.bad(f"seat {j} daiminkan {call} without its 0 in the discards")
+                self.bad(
+                    "kan_placeholder",
+                    "has an open kan without its placeholder discard",
+                    j,
+                    draw=at,
+                )
             if not self.draw(j, rinshan=True):
-                self.bad(f"seat {j} has no rinshan draw after {call}")
+                self.bad(
+                    "no_rinshan", "has no replacement draw after a kan", j, draw=at
+                )
 
     def play(self) -> None:
         cur, need_draw = self.dealer, True
@@ -661,9 +696,8 @@ class _Replay:
                 return  # the hand ended before this draw (a ron, or the wall ran out)
             d = self.discard(cur)
             if d is None:
-                self.ended_on_draw = (
-                    cur  # no discard after the draw: the hand ended on it (a tsumo)
-                )
+                # no discard after the draw: the hand ended on it (a tsumo)
+                self.ended_on_draw = cur
                 return
             tile, is_r = d
             self.last = (cur, tile, is_r)
@@ -678,7 +712,7 @@ class _Replay:
         """Validate starting hand sizes and global tile-copy limits."""
         for i in range(4):
             if len(self.haipai[i]) != STARTING_HAND_SIZE:
-                self.bad(f"seat {i} haipai has {len(self.haipai[i])} tiles")
+                self.bad("haipai_size", f"starts with {len(self.haipai[i])} tiles", i)
         seen = (
             Counter(t for h in self.haipai for t in h)
             + Counter(self.dora)
@@ -687,8 +721,14 @@ class _Replay:
         seen += Counter(t for d in self.draws for t in d if isinstance(t, int))
         for t, c in sorted(seen.items()):
             if c > _limit(t):
-                self.bad(
-                    f"{tile_str(t)} appears {c} times (hands, draws and indicators)"
+                self.violations.append(
+                    Violation(
+                        self.name,
+                        "over_count",
+                        f"{tile_str(t)} appears {c} times (hands, draws and "
+                        "indicators)",
+                        tile=tile_str(t),
+                    )
                 )
 
     def _check_progress(self) -> None:
@@ -696,26 +736,32 @@ class _Replay:
         for i in range(4):
             if self.di[i] < len(self.draws[i]) or self.ki[i] < len(self.discards[i]):
                 self.bad(
-                    f"seat {i} has {len(self.draws[i]) - self.di[i]} draw(s) "
-                    f"and {len(self.discards[i]) - self.ki[i]} discard(s) that "
-                    "never came to be played (out of turn, or more discards "
-                    "than draws)"
+                    "unplayed",
+                    f"has {len(self.draws[i]) - self.di[i]} draw(s) and "
+                    f"{len(self.discards[i]) - self.ki[i]} discard(s) that never "
+                    "came to be played (out of turn, or more discards than draws)",
+                    i,
+                    draw=self.di[i],
+                    discard=self.ki[i],
                 )
         if self.wall + self.kans > LIVE_WALL:
             self.bad(
+                "wall",
                 f"{self.wall} wall draws and {self.kans} kan(s) exceed the live"
-                f" wall of {LIVE_WALL}"
+                f" wall of {LIVE_WALL}",
             )
         # every kan reveals an indicator; ura, when given, lie under each of them
         if len(self.dora) != 1 + self.kans:
             self.bad(
+                "indicators",
                 f"{len(self.dora)} dora indicator(s) for {self.kans} kan(s): a "
-                f"log needs {1 + self.kans}"
+                f"log needs {1 + self.kans}",
             )
         if self.ura and len(self.ura) != len(self.dora):
             self.bad(
+                "ura",
                 f"{len(self.ura)} ura indicator(s) under {len(self.dora)} dora "
-                "indicator(s)"
+                "indicator(s)",
             )
 
     def _check_result(self) -> None:
@@ -728,11 +774,12 @@ class _Replay:
                 self._check_win(res[w], res[w + 1])
         elif res[0] == RYUKYOKU:
             if len(res) > 1 and sum(res[1]) != 0:
-                self.bad(f"the deltas of the draw sum to {sum(res[1])}, not 0")
+                self.bad("deltas", f"the deltas of the draw sum to {sum(res[1])}")
             if self.wall + self.kans < LIVE_WALL:
                 self.bad(
+                    "short_wall",
                     f"an exhaustive draw after {self.wall} wall draws and "
-                    f"{self.kans} kan(s), not {LIVE_WALL}"
+                    f"{self.kans} kan(s), not {LIVE_WALL}",
                 )
 
     def _check_win(self, delta: list[int], info: list) -> None:
@@ -742,25 +789,30 @@ class _Replay:
         if winner != frm:
             if self.last is None or self.last[0] != frm:
                 self.bad(
-                    f"ron by seat {winner} on seat {frm}, whose discard"
-                    " was not the last"
+                    "not_last_discard",
+                    "wins by ron on a discard that was not the last",
+                    winner,
                 )
             else:
                 hand[self.last[1]] += 1
                 if self.last[2]:
                     self.declared -= 1  # a declaration ronned on: its stick is not paid
         elif self.ended_on_draw != winner:
-            self.bad(f"tsumo by seat {winner}, but the hand did not end on its draw")
+            self.bad(
+                "not_on_draw",
+                "wins by tsumo, but the hand did not end on its draw",
+                winner,
+            )
         if not _wins(hand):
-            self.bad(f"the winner, seat {winner}, does not hold a winning hand")
+            self.bad("not_winning", "does not hold a winning hand", winner)
         if sum(delta) != 1000 * (self.sticks + self.declared):
             self.bad(
+                "deltas",
                 f"the deltas sum to {sum(delta)}, not the "
-                f"{1000 * (self.sticks + self.declared)} of the riichi "
-                "sticks"
+                f"{1000 * (self.sticks + self.declared)} of the riichi sticks",
             )
 
-    def check(self) -> list[str]:
+    def check(self) -> list[Violation]:
         self._check_inventory()
         self.play()
         self._check_progress()
@@ -769,20 +821,20 @@ class _Replay:
             want = 13 - 3 * self.sets[i] + (1 if self.ended_on_draw == i else 0)
             n = sum(self.hands[i].values())
             if n != want or any(c < 0 for c in self.hands[i].values()):
-                self.bad(f"seat {i} ends with {n} tiles in hand, not {want}")
-        return self.problems
+                self.bad("hand_size", f"ends with {n} tiles in hand, not {want}", i)
+        return self.violations
 
 
-def replay_kyoku(k: list) -> list[str]:
-    """Replay a Tenhou hand in legal turn order and verify its transitions.
+def replay_kyoku(k: list) -> list[Violation]:
+    """Replay one kyoku of a tenhou/6 log turn by turn; return its violations.
 
-    Simulate one kyoku of a tenhou/6 log turn by turn, in the real interleaving (the
-    dealer first; after each discard, a call in another seat's draw list naming that
-    tile from that seat takes the turn), and return its violations (empty = legal).
+    The real interleaving is simulated (the dealer first; after each discard, a call in
+    another seat's draw list naming that tile from that seat takes the turn). An empty
+    list means the hand is legal.
     """
     return _Replay(k).check()
 
 
-def replay(game_dict: dict) -> list[str]:
+def replay(game_dict: dict) -> list[Violation]:
     """Violations of every kyoku of a tenhou/6 log dict (empty = legal)."""
     return [p for k in game_dict["log"] for p in replay_kyoku(k)]

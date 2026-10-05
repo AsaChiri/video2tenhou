@@ -1,16 +1,7 @@
-export interface RequestOptions {
-  jobStatus?: boolean;
-  signal?: AbortSignal;
-}
-
-export async function api<T>(
-  path: string,
-  body?: unknown,
-  { jobStatus = false, signal }: RequestOptions = {},
-): Promise<T> {
-  const response = await fetch(path, {
-    signal,
-    ...(body === undefined
+export async function api<T>(path: string, body?: unknown): Promise<T> {
+  const response = await fetch(
+    path,
+    body === undefined
       ? {}
       : {
           method: "POST",
@@ -19,16 +10,15 @@ export async function api<T>(
             "X-Video2Tenhou": "1",
           },
           body: JSON.stringify(body),
-        }),
-  });
+        },
+  );
   let data;
   try {
     data = await response.json();
   } catch {
     throw new Error("Could not read the response. Try again.");
   }
-  if (!response.ok || (data.error && !jobStatus))
-    throw new Error(data.error || `Request failed (${response.status}).`);
+  if (!response.ok) throw new Error(data.error || "Request failed. Try again.");
   return data;
 }
 

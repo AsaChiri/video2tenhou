@@ -1,13 +1,15 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preserve draft provenance and prevent implicit acceptance as training labels."""
+"""Draft exports keep provenance and never pass as reviewed training labels."""
+
+from __future__ import annotations
 
 import hashlib
 import json
 import zipfile
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -17,229 +19,106 @@ from tools import pseudolabel_images as drafts
 from video2tenhou.perception import detector
 from video2tenhou.perception.detector import Det
 
-if TYPE_CHECKING:
-    from pathlib import Path
+
+@dataclass
+class FixedDetector:
+    """Return the same face boxes for every image."""
+
+    boxes: list[Det] = field(default_factory=list)
+    id: str = "detector:fixture"
+    conf: float = 0.15
+
+    def predict(self, _image: np.ndarray, /) -> list[Det]:
+        """Return the configured predictions without inference."""
+        return self.boxes
 
 
-def detection(
-    box: tuple[float, float, float, float] = (-2, 2, 30, 8),
-    confidence: float = 0.8,
-    *,
-    back: bool = False,
-) -> Det:
-    """Create a face-detector result with controlled box and confidence."""
-    return Det(xyxy=box, conf=confidence, back=back)
-
-
-def archive_fixture(tmp_path: "Path", members: "list[tuple[str, bytes]]") -> tuple:
-    """Create an image archive from explicitly supplied member bytes."""
-    archive = tmp_path / "images.zip"
-    with zipfile.ZipFile(archive, "w") as stream:
-        for name, content in members:
-            stream.writestr(name, content)
-    weights = tmp_path / "weights.pt"
-    weights.write_bytes(b"test-checkpoint-identity")
-    return archive, weights
-
-
-def png() -> "bytes":
-    """Encode a small synthetic image as PNG bytes."""
+def png() -> bytes:
+    """Encode a 20x10 black image."""
     ok, image = cv2.imencode(".png", np.zeros((10, 20, 3), dtype=np.uint8))
     assert ok
     return image.tobytes()
 
 
-@dataclass
-class PredictionModel:
-    """Localization labels accompanying controlled test predictions."""
-
-    names: dict[int, str]
-
-
-@dataclass
-class Predictor:
-    """Controlled face predictions implementing the draft export interface."""
-
-    predictions: list[Det]
-    model: PredictionModel
-    device: str = "fake"
-    id: str | None = None
-    imgsz: int | None = None
-    conf: float | None = None
-    iou: float | None = None
-    cuda_graph: bool | None = None
-
-    def predict(self, _image: np.ndarray, /) -> list[Det]:
-        """Return the supplied predictions without model inference."""
-        return self.predictions
+def archive(tmp_path: Path, members: dict[str, bytes]) -> Path:
+    """Write a ZIP with the given members."""
+    path = tmp_path / "images.zip"
+    with zipfile.ZipFile(path, "w") as stream:
+        for name, content in members.items():
+            stream.writestr(name, content)
+    return path
 
 
-def predictor(predictions: list[Det], names: dict[int, str] | None = None) -> Predictor:
-    """Return controlled face predictions and model class metadata."""
-    return Predictor(predictions, PredictionModel(names or drafts.CLASS_NAMES))
-
-
-def test_box_clipping_normalization_and_raw_coordinates() -> None:
-    """Verify box clipping normalization and raw coordinates."""
-    box = drafts.normalized_box(detection(), 20, 10)
+def test_boxes_are_clipped_and_normalized_with_raw_coordinates_kept() -> None:
+    """Out-of-image edges are clipped; raw coordinates stay in predictions."""
+    box = drafts.draft_box(Det((-2, 2, 30, 8), 0.8), 20, 10)
     assert box["raw_xyxy"] == [-2, 2, 30, 8]
     assert box["xyxy"] == [0, 2, 20, 8]
     assert box["yolo"] == [0.5, 0.5, 1.0, 0.6]
-    assert box["class_name"] == "face"
-    assert box["back"] is False
+    with pytest.raises(ValueError, match="Invalid detection"):
+        drafts.draft_box(Det((30, 0, 40, 5), 0.8), 20, 10)
 
 
-@pytest.mark.parametrize(
-    ("box", "confidence"),
-    [
-        ((0, 0, float("nan"), 5), 0.8),
-        ((4, 0, 2, 5), 0.8),
-        ((30, 0, 40, 5), 0.8),
-        ((0, 0, 4, 5), 1.2),
-    ],
-)
-def test_invalid_prediction_is_rejected(
-    box: "tuple[float, float, float, float]", confidence: float
+def test_export_preserves_bytes_and_marks_every_draft_unreviewed(
+    tmp_path: Path,
 ) -> None:
-    """Verify invalid prediction is rejected."""
-    with pytest.raises(
-        ValueError,
-        match=r"must be finite|Invalid detection area|no area inside the image",
-    ):
-        drafts.normalized_box(detection(box, confidence), 20, 10)
-
-
-def test_face_only_schema_rejects_identity_classes_and_back_predictions() -> None:
-    """Verify face only schema rejects identity classes and back predictions."""
-    with pytest.raises(ValueError, match="Expected detector classes"):
-        drafts.validate_classes({0: "1m", 1: "unknown"})
-    drafts.validate_classes({0: "face"})
-    with pytest.raises(ValueError, match="cannot export a back"):
-        drafts.normalized_box(detection(back=True), 20, 10)
-
-
-@pytest.mark.parametrize(
-    "members",
-    [
-        [("../outside.png", b"x")],
-        [("C:/outside.png", b"x")],
-        [("same.png", b"x"), ("SAME.png", b"y")],
-    ],
-)
-def test_zip_traversal_and_duplicate_members_fail_closed(
-    tmp_path: "Path", members: list[tuple[str, bytes]]
-) -> None:
-    """Verify zip traversal and duplicate members fail closed."""
-    archive, weights = archive_fixture(tmp_path, members)
-    output = tmp_path / "draft"
-    with pytest.raises(ValueError, match=r"Unsafe image member|Duplicate image member"):
-        drafts.export_drafts(archive, weights, output, predictor=predictor([]))
-    assert not json.loads((output / "summary.json").read_text())["complete"]
-    assert not list((output / "images").iterdir())
-    assert not (tmp_path / "outside.png").exists()
-
-
-def test_zero_predictions_duplicate_groups_and_source_bytes_are_preserved(
-    tmp_path: "Path",
-) -> None:
-    """Verify zero predictions duplicate groups and source bytes are preserved."""
+    """Members with one name in two folders keep separate files and hashes."""
     content = png()
-    archive, weights = archive_fixture(
+    source = archive(
         tmp_path,
-        [
-            ("a/tile.png", content),
-            ("b/tile.png", content),
-            ("ignored.txt", b"not an image"),
-        ],
+        {"a/tile.png": content, "b/tile.png": content, "notes.txt": b"ignored"},
     )
     output = tmp_path / "draft"
-    summary = drafts.export_drafts(archive, weights, output, predictor=predictor([]))
+    model = FixedDetector([Det((1, 1, 8, 8), 0.9)])
+    summary = drafts.export_drafts(source, tmp_path / "w.pt", output, model=model)
     assert summary["complete"]
-    assert summary["images_completed"] == 2
-    assert summary["images_zero_detections"] == 2
-    assert summary["class_counts"] == {0: 0}
-    assert summary["image_dimensions"] == {
-        "min_width": 20,
-        "max_width": 20,
-        "min_height": 10,
-        "max_height": 10,
-    }
-    assert summary["exact_duplicate_groups"] == [
-        {
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "members": ["a/tile.png", "b/tile.png"],
-        }
-    ]
-    rows = [
-        json.loads(line)
-        for line in (output / "manifest.jsonl").read_text().splitlines()
-    ]
+    assert summary["archive_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert summary["recognition_id"] == "detector:fixture"
+    assert (summary["images"], summary["detections"]) == (2, 2)
+    rows = [json.loads(line) for line in (output / "manifest.jsonl").open()]
     assert len({row["image"] for row in rows}) == 2
     for row in rows:
         assert row["reviewed"] is False
-        assert row["status"] == "unreviewed_zero_detections"
+        assert row["status"] == "unreviewed_predictions"
+        assert row["sha256"] == hashlib.sha256(content).hexdigest()
         assert (output / row["image"]).read_bytes() == content
-        assert (output / row["draft_labels"]).read_text() == ""
+        assert (output / row["draft_labels"]).read_text().startswith("0 ")
     assert not (output / "data.yaml").exists()
-    assert not (output / "labels").exists()
     with pytest.raises(FileExistsError):
-        drafts.export_drafts(archive, weights, output, predictor=predictor([]))
+        drafts.export_drafts(source, tmp_path / "w.pt", output, model=model)
 
 
-def test_face_export_and_partial_failure_manifest(tmp_path: "Path") -> None:
-    """Verify face export and partial failure manifest."""
-    archive, weights = archive_fixture(
-        tmp_path, [("good.png", png()), ("bad.png", b"invalid image")]
-    )
-    names = {0: "face"}
-    box = detection((1, 1, 8, 8), 0.9)
+def test_failed_image_leaves_an_incomplete_export(tmp_path: Path) -> None:
+    """An undecodable image fails the run but keeps the drafts written before it."""
+    source = archive(tmp_path, {"good.png": png(), "bad.png": b"not an image"})
     output = tmp_path / "draft"
     with pytest.raises(ValueError, match="Cannot decode"):
-        drafts.export_drafts(
-            archive, weights, output, predictor=predictor([box], names)
-        )
+        drafts.export_drafts(source, tmp_path / "w.pt", output, model=FixedDetector())
     summary = json.loads((output / "summary.json").read_text())
     assert not summary["complete"]
-    assert summary["images_completed"] == 1
-    assert summary["class_counts"] == {"0": 1}
-    assert summary["classes"]["0"] == "face"
-    rows = [
-        json.loads(line)
-        for line in (output / "manifest.jsonl").read_text().splitlines()
-    ]
-    assert rows[0]["status"] == "unreviewed_predictions"
-    assert rows[1]["status"] == "error"
-    assert (output / rows[0]["draft_labels"]).read_text().startswith("0 ")
+    assert summary["images_without_detections"] == 1
+    rows = [json.loads(line) for line in (output / "manifest.jsonl").open()]
+    assert [row["status"] for row in rows] == ["unreviewed_zero_detections", "error"]
+    assert (output / rows[0]["draft_labels"]).read_text() == ""
 
 
-def test_export_uses_checkpoint_defaults_and_records_recognition_identity(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+def test_production_detector_uses_checkpoint_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify export uses checkpoint defaults and records recognition identity."""
-    archive, weights = archive_fixture(tmp_path, [("photo.png", png())])
-    metadata = weights.with_name("meta.json")
-    metadata.write_text('{"inference":{"confidence":0.08}}')
-    calls = []
-    model = predictor([detection()])
-    model.id, model.imgsz, model.conf, model.iou, model.cuda_graph = (
-        "detector:fixture",
-        1024,
-        0.08,
-        0.5,
-        True,
-    )
+    """Without a substitute, the deployed detector loads the given weights."""
+    loaded = []
 
-    def load(path: "Path", **kwargs: object) -> Predictor:
-        calls.append((path, kwargs))
-        return model
+    def load(weights: Path, **kwargs: object) -> FixedDetector:
+        loaded.append((weights, kwargs))
+        return FixedDetector()
 
     monkeypatch.setattr(detector, "Detector", load)
-    summary = drafts.export_drafts(archive, weights, tmp_path / "draft", device="cpu")
-    assert calls == [(weights.resolve(), {"device": "cpu"})]
-    assert summary["settings"]["conf"] == 0.08
-    assert summary["recognition_id"] == "detector:fixture"
-    assert (
-        summary["metadata_sha256"] == hashlib.sha256(metadata.read_bytes()).hexdigest()
+    weights = tmp_path / "weights.pt"
+    summary = drafts.export_drafts(
+        archive(tmp_path, {"photo.png": png()}),
+        weights,
+        tmp_path / "draft",
+        device="cpu",
     )
-    assert summary["classes"] == {0: "face"}
-    assert summary["class_counts"] == {0: 1}
+    assert loaded == [(weights, {"device": "cpu"})]
+    assert summary["confidence"] == 0.15

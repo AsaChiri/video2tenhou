@@ -10,8 +10,9 @@ conversion. Commands and timing interpretation are in [Performance](PERFORMANCE.
 | Reconstruction | Complete hand evidence, result record and saved answers | Draw/discard order, calls, tile inventory, confidence bounds and legal replay |
 | Complete recording | Video, geometry, model/runtime identities, initial caches and answers | Stage times, exports, scores and independent human annotations |
 
-Keep benchmark outputs under `work/`, together with input hashes and the source
-revision. Reports belong to the measured run; this guide defines the workloads.
+Keep benchmark outputs under `work/`, together with the profile's source
+revision, recognition identities and geometry digest. Reports belong to the
+measured run; this guide defines the workloads.
 
 ## Representative evidence
 

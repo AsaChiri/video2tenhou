@@ -3,28 +3,26 @@
 
 """Job admission and completion stay truthful when project storage fails."""
 
+from __future__ import annotations
+
 import ctypes
 import json
 import sys
 import threading
+from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 
 from video2tenhou import files
 from video2tenhou.tool import workflow
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-    from video2tenhou.tool.workflow import Workspace
+from video2tenhou.tool.workflow import Workspace
 
 
 @pytest.fixture
 def project(
-    tmp_path: "Path",
-) -> "Iterator[tuple[Workspace, str, Path, list[list[str]]]]":
+    tmp_path: Path,
+) -> Iterator[tuple[Workspace, str, Path, list[list[str]]]]:
     """Create a persisted studio project with a controlled command runner."""
     video = tmp_path / "recording.mp4"
     video.write_bytes(b"local recording identity")
@@ -39,20 +37,19 @@ def project(
     workspace.close()
 
 
-def finish(workspace: "Workspace") -> None:
+def finish(workspace: Workspace) -> None:
     """Join all workspace jobs and verify that each worker stopped."""
-    for thread in workspace._threads:
+    for thread in workspace.threads:
         thread.join(timeout=5)
         assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("boundary", ["temporary_file", "replacement"])
 def test_failed_admission_keeps_manifest_and_allows_retry(
-    project: "tuple[Workspace, str, Path, list[list[str]]]",
-    monkeypatch: "pytest.MonkeyPatch",
+    project: tuple[Workspace, str, Path, list[list[str]]],
+    monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
-    """Verify failed admission keeps manifest and allows retry."""
     workspace, key, path, commands = project
     before = path.read_bytes()
     attempts = []
@@ -60,10 +57,9 @@ def test_failed_admission_keeps_manifest_and_allows_retry(
 
     def denied(*_unused_args: object, **_unused_kwargs: object) -> None:
         attempts.append(True)
-        msg = "data folder denies writing"
-        raise PermissionError(msg)
+        raise PermissionError("data folder denies writing")
 
-    def replace(source: "Path", target: "Path") -> "Path | None":
+    def replace(source: Path, target: Path) -> Path | None:
         if target == path:
             return denied()
         return original_replace(source, target)
@@ -101,20 +97,18 @@ class WindowsPermissionError(PermissionError):
 
 
 def test_persistent_windows_denial_is_bounded_and_retryable(
-    project: "tuple[Workspace, str, Path, list[list[str]]]",
-    monkeypatch: "pytest.MonkeyPatch",
+    project: tuple[Workspace, str, Path, list[list[str]]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify persistent windows denial is bounded and retryable."""
     workspace, key, path, commands = project
     before = path.read_bytes()
     original = Path.replace
     attempts = []
 
-    def replace(source: "Path", target: "Path") -> "Path":
+    def replace(source: Path, target: Path) -> Path:
         if target == path:
             attempts.append(True)
-            msg = "persistent replacement denial"
-            raise WindowsPermissionError(msg)
+            raise WindowsPermissionError("persistent replacement denial")
         return original(source, target)
 
     with monkeypatch.context() as patch:
@@ -132,10 +126,9 @@ def test_persistent_windows_denial_is_bounded_and_retryable(
 
 
 def test_real_windows_reader_contention_recovers_before_launch(
-    project: "tuple[Workspace, str, Path, list[list[str]]]",
-    monkeypatch: "pytest.MonkeyPatch",
+    project: tuple[Workspace, str, Path, list[list[str]]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify real windows reader contention recovers before launch."""
     if sys.platform != "win32":
         pytest.skip("Windows delete-sharing semantics")
     workspace, key, path, commands = project
@@ -157,7 +150,7 @@ def test_real_windows_reader_contention_recovers_before_launch(
     original = Path.replace
     denied = []
 
-    def replace(source: "Path", target: "Path") -> "Path":
+    def replace(source: Path, target: Path) -> Path:
         nonlocal handle
         try:
             return original(source, target)
@@ -186,14 +179,13 @@ def test_real_windows_reader_contention_recovers_before_launch(
 
 
 def test_completion_save_failure_is_visible_and_restart_recovers(
-    project: "tuple[Workspace, str, Path, list[list[str]]]",
-    monkeypatch: "pytest.MonkeyPatch",
+    project: tuple[Workspace, str, Path, list[list[str]]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify completion save failure is visible and restart recovers."""
     workspace, key, path, commands = project
     entered, release = threading.Event(), threading.Event()
 
-    def runner(args: "list[str]", value: "dict") -> None:
+    def runner(args: list[str], _job: workflow.Job) -> None:
         commands.append(args)
         entered.set()
         assert release.wait(5)
@@ -205,10 +197,9 @@ def test_completion_save_failure_is_visible_and_restart_recovers(
     assert json.loads(admitted)["job"]["running"]
     original = Path.replace
 
-    def replace(source: "Path", target: "Path") -> "Path":
+    def replace(source: Path, target: Path) -> Path:
         if target == path:
-            msg = "completion cannot be saved"
-            raise PermissionError(msg)
+            raise PermissionError("completion cannot be saved")
         return original(source, target)
 
     with monkeypatch.context() as patch:
@@ -218,9 +209,9 @@ def test_completion_save_failure_is_visible_and_restart_recovers(
         value = workspace.snapshot(key)
         assert value["status"] == "failed"
         assert not value["job"]["running"]
-        assert value["export_signature"] is None
+        assert workspace.project(key)["export_signature"] is None
         assert "Could not save" in value["job"]["error"]
-        assert "completion cannot be saved" in value["job"]["log"][-1]
+        assert "completion cannot be saved" in workspace.log(key)[-1]
         assert path.read_bytes() == admitted
     reopened = workflow.Workspace(
         workspace.root, runner=lambda args, _p: commands.append(args)
@@ -237,16 +228,14 @@ def test_completion_save_failure_is_visible_and_restart_recovers(
 
 
 def test_create_failure_does_not_leave_an_unopenable_project(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify create failure does not leave an unopenable project."""
     video = tmp_path / "recording.mp4"
     video.write_bytes(b"recording")
     workspace = workflow.Workspace(tmp_path)
 
     def denied(*_unused_args: object, **_unused_kwargs: object) -> None:
-        msg = "cannot create manifest"
-        raise PermissionError(msg)
+        raise PermissionError("cannot create manifest")
 
     try:
         with monkeypatch.context() as patch:

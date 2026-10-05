@@ -1,77 +1,95 @@
 export type Point = [number, number];
 export type Rectangle = [number, number, number, number];
 
+/** A hand of the analysis as saved in hands.json. */
 export interface HandEntry {
   hand: number;
+  game: number;
   kyoku: number;
   honba: number;
-  corner_wind?: Record<string, string>;
+  t_start: number;
+  t_end: number;
+  corner_wind: Record<string, string>;
   nicks?: Record<string, string>;
-  decoded_at?: number;
-  pending_rebuild?: boolean;
-  facts_newer?: number;
-  t_start?: number;
-  t_end?: number;
-  status?: string;
+}
+/** One row of the review's hand list. */
+export interface HandRow {
+  hand: number;
   game: number;
-  turns?: number;
-  score?: boolean;
-  t_last?: number;
-  play_window?: Point;
+  kyoku: number;
+  honba: number;
+  t_start: number;
+  t_end: number;
+  status: string | null;
+  pending: boolean;
+  turns: number | null;
+  score: boolean | null;
 }
 
-export interface ReviewItem {
-  kind: string;
-  stage?: string;
-  hand: number;
-  idx?: number;
+export interface ReviewChoice {
+  id?: string;
+  kind?: string;
   field?: string;
   seat?: string;
   j?: number;
-  i?: number;
   t?: number;
-  tile?: string;
-  tiles?: string[];
-  seats?: string[];
-  choices?: ReviewChoice[];
+  value?: string | string[];
   lost?: boolean;
   margin?: number | null;
   alternative_gap?: number | null;
   runner_up?: string | null;
+}
+export interface ReviewItem extends ReviewChoice {
+  id: string;
+  kind: string;
+  hand: number;
+  game?: number;
+  kyoku?: number;
+  honba?: number;
+  stage?: string;
+  i?: number;
+  tile?: string;
+  tiles?: string[];
+  seats?: string[];
+  choices?: ReviewChoice[];
   text?: string;
   type?: string;
   source?: string | null;
-  ts?: number;
-  author?: string;
-  t_discard?: number;
-  called_pos?: number | null;
-  value?: string | string[];
-  guess?: boolean;
-  culprit?: string;
+  guess?: boolean | string[];
+  culprit?: string | null;
+  fact_seat?: string | null;
+  fact_kind?: string | null;
   han?: number;
   fu?: number;
   site?: number[];
   same_payment?: boolean;
-  outcome?: string;
-  conflict?: boolean;
-  box?: Rectangle;
+  win_tile?: string;
+  candidates?: string[];
   over?: {
     tile: string;
     count: number;
     limit?: number;
     sources: EvidenceSource[];
   }[];
+  violations?: Violation[];
 }
-export type ReviewChoice = Omit<ReviewItem, "hand" | "kind"> & {
-  hand?: number;
-  kind?: string;
-};
+/** One rule of play an exported log breaks; `seat` is the hand's wind. */
+export interface Violation {
+  kind: string;
+  seat: string | null;
+  tile: string | null;
+  t: number | null;
+  text: string;
+}
 export interface EvidenceSource {
   kind: string;
   seat: string;
   t: number;
   tile: string;
   corner: string;
+  j?: number;
+  field?: string;
+  index?: number;
   type?: string;
   tiles?: string[];
   source?: string;
@@ -81,46 +99,89 @@ export interface EvidenceSource {
   call?: { corner: string; t: number };
 }
 
-export type Fact = ReviewItem;
-export type FactBody = Omit<Fact, "hand"> & { hand?: number };
-export type Facts = Partial<Record<number, Fact[]>>;
-export interface Decision {
-  item: ReviewItem;
-  choice: number | null;
-  decision: ReviewChoice;
+/** A saved review answer (labels/<video>/facts.jsonl). */
+export interface Fact {
+  kind: string;
+  hand: number;
+  ts?: number;
+  author?: string;
+  source?: string;
+  seat?: string;
+  corner?: string;
+  t?: number;
+  t_discard?: number;
+  j?: number;
+  field?: string;
+  tile?: string;
+  tiles?: string[];
+  seats?: string[];
+  type?: string;
+  called_pos?: number | null;
+  item?: string;
+  text?: string;
+  han?: number;
+  fu?: number;
+  site?: number[];
 }
-export interface Job {
+export type FactBody = Omit<Fact, "hand" | "ts" | "author"> & { hand?: number };
+export type Facts = Partial<Record<number, Fact[]>>;
+/** One question of the queue: an item, or one choice of a grouped item. */
+export interface Decision {
+  key: string;
+  item: ReviewItem;
+  choice: ReviewChoice | null;
+}
+export interface IgnoredAnswer {
+  ts: number | null;
+  kind: string;
+  reason: string;
+}
+
+/** The workspace's single processing job. */
+export interface WorkspaceJob {
+  kind: "prepare" | "analyze" | "rebuild" | "fit" | "check";
+  project: string;
+  stage: string;
+  hands: number[] | null;
   running: boolean;
-  hands?: number[];
-  pending?: number[];
-  error?: string;
-  hands_done?: number;
-  hands_total?: number;
-  log?: string[];
-  kind?: string;
-  started?: number;
-  finished?: number;
+  started: number;
+  finished: number | null;
+  error: string | null;
+  log_lines: number;
+}
+export interface JobStatus {
+  job: WorkspaceJob | null;
+  revision: string | null;
+}
+/** A project's latest preparation or analysis. */
+export interface ProjectJob {
+  action?: string;
+  running: boolean;
   stage?: string;
+  started?: number;
+  finished?: number | null;
+  error?: string | null;
 }
 export interface Project {
   id: string;
   name: string;
-  display_name?: string;
-  created?: number;
-  review_running?: boolean;
-  artifacts: string[];
-  job: Job;
-  has_fit: boolean;
-  can_calibrate?: boolean;
-  open_items: number;
+  display_name: string;
+  kind: string;
   source: string;
   games: number[];
-  start: string;
-  end: string;
   layout: string;
-  stale_exports?: boolean;
-  results_revision?: string;
-  pending_rebuilds?: number[];
+  start: number;
+  end: number | null;
+  created?: number;
+  status: string;
+  job: ProjectJob;
+  checking: boolean;
+  artifacts: string[];
+  stale_exports: boolean;
+  results_revision: [string, number, number][];
+  can_calibrate: boolean;
+  has_fit: boolean;
+  open_items: number | null;
 }
 export interface Turn {
   i: number;
@@ -136,12 +197,12 @@ export interface Turn {
   hand_after?: string[];
   riichi?: boolean;
   tsumogiri?: boolean;
-  margin?: number;
   discard_box?: Rectangle;
 }
 export interface Decode {
   confidence?: (ReviewChoice & { turn?: number })[];
   t_last?: number;
+  play_window?: Point;
   dealer?: string;
   dora?: string[];
   ura?: string[];
@@ -163,12 +224,11 @@ export interface Decode {
   riichi?: string[];
   result?: { outcome?: string; winner?: string; loser?: string };
   notes?: string[];
-  problems?: string[];
 }
 export interface HandData {
   entry: HandEntry;
-  decode?: Decode;
-  notes?: string[];
+  decode: Decode | null;
+  ignored: IgnoredAnswer[];
 }
 export interface LabelBox {
   xyxy: Rectangle;
@@ -209,7 +269,7 @@ export interface CalibrationRegion {
   movable: boolean;
   rect: Rectangle;
   quad: Point[];
-  roll?: number;
+  roll?: number | null;
 }
 export interface Overhead {
   center: Point;
@@ -220,9 +280,9 @@ export interface Calibration {
   layout?: string;
   frame: Point;
   regions: Record<string, CalibrationRegion>;
-  fit?: { overhead?: Overhead };
+  fit?: { overhead?: Overhead } | null;
   overhead?: Overhead;
-  checks?: Record<string, { level: string; held: number; cut: number }>;
+  checks?: Record<string, { level: string }>;
 }
 export interface Drag {
   name: string;

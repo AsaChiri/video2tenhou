@@ -17,19 +17,40 @@ if [ "$missing" -ne 0 ]; then
     exit 1
 fi
 
-printf '%s\n' 'Checking this computer and preparing video2tenhou. Leave this terminal open.'
-UV_PROJECT_ENVIRONMENT=.venv-runtime
-UV_TORCH_BACKEND=${UV_TORCH_BACKEND:-auto}
-if [ "${VIDEO2TENHOU_DEVICE:-auto}" = cpu ]; then
-    UV_TORCH_BACKEND=cpu
+# Install only when the runtime is missing, incomplete or older than pyproject.toml,
+# or when asked to: a new PyTorch build invalidates every recognition cache.
+update=${VIDEO2TENHOU_UPDATE:-0}
+if [ "${1:-}" = --update ]; then
+    update=1
+    shift
 fi
-export UV_PROJECT_ENVIRONMENT UV_TORCH_BACKEND
-uv venv --allow-existing --python 3.12 .venv-runtime || exit "$?"
-uv pip install --python .venv-runtime --torch-backend "$UV_TORCH_BACKEND" --upgrade-package torch --upgrade-package torchvision --editable .
-status=$?
-if [ "$status" -ne 0 ]; then
-    printf '%s\n' 'Setup failed. Check your connection and disk space, and update uv if needed. See docs/QUICKSTART.md.' >&2
-    exit "$status"
+UV_PROJECT_ENVIRONMENT=.venv-runtime
+export UV_PROJECT_ENVIRONMENT
+installed=.venv-runtime/video2tenhou-pyproject.toml
+if [ "$update" = 1 ] || ! cmp -s pyproject.toml "$installed" 2>/dev/null; then
+    printf '%s\n' 'Preparing video2tenhou for this computer. Leave this terminal open.'
+    UV_TORCH_BACKEND=${UV_TORCH_BACKEND:-auto}
+    if [ "${VIDEO2TENHOU_DEVICE:-auto}" = cpu ]; then
+        UV_TORCH_BACKEND=cpu
+    fi
+    export UV_TORCH_BACKEND
+    upgrade=
+    if [ "$update" = 1 ]; then
+        upgrade='--upgrade-package torch --upgrade-package torchvision'
+    fi
+    rm -f "$installed"
+    uv venv --allow-existing --python 3.12 .venv-runtime || exit "$?"
+    uv pip install --python .venv-runtime --torch-backend "$UV_TORCH_BACKEND" \
+        $upgrade --editable .
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        cp pyproject.toml "$installed"
+        status=$?
+    fi
+    if [ "$status" -ne 0 ]; then
+        printf '%s\n' 'Setup failed. Check your connection and disk space, and update uv if needed. See docs/QUICKSTART.md.' >&2
+        exit "$status"
+    fi
 fi
 uv run --no-sync video2tenhou web "$@"
 status=$?

@@ -10,116 +10,89 @@ stage fingerprint. Missing metadata selects the default filtering contract.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
+from video2tenhou.files import json_digest
 from video2tenhou.paths import MODEL_DIR
 
-from .reader import Box, assign_hand, assign_meld, assign_pond
+from .reader import Box, structure
+from .tiles import CLASS_INDEX
 
 SPARSE_NONE_MAX = 0.5
-
-
-KINDS = ("hand", "pond", "meld")
 PREPARATION_VERSION = 1
 
+type Stage = Literal["sparse", "dense"]
 
-def _floors(values: object) -> tuple[float, float, float]:
-    if not isinstance(values, dict) or set(values) != set(KINDS):
-        msg = "Evidence policy must specify exactly hand, pond and meld floors"
-        raise ValueError(msg)
-    result = tuple(values[kind] for kind in KINDS)
+
+@dataclass(frozen=True)
+class Floors:
+    """Inclusive detector-confidence floors per region kind."""
+
+    hand: float
+    pond: float
+    meld: float
+
+
+@dataclass(frozen=True)
+class EvidencePolicy:
+    """Confidence floors for sparse and dense readings.
+
+    Floors act on stored confidence without renormalization. Sparse preparation
+    also keeps only boxes with ``p(none) < SPARSE_NONE_MAX``; dense preparation has
+    no none filter.
+    """
+
+    sparse: Floors
+    dense: Floors
+
+    def to_dict(self) -> dict:
+        """Return schema-1 JSON metadata."""
+        return {
+            "schema_version": 1,
+            "sparse": asdict(self.sparse),
+            "dense": asdict(self.dense),
+        }
+
+    def fingerprint_for(self, stage: Stage) -> str:
+        """Identify one derived-evidence stage without invalidating the other."""
+        return json_digest(
+            {
+                "schema_version": 1,
+                "preparation_version": PREPARATION_VERSION,
+                "stage": stage,
+                "floors": asdict(getattr(self, stage)),
+                "none_max_exclusive": SPARSE_NONE_MAX if stage == "sparse" else None,
+            }
+        )
+
+
+DEFAULT_POLICY = EvidencePolicy(Floors(0.2, 0.2, 0.35), Floors(0.2, 0.2, 0.2))
+
+
+def _floors(values: object) -> Floors:
+    if not isinstance(values, dict) or set(values) != {"hand", "pond", "meld"}:
+        raise ValueError(
+            "Evidence policy must specify exactly hand, pond and meld floors"
+        )
     if any(
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or not math.isfinite(value)
         or not 0 <= value <= 1
-        for value in result
+        for value in values.values()
     ):
-        msg = "Evidence floors must be finite numbers in [0, 1]"
-        raise ValueError(msg)
-    hand, pond, meld = result
-    return float(hand), float(pond), float(meld)
-
-
-def _digest(value: dict) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-@dataclass(frozen=True)
-class EvidencePolicy:
-    """Immutable confidence floors, ordered hand/pond/meld, for both consumers.
-
-    Prefer ``resolve_policy`` for metadata input. Floors act on stored confidence
-    without renormalization. Sparse preparation also retains the
-    ``p(none) < .5`` condition; dense preparation has no additional none filter.
-    """
-
-    sparse: tuple[float, float, float]
-    dense: tuple[float, float, float]
-
-    def __post_init__(self) -> None:
-        """Require complete, finite confidence floors for both reading stages."""
-        for stage in ("sparse", "dense"):
-            values = getattr(self, stage)
-            if not isinstance(values, tuple) or len(values) != len(KINDS):
-                msg = "Evidence policy requires three immutable floors per stage"
-                raise ValueError(msg)
-            object.__setattr__(
-                self, stage, _floors(dict(zip(KINDS, values, strict=False)))
-            )
-
-    def minimum(self, stage: str, kind: str) -> float:
-        """Return the inclusive detection floor; unknown stages/kinds are errors."""
-        if stage not in ("sparse", "dense") or kind not in KINDS:
-            msg = f"Unknown evidence stage/kind: {stage}/{kind}"
-            raise ValueError(msg)
-        return getattr(self, stage)[KINDS.index(kind)]
-
-    def to_dict(self) -> dict:
-        """Return independent JSON metadata; callers cannot mutate this policy."""
-        return {
-            "schema_version": 1,
-            **{
-                stage: dict(zip(KINDS, getattr(self, stage), strict=False))
-                for stage in ("sparse", "dense")
-            },
-        }
-
-    @property
-    def fingerprint(self) -> str:
-        """Identify the full policy for model provenance, excluding recognition."""
-        return _digest({"preparation_version": PREPARATION_VERSION, **self.to_dict()})
-
-    def fingerprint_for(self, stage: str) -> str:
-        """Identify one derived-evidence stage without invalidating the other."""
-        self.minimum(stage, "hand")
-        return _digest(
-            {
-                "schema_version": 1,
-                "preparation_version": PREPARATION_VERSION,
-                "stage": stage,
-                "floors": self.to_dict()[stage],
-                "none_max_exclusive": 0.5 if stage == "sparse" else None,
-            }
-        )
-
-
-DEFAULT_POLICY = EvidencePolicy((0.2, 0.2, 0.35), (0.2, 0.2, 0.2))
+        raise ValueError("Evidence floors must be finite numbers in [0, 1]")
+    return Floors(**{kind: float(value) for kind, value in values.items()})
 
 
 def resolve_policy(value: object = None) -> EvidencePolicy:
-    """Validate evidence metadata or use the default retention policy.
-
-    Validate complete schema-1 metadata, or resolve absent metadata to the default
-    policy.
+    """Validate schema-1 evidence metadata, or use the default for absent metadata.
 
     Unknown fields, partial maps, nonfinite values and unsupported schemas fail closed.
     Explicit metadata does not itself establish that a policy has passed downstream
@@ -135,8 +108,7 @@ def resolve_policy(value: object = None) -> EvidencePolicy:
         or type(value["schema_version"]) is not int
         or value["schema_version"] != 1
     ):
-        msg = "Unsupported or incomplete evidence policy metadata"
-        raise ValueError(msg)
+        raise ValueError("Unsupported or incomplete evidence policy metadata")
     return EvidencePolicy(_floors(value["sparse"]), _floors(value["dense"]))
 
 
@@ -159,90 +131,52 @@ def load_policy(metadata_path: str | Path | None = None) -> EvidencePolicy:
         or type(metadata.get("schema_version")) is not int
         or metadata["schema_version"] != 1
     ):
-        msg = "Unsupported detector metadata schema for evidence policy"
-        raise ValueError(msg)
+        raise ValueError("Unsupported detector metadata schema for evidence policy")
     return resolve_policy(metadata.get("evidence_policy"))
-
-
-def restructure(kind: str, reading: dict) -> None:
-    """Recompute stored box roles/order in place using the reader's geometry rules.
-
-    Raw probabilities and confidence are unchanged. Invalid pond layouts are
-    rejected after filtering, using the same geometry rules as live readings.
-    """
-    if kind not in ("pond", "meld", "hand"):
-        return
-    reading["rejected"] = False
-    if not reading["boxes"]:
-        return
-    boxes = [
-        Box(tuple(b["xyxy"]), b["conf"], sideways=b["sideways"], p=np.asarray(b["p"]))
-        for b in reading["boxes"]
-    ]
-    if kind == "pond":
-        reading["rejected"] = assign_pond(
-            boxes, region_h=reading["size"][1], region_w=reading["size"][0]
-        )
-        order = sorted(
-            range(len(boxes)),
-            key=lambda i: (
-                boxes[i].role != "tile",
-                boxes[i].row if boxes[i].row is not None else 99,
-                boxes[i].col if boxes[i].col is not None else 99,
-                boxes[i].cx,
-            ),
-        )
-    else:
-        (assign_meld if kind == "meld" else assign_hand)(boxes)
-        order = sorted(
-            range(len(boxes)),
-            key=lambda i: (
-                boxes[i].group if boxes[i].group is not None else 99,
-                boxes[i].cx,
-            ),
-        )
-    new = []
-    for i in order:
-        d = dict(reading["boxes"][i])
-        for k in ("row", "col", "group"):
-            d.pop(k, None)
-        b = boxes[i]
-        d["role"] = b.role
-        d["sideways"] = b.sideways
-        for k in ("row", "col", "group"):
-            if getattr(b, k) is not None:
-                d[k] = getattr(b, k)
-        new.append(d)
-    reading["boxes"] = new
 
 
 def prepare_reading(
     kind: str,
     reading: dict,
     *,
-    stage: str,
+    stage: Stage,
     policy: EvidencePolicy | None = None,
-    none_index: int | None = None,
 ) -> dict:
-    """Return a filtered/restructured copy without changing cached raw readings.
+    """Return a filtered copy with recomputed structure; cached raw readings are kept.
 
-    Sparse voting excludes classifier background predictions. Dense event searches apply
-    their separate detector-confidence floors. Comparisons use serialized scores as
-    stored; this function never rounds, rescales, reclassifies or votes. Probability
-    arrays/lists are shared without mutation; callers should treat them as read-only
-    rather than editing the retained output's probabilities.
+    Sparse voting also excludes classifier background predictions. Comparisons use
+    serialized scores as stored; this function never rounds, rescales, reclassifies
+    or votes. Box roles, rows, columns, groups and order are recomputed with the
+    reader's geometry rules, which also reject impossible pond layouts. Probability
+    lists are shared with the input and must be treated as read-only.
     """
-    policy = resolve_policy(policy)
-    floor = policy.minimum(stage, kind)
-    if stage == "sparse" and (type(none_index) is not int or none_index < 0):
-        msg = "Sparse evidence preparation requires the none class index"
-        raise ValueError(msg)
-    prepared = dict(reading)
-    prepared["boxes"] = [
-        dict(box)
+    floor = getattr(getattr(resolve_policy(policy), stage), kind)
+    none = CLASS_INDEX["none"]
+    kept = [
+        box
         for box in reading["boxes"]
         if box["conf"] >= floor
-        and (stage != "sparse" or box["p"][none_index] < SPARSE_NONE_MAX)
+        and (stage == "dense" or box["p"][none] < SPARSE_NONE_MAX)
     ]
-    restructure(kind, prepared)
-    return prepared
+    boxes = [
+        Box(tuple(b["xyxy"]), b["conf"], sideways=b["sideways"], p=np.asarray(b["p"]))
+        for b in kept
+    ]
+    source = {id(box): raw for box, raw in zip(boxes, kept, strict=True)}
+    rejected = structure(kind, boxes, reading["size"])
+    return {
+        **reading,
+        "rejected": rejected,
+        "boxes": [_restructured(source[id(box)], box) for box in boxes],
+    }
+
+
+def _restructured(raw: dict, box: Box) -> dict:
+    out = {
+        key: value for key, value in raw.items() if key not in ("row", "col", "group")
+    }
+    out["role"], out["sideways"] = box.role, box.sideways
+    for key in ("row", "col", "group"):
+        if getattr(box, key) is not None:
+            out[key] = getattr(box, key)
+    return out

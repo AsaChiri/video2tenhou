@@ -2,10 +2,12 @@
 import { onBeforeUnmount, ref } from "vue";
 import type { LabelBox, Point, Reading } from "../types";
 import { useReview } from "./context";
+import { parseTime } from "./format";
+import { errorText } from "../shared/useAction";
 import TilePalette from "./TilePalette.vue";
 const review = useReview(),
   region = ref("hand:TL"),
-  at = ref(0),
+  at = ref("0:00"),
   boxes = ref<LabelBox[]>([]),
   canvas = ref<HTMLCanvasElement | null>(null),
   selected = ref<number | null>(null),
@@ -42,9 +44,14 @@ function draw() {
 }
 async function load() {
   const token = ++request,
-    target = { region: region.value, t: at.value };
+    t = parseTime(at.value);
+  if (t === null) {
+    status.value = "Enter the time as m:ss.";
+    return;
+  }
+  const target = { region: region.value, t };
   busy.value = true;
-  status.value = "Reading (the models run on the frame)…";
+  status.value = "Reading tiles…";
   try {
     const result = await review.api<Reading>(
       `read?t=${target.t}&region=${target.region}`,
@@ -59,9 +66,9 @@ async function load() {
       if (token === request) draw();
     };
     image.src = review.url(`frame?t=${target.t}&region=${target.region}`);
-    status.value = `${boxes.value.length} boxes prefilled — check each tile`;
+    status.value = `${boxes.value.length} boxes found. Check each tile.`;
   } catch (error) {
-    status.value = error instanceof Error ? error.message : String(error);
+    status.value = errorText(error);
   } finally {
     busy.value = false;
   }
@@ -131,15 +138,15 @@ async function save() {
   busy.value = true;
   try {
     const [kind, corner] = loaded.value.region.split(":");
-    const result = await review.api<{ saved: string }>("label", {
+    await review.api("label", {
       t: loaded.value.t,
       kind,
       corner,
       boxes: boxes.value,
     });
-    status.value = "Saved " + result.saved;
+    status.value = "Label saved.";
   } catch (error) {
-    status.value = error instanceof Error ? error.message : String(error);
+    status.value = errorText(error);
   } finally {
     busy.value = false;
   }
@@ -160,9 +167,7 @@ async function save() {
           </option></template
         >
       </select></label
-    ><label
-      >Time (seconds)<input v-model.number="at" type="number" min="0"
-    /></label>
+    ><label>Time<input v-model="at" placeholder="m:ss" /></label>
     <div class="actions">
       <button :disabled="busy" @click="load">Load</button
       ><button :disabled="busy || !loaded" @click="save">Save label</button

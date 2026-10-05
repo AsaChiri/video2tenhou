@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from video2tenhou.perception.tiles import CLASSES
 from video2tenhou.read import ReadContext, dense_reads
-from video2tenhou.train.data import CLASSES
 
 from .hand import corner_of
 
@@ -145,19 +145,7 @@ def replacement_question(request: dict, *, chosen: str | None = None) -> dict:
         "runner_up": alternative,
         "evidence_t": views[-1]["t0"],
         "tracking_uncertain": not request.get("acquired", False),
-        "text": (
-            (
-                "Continuous pond tracking links the conflicting views, but "
-                "reconstruction could not certify the discard identity. Check both "
-                "views."
-            )
-            if request.get("acquired")
-            else (
-                "A later pond view conflicts with this discard, and its "
-                "correspondence is unresolved. Check the discard and the later view"
-                " before accepting the log."
-            )
-        ),
+        "text": "A later pond view shows another tile here. Check both views.",
     }
 
 

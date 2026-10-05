@@ -3,12 +3,15 @@
 
 """Dense scheduling must preserve pixels, inference batches, and failure semantics."""
 
+from __future__ import annotations
+
 import hashlib
 import shutil
 import subprocess
 import threading
+from collections.abc import Generator, Iterable, Iterator
 from contextlib import closing
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -19,23 +22,18 @@ from video2tenhou import read
 from video2tenhou.commands import executable
 from video2tenhou.layout import Calibration
 from video2tenhou.perception.evidence_policy import DEFAULT_POLICY
-from video2tenhou.perception.reader import Box, Reading
-from video2tenhou.train.data import CLASSES
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
-
-    from video2tenhou.perception.reader import RegionClassifier, RegionDetector
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from video2tenhou.perception.reader import (
+    Box,
+    Reading,
+    RegionClassifier,
+    RegionDetector,
+)
+from video2tenhou.perception.tiles import CLASSES
 
 
 def test_dense_prefetch_preserves_batches_pixels_posteriors_and_caller_thread(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify dense prefetch preserves batches pixels posteriors and caller thread."""
     monkeypatch.setattr(read, "source_identity", lambda _: "source")
     monkeypatch.setattr(read, "READ_BATCH", 4)
     producer_ready = threading.Event()
@@ -46,8 +44,8 @@ def test_dense_prefetch_preserves_batches_pixels_posteriors_and_caller_thread(
     concurrent = [False]
 
     def sample(
-        path: "str | Path", **_unused_kwargs: object
-    ) -> "Iterator[tuple[float, np.ndarray]]":
+        path: str | Path, **_unused_kwargs: object
+    ) -> Iterator[tuple[float, np.ndarray]]:
         try:
             for i in range(7):
                 if concurrent[0] and i == 2:
@@ -57,14 +55,12 @@ def test_dense_prefetch_preserves_batches_pixels_posteriors_and_caller_thread(
         finally:
             closes.append(True)
 
-    def crop(
-        frame: "np.ndarray", cal: "Calibration", kind: "str", corner: "str"
-    ) -> tuple:
+    def crop(frame: np.ndarray, cal: Calibration, kind: str, corner: str) -> tuple:
         return frame[:6, :6].copy() + (1 if corner == "TR" else 0), None
 
     def infer(
-        items: "read.CropBatch", det: "RegionDetector", clf: "RegionClassifier"
-    ) -> "list[Reading]":
+        items: read.CropBatch, det: RegionDetector, clf: RegionClassifier
+    ) -> list[Reading]:
         assert threading.get_ident() == caller
         if concurrent[0] and not inference_started.is_set():
             inference_started.set()
@@ -118,9 +114,8 @@ def test_dense_prefetch_preserves_batches_pixels_posteriors_and_caller_thread(
 
 @pytest.mark.parametrize("failure", ["producer", "inference"])
 def test_dense_failure_closes_sampler_and_never_publishes_cache(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", failure: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Verify dense failure closes sampler and never publishes cache."""
     monkeypatch.setattr(read, "source_identity", lambda _: "source")
     monkeypatch.setattr(read, "READ_BATCH", 2)
     closed = threading.Event()
@@ -128,21 +123,19 @@ def test_dense_failure_closes_sampler_and_never_publishes_cache(
 
     def sample(
         *_unused_args: object, **_unused_kwargs: object
-    ) -> "Iterator[tuple[float, np.ndarray]]":
+    ) -> Iterator[tuple[float, np.ndarray]]:
         try:
             for i in range(100):
                 if failure == "producer" and i == 3:
-                    msg = "sampling failed"
-                    raise RuntimeError(msg)
+                    raise RuntimeError("sampling failed")
                 produced.append(i)
                 yield i / 5, np.zeros((4, 4, 3), np.uint8)
         finally:
             closed.set()
 
-    def infer(items: "read.CropBatch", *_unused_args: object) -> list:
+    def infer(items: read.CropBatch, *_unused_args: object) -> list:
         if failure == "inference":
-            msg = "inference failed"
-            raise RuntimeError(msg)
+            raise RuntimeError("inference failed")
         return [Reading(t, region, (4, 4)) for t, region, _ in items]
 
     monkeypatch.setattr(read.video, "sample", sample)
@@ -168,9 +161,8 @@ def test_dense_failure_closes_sampler_and_never_publishes_cache(
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
 def test_real_ffmpeg_prefetch_keeps_fractional_window_pixels_and_closes_child(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify real ffmpeg prefetch keeps fractional window pixels and closes child."""
     clip = tmp_path / "sample.mp4"
     subprocess.run(  # noqa: S603
         [
@@ -210,7 +202,7 @@ def test_real_ffmpeg_prefetch_keeps_fractional_window_pixels_and_closes_child(
     )
     monkeypatch.setattr(read, "READ_BATCH", 2)
 
-    def digest(batches: "Iterable[read.CropBatch]") -> list:
+    def digest(batches: Iterable[read.CropBatch]) -> list:
         return [
             [
                 (t, region, hashlib.sha256(img.tobytes()).hexdigest())
@@ -219,19 +211,19 @@ def test_real_ffmpeg_prefetch_keeps_fractional_window_pixels_and_closes_child(
             for batch in batches
         ]
 
+    def crops(lo: float, hi: float, fps: float) -> Generator[read.CropBatch]:
+        samples = read.video.sample(context.path, fps=fps, start=lo, end=hi)
+        return read._crop_batches(
+            samples, context.calibration, lambda _t: ["hand:TL"], 2
+        )
+
     for lo, hi, fps in ((0.031, 1.731, 5.0), (0.143, 1.913, 2.5)):
-        serial = digest(read._dense_batches(context, lo, hi, ["hand:TL"], fps))
-        with closing(
-            read._prefetch_batches(
-                read._dense_batches(context, lo, hi, ["hand:TL"], fps)
-            )
-        ) as batches:
+        serial = digest(crops(lo, hi, fps))
+        with closing(read._prefetch_batches(crops(lo, hi, fps))) as batches:
             assert digest(batches) == serial
     # Abandoning the consumer must terminate its real decoder, not leave a
     # prefetched worker waiting on a full pipe after the UI operation fails.
-    with closing(
-        read._prefetch_batches(read._dense_batches(context, 0, 2, ["hand:TL"], 30))
-    ) as batches:
+    with closing(read._prefetch_batches(crops(0, 2, 30))) as batches:
         assert next(batches)
     assert children
     assert all(child.poll() is not None for child in children)

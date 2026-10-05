@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { api } from "../shared/api";
+import { errorText } from "../shared/useAction";
 import type { Project, Results } from "../types";
-const props = defineProps<{ project: Project }>();
+// `updating`: this project's hands are being updated with saved answers.
+const props = defineProps<{ project: Project; updating?: boolean }>();
 const emit = defineEmits(["error"]);
 const data = ref<Results | null>(null),
   active = ref(0),
@@ -21,7 +23,7 @@ watch(
     JSON.stringify([
       props.project.id,
       props.project.results_revision,
-      props.project.pending_rebuilds,
+      props.updating,
     ]),
   async (_, __, onCleanup) => {
     let current = true;
@@ -33,8 +35,7 @@ watch(
       );
       if (current) data.value = result;
     } catch (error) {
-      if (current)
-        emit("error", error instanceof Error ? error.message : String(error));
+      if (current) emit("error", errorText(error));
     } finally {
       if (current) loading.value = false;
     }
@@ -83,8 +84,11 @@ async function copy(text: string) {
         </div>
       </div>
       <p v-if="pending" role="status">
-        Saved changes have not been applied yet. Return to Review to update the
-        record.
+        {{
+          updating
+            ? "Updating this hanchan with your answers…"
+            : "Your latest answers are not in this record yet. Open Review to apply them."
+        }}
       </p>
       <template v-else>
         <div class="game-actions">

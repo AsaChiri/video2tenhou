@@ -3,6 +3,8 @@
 
 """Tenhou tile encoding, call notation and legal hand replay."""
 
+from __future__ import annotations
+
 import json
 from urllib.parse import unquote
 
@@ -10,7 +12,6 @@ from video2tenhou import tenhou6 as t
 
 
 def test_tile_parsing_and_roundtrip() -> None:
-    """Verify tile parsing and roundtrip."""
     assert t.tile("1m") == 11
     assert t.tile("9s") == 39
     assert t.tile("7z") == 47
@@ -24,7 +25,6 @@ def test_tile_parsing_and_roundtrip() -> None:
 
 def test_relative_seat() -> None:
     # seat 1's kamicha is seat 0, toimen seat 3, shimocha seat 2
-    """Verify relative seat."""
     assert t.relative_seat(1, 0) == 0
     assert t.relative_seat(1, 3) == 1
     assert t.relative_seat(1, 2) == 2
@@ -32,7 +32,6 @@ def test_relative_seat() -> None:
 
 
 def test_call_strings() -> None:
-    """Verify call strings."""
     assert t.chi(13, 11, 12) == "c131112"
     assert t.pon(25, 25, 52, rel=0) == "p252552"
     assert t.pon(25, 25, 52, rel=1) == "25p2552"
@@ -50,7 +49,6 @@ def test_call_strings() -> None:
 
 
 def test_game_dump_shape() -> None:
-    """Verify game dump shape."""
     k = t.Kyoku(
         kyoku=0, honba=0, riichi_sticks=0, scores=[25000] * 4, dora=[t.tile("3p")]
     )
@@ -92,22 +90,18 @@ def test_game_dump_shape() -> None:
 
 
 def test_ryukyoku_dump() -> None:
-    """Verify ryukyoku dump."""
     assert t.Ryukyoku([3000, -1000, -1000, -1000]).dump() == [
         "流局",
         [3000, -1000, -1000, -1000],
     ]
-    assert t.Ryukyoku(kind="九種九牌").dump() == ["九種九牌"]
 
 
 def test_viewer_url() -> None:
-    """Verify viewer url."""
     g = t.Game(names=["A", "B", "C", "D"])
     assert g.viewer_url().startswith("https://tenhou.net/5/#json=")
 
 
 def test_editor_url_carries_one_kyoku() -> None:
-    """Verify editor url carries one kyoku."""
     g = t.Game(
         names=["A", "B", "C", "D"],
         title=["w", "g"],
@@ -129,7 +123,6 @@ def test_editor_url_carries_one_kyoku() -> None:
 
 
 def test_replay_needs_an_indicator_per_kan() -> None:
-    """Verify replay needs an indicator per kan."""
     k = t.Kyoku(0, 0, 0, [25000] * 4, dora=[33])
     k.haipai = [
         [11, 11, 11, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21],
@@ -141,7 +134,7 @@ def test_replay_needs_an_indicator_per_kan() -> None:
     # there
     k.draws = [[27, 28], [], [], []]
     k.discards = [[t.ankan(11), 60], [], [], []]
-    k.result = t.Ryukyoku(kind="九種九牌")
-    assert any("a log needs 2" in p for p in t.replay_kyoku(k.dump()))
+    (needs,) = [v for v in t.replay_kyoku(k.dump()) if v.kind == "indicators"]
+    assert needs.text.endswith("a log needs 2")
     k.dora = [33, 37]
-    assert not any("dora indicator" in p for p in t.replay_kyoku(k.dump()))
+    assert "indicators" not in {v.kind for v in t.replay_kyoku(k.dump())}

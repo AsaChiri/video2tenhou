@@ -1,6 +1,6 @@
 import { mount, flushPromises } from "@vue/test-utils";
 import type { VueWrapper } from "@vue/test-utils";
-import type { Project } from "../src/types";
+import type { Project, WorkspaceJob } from "../src/types";
 import { defineComponent } from "vue";
 import { beforeEach, expect, it, vi } from "vitest";
 import { api, upload } from "../src/shared/api";
@@ -14,15 +14,34 @@ vi.mock("../src/shared/api", () => ({ api: vi.fn(), upload: vi.fn() }));
 const project = (id: string, extra: Partial<Project> = {}): Project => ({
   id,
   name: id,
+  display_name: id,
+  kind: "local",
   games: [12],
   source: "video.mp4",
-  start: "",
-  end: "",
+  start: 0,
+  end: null,
+  status: "complete",
   open_items: 0,
   layout: "pml",
   has_fit: true,
+  can_calibrate: true,
+  checking: false,
+  stale_exports: false,
+  results_revision: [],
   artifacts: ["g0.json"],
-  job: { running: false, log: [], started: 1 },
+  job: { running: false, started: 1 },
+  ...extra,
+});
+const job = (extra: Partial<WorkspaceJob> = {}): WorkspaceJob => ({
+  kind: "analyze",
+  project: "A",
+  stage: "Reading tiles · hand 3",
+  hands: null,
+  running: true,
+  started: 1,
+  finished: null,
+  error: null,
+  log_lines: 0,
   ...extra,
 });
 const results = (id: string) => ({
@@ -56,9 +75,14 @@ beforeEach(() => {
   vi.mocked(upload).mockReset();
   location.hash = "";
 });
-async function studio(projects: Project[]) {
+async function studio(
+  projects: Project[],
+  status: { job: WorkspaceJob | null } = { job: null },
+) {
   vi.mocked(api).mockImplementation(async (path) => {
-    if (path === "/api/workspace") return { projects, setup: { ready: true } };
+    if (path === "/api/workspace")
+      return { projects: [...projects], setup: { ready: true } };
+    if (path.startsWith("/api/job")) return { ...status, revision: null };
     if (path.endsWith("/results")) return results(path);
     throw Error(path);
   });
@@ -77,6 +101,8 @@ async function studio(projects: Project[]) {
   await flushPromises();
   return wrapper;
 }
+const workspaceRequests = () =>
+  vi.mocked(api).mock.calls.filter(([path]) => path === "/api/workspace");
 it("lists existing projects on arrival, searches them and opens settings directly", async () => {
   const wrapper = await studio([
     project("A", { display_name: "League final", games: [123] }),
@@ -94,6 +120,45 @@ it("lists existing projects on arrival, searches them and opens settings directl
   expect(wrapper.getComponent(RecordingForm).attributes("style")).not.toContain(
     "display: none",
   );
+});
+it("polls only the job status while idle and refreshes projects when a job ends", async () => {
+  vi.useFakeTimers();
+  const status: { job: WorkspaceJob | null } = { job: job() };
+  const wrapper = await studio([project("A", { artifacts: [] })], status);
+  expect(workspaceRequests()).toHaveLength(1);
+  expect(wrapper.get(".project-status").text()).toBe("Reading tiles · hand 3");
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(workspaceRequests()).toHaveLength(1);
+  status.job = job({ running: false, finished: 2 });
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(workspaceRequests()).toHaveLength(2);
+  await vi.advanceTimersByTimeAsync(20000);
+  expect(workspaceRequests()).toHaveLength(2);
+  expect(
+    vi.mocked(api).mock.calls.filter(([path]) => path === "/api/job").length,
+  ).toBeLessThan(10);
+});
+it("refreshes projects after a job that started and ended between polls", async () => {
+  vi.useFakeTimers();
+  const status: { job: WorkspaceJob | null } = {
+    job: job({ running: false, finished: 1 }),
+  };
+  await studio([project("A")], status);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(workspaceRequests()).toHaveLength(1); // An earlier job is not news.
+  status.job = job({ kind: "check", started: 3, running: false, finished: 4 });
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(workspaceRequests()).toHaveLength(2);
+});
+it("checks a recording again while its digest is being computed", async () => {
+  vi.useFakeTimers();
+  const projects = [project("A", { checking: true, has_fit: false })];
+  const wrapper = await studio(projects);
+  expect(wrapper.get(".project-status").text()).toBe("Checking recording");
+  projects[0] = project("A");
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(workspaceRequests()).toHaveLength(2);
+  expect(wrapper.get(".project-status").text()).toBe("Results ready");
 });
 it("renames a project and requires confirmation before removing it", async () => {
   const wrapper = await studio([project("A")]);
@@ -140,9 +205,7 @@ it("retains project and input when a mutation fails, and blocks deleting active 
   await flushPromises();
   expect(wrapper.emitted("deleted")).toBeUndefined();
   expect(wrapper.findAll(".project-row")).toHaveLength(1);
-  await wrapper.setProps({
-    projects: [project("A", { review_running: true })],
-  });
+  await wrapper.setProps({ job: job({ kind: "rebuild" }) });
   expect(
     button(wrapper, "Delete project").attributes("disabled"),
   ).toBeDefined();
@@ -161,39 +224,44 @@ it("opens saved project links and follows browser navigation", async () => {
   expect(wrapper.findComponent(ProjectLibrary).exists()).toBe(true);
 });
 it("shows a retryable load failure without claiming the project library is empty", async () => {
-  vi.mocked(api).mockRejectedValueOnce(new Error("Server unavailable"));
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (path === "/api/workspace") throw new Error("Server unavailable");
+    return { job: null, revision: null };
+  });
   const wrapper = mount(StudioApp);
   await flushPromises();
   expect(wrapper.text()).toContain("Could not load projects");
   expect(wrapper.text()).not.toContain("Your recordings start here");
-  vi.mocked(api).mockResolvedValue({
-    projects: [project("A")],
-    setup: { ready: true },
-  });
+  vi.mocked(api).mockImplementation(async (path) =>
+    path === "/api/workspace"
+      ? { projects: [project("A")], setup: { ready: true } }
+      : { job: null, revision: null },
+  );
   await button(wrapper, "Retry").trigger("click");
   await flushPromises();
   expect(wrapper.findAll(".project-row")).toHaveLength(1);
   expect(wrapper.text()).not.toContain("Could not load projects");
 });
-it("does not let an older poll resurrect a deleted project", async () => {
-  vi.useFakeTimers();
+it("does not let an older project list resurrect a deleted project", async () => {
   const wrapper = await studio([project("A")]);
+  await wrapper.get('.project-summary a[href="#A"]').trigger("click");
+  await flushPromises();
   let finish: ((value: unknown) => void) | undefined;
   vi.mocked(api).mockImplementation((path) =>
     path === "/api/workspace"
       ? new Promise((resolve) => (finish = resolve))
-      : Promise.resolve({ deleted: "A" }),
+      : Promise.resolve({ deleted: "A", job: null, revision: null }),
   );
-  await vi.advanceTimersByTimeAsync(2500);
+  await button(wrapper, "All projects").trigger("click");
   await button(wrapper, "Delete").trigger("click");
   await button(wrapper, "Delete project").trigger("click");
   await flushPromises();
-  if (!finish) throw Error("Poll did not start");
+  if (!finish) throw Error("The project list was not requested");
   finish({ projects: [project("A")], setup: { ready: true } });
   await flushPromises();
   expect(wrapper.findAll(".project-row")).toHaveLength(0);
 });
-it("retains settings input and the review component through unrelated polls", async () => {
+it("retains settings input and the review component through status polls", async () => {
   vi.useFakeTimers();
   const wrapper = await studio([project("A")]);
   await wrapper.get('.project-summary a[href="#A"]').trigger("click");
@@ -201,12 +269,22 @@ it("retains settings input and the review component through unrelated polls", as
   const review = wrapper.get(".review-stub").element;
   await button(wrapper, "Settings").trigger("click");
   await wrapper.get("#settings-games").setValue("99, 100");
-  await vi.advanceTimersByTimeAsync(2500);
+  await vi.advanceTimersByTimeAsync(10000);
   expect(wrapper.get<HTMLInputElement>("#settings-games").element.value).toBe(
     "99, 100",
   );
   await button(wrapper, "Review").trigger("click");
   expect(wrapper.get(".review-stub").element).toBe(review);
+});
+it("shows analysis progress from the job status with the elapsed time", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(65_000);
+  history.replaceState(null, "", "#A");
+  const wrapper = await studio([project("A", { artifacts: [] })], {
+    job: job({ started: 1 }),
+  });
+  expect(wrapper.get(".processing h2").text()).toBe("Reading tiles · hand 3");
+  expect(wrapper.get(".processing").text()).toContain("Elapsed 1:04");
 });
 it("blocks navigation and analysis while calibration is dirty", async () => {
   const wrapper = await studio([project("A", { artifacts: [] }), project("B")]);
@@ -227,11 +305,16 @@ it("opens calibration in settings after a failed prepare and retries only on req
     has_fit: false,
     can_calibrate: true,
     artifacts: [],
-    job: { running: false, error: "No stable play windows found." },
+    job: {
+      action: "prepare",
+      running: false,
+      error: "Adjust the table borders in Calibration: pond:TL cuts tiles.",
+    },
   });
   const wrapper = await studio([failed]);
   await wrapper.get('.project-summary a[href="#A"]').trigger("click");
-  await button(wrapper, "Settings").trigger("click");
+  expect(wrapper.get('[role="alert"]').text()).toContain("pond:TL cuts tiles");
+  await button(wrapper, "Open settings").trigger("click");
   expect(button(wrapper, "Calibration").attributes("disabled")).toBeUndefined();
   await button(wrapper, "Calibration").trigger("click");
   expect(wrapper.get(".review-stub").isVisible()).toBe(true);
@@ -247,30 +330,43 @@ it("opens calibration in settings after a failed prepare and retries only on req
   await flushPromises();
   expect(api).toHaveBeenCalledWith("/api/projects/A/prepare", {});
 });
-it("keeps calibration unavailable while a recording is missing or processing", async () => {
+it("keeps calibration unavailable while a recording is missing or a job runs", async () => {
   const wrapper = mount(ProjectSettings, {
     props: { project: project("A", { can_calibrate: false, has_fit: false }) },
   });
   expect(button(wrapper, "Calibration").attributes("disabled")).toBeDefined();
   await wrapper.setProps({
-    project: project("A", { can_calibrate: true, job: { running: true } }),
+    project: project("A", { can_calibrate: true }),
+    locked: true,
   });
   expect(button(wrapper, "Calibration").attributes("disabled")).toBeDefined();
 });
+it("shows a selected range as video times", () => {
+  const wrapper = mount(ProjectSettings, {
+    props: { project: project("A", { start: 90, end: 3725 }) },
+  });
+  expect(wrapper.text()).toContain("Selected range: 1:30 to 62:05.");
+});
 it("does not let a delayed action replace another selected recording", async () => {
-  const wrapper = await studio([project("A", { artifacts: [] }), project("B")]);
+  const projects = [project("A", { artifacts: [] }), project("B")];
+  const wrapper = await studio(projects);
   await wrapper.get('.project-summary a[href="#A"]').trigger("click");
   let finish: ((value: unknown) => void) | undefined;
   vi.mocked(api).mockImplementation((path) =>
     path.endsWith("/analyze")
       ? new Promise((resolve) => (finish = resolve))
-      : Promise.resolve({ projects: [], setup: { ready: true } }),
+      : Promise.resolve({
+          projects,
+          setup: { ready: true },
+          job: null,
+          revision: null,
+        }),
   );
   await button(wrapper, "Analyze recording").trigger("click");
   await button(wrapper, "All projects").trigger("click");
   if (!finish) throw new Error("Request did not start.");
   await wrapper.get('.project-summary a[href="#B"]').trigger("click");
-  finish(project("A", { job: { running: true, log: [] } }));
+  finish(project("A", { job: { running: true } }));
   await flushPromises();
   expect(wrapper.get(".review-stub").text()).toBe("Review B");
 });
@@ -287,7 +383,7 @@ it("keeps the latest project results when an older request completes last", asyn
   await flushPromises();
   expect(wrapper.get(".players").text()).toBe("B");
 });
-it("does not restart a slow results request on identical poll data", async () => {
+it("does not restart a slow results request on identical project data", async () => {
   let finish: ((value: unknown) => void) | undefined;
   vi.mocked(api).mockImplementation(
     () => new Promise((resolve) => (finish = resolve)),
@@ -304,17 +400,18 @@ it("withholds replay and download links for games with pending answers", async (
   vi.mocked(api).mockResolvedValue({ ...results("A"), pending_games: [0] });
   const wrapper = mount(ResultsPanel, { props: { project: project("A") } });
   await flushPromises();
-  expect(wrapper.text()).toContain("Return to Review to update the record");
+  expect(wrapper.text()).toContain("Open Review to apply them");
   expect(wrapper.find("a[download]").exists()).toBe(false);
+  await wrapper.setProps({ updating: true });
+  await flushPromises();
+  expect(wrapper.text()).toContain("Updating this hanchan");
 });
 it("preserves settings drafts and reports an API failure", async () => {
   vi.mocked(api).mockRejectedValue(new Error("Cannot save"));
   const wrapper = mount(ProjectSettings, { props: { project: project("A") } });
   await wrapper.get("#settings-games").setValue("15");
   await wrapper.setProps({
-    project: project("A", {
-      job: { running: false, error: "failed", log: ["failed"] },
-    }),
+    project: project("A", { job: { running: false, error: "failed" } }),
   });
   await wrapper.get("form").trigger("submit");
   await flushPromises();
@@ -346,7 +443,6 @@ it("captures the local file and form before a slow copy", async () => {
   expect(api).toHaveBeenCalledWith("/api/projects", {
     kind: "local",
     games: [12],
-
     layout: "",
     start: "",
     end: "",
@@ -392,10 +488,14 @@ it("rejects a reversed time range before copying a recording", async () => {
   expect(upload).not.toHaveBeenCalled();
   expect(wrapper.emitted("error")?.at(-1)?.[0]).toContain("after start");
 });
-it("updates logs as text, preserves expansion and stops following when reading older output", async () => {
+it("fetches the developer log only while open, as text, and follows new lines", async () => {
+  let log = ["first"];
+  vi.mocked(api).mockImplementation(async () => ({ log }));
   const wrapper = mount(ProcessingLog, {
-    props: { job: { started: 1, log: ["first"] } },
+    props: { projectId: "A", job: { started: 1, running: true }, lines: 1 },
   });
+  await flushPromises();
+  expect(api).not.toHaveBeenCalled();
   const output = wrapper.get("pre").element;
   Object.defineProperties(output, {
     scrollHeight: { value: 1000, configurable: true },
@@ -404,17 +504,18 @@ it("updates logs as text, preserves expansion and stops following when reading o
   wrapper.get("details").element.open = true;
   await wrapper.get("details").trigger("toggle");
   await flushPromises();
+  expect(api).toHaveBeenCalledWith("/api/projects/A/log");
   expect(output.scrollTop).toBe(1000);
   output.scrollTop = 200;
   await wrapper.get("pre").trigger("scroll");
-  await wrapper.setProps({
-    job: { started: 1, log: ["first", "<script>latest</script>"] },
-  });
+  log = ["first", "<script>latest</script>"];
+  await wrapper.setProps({ lines: 2 });
   await flushPromises();
   expect(output.scrollTop).toBe(200);
-  expect(wrapper.get("details").element.open).toBe(true);
+  expect(wrapper.text()).toContain("<script>latest</script>");
   expect(wrapper.find("script").exists()).toBe(false);
-  await wrapper.setProps({ job: { started: 2, log: ["retry"] } });
+  log = ["retry"];
+  await wrapper.setProps({ job: { started: 2, running: true }, lines: 1 });
   await flushPromises();
   expect(output.scrollTop).toBe(1000);
 });

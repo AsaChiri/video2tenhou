@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import itertools
 import json
 import logging
@@ -20,19 +19,16 @@ from .cache import source_identity
 from .engine.ponds import clearings
 from .files import atomic_write_json
 from .layout import CORNERS, Calibration
-from .perception import detector as detector_backend
 from .perception.reader import Box, assign_pond
+from .perception.tiles import CLASSES
 from .record import SEAT_LETTER, SEATS, Game
-from .train.data import CLASSES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from video2tenhou.perception.reader import RegionDetector
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
+    from video2tenhou.read import ReadContext
 
 POND_DETECTION_CONFIDENCE = 0.4
 MIN_HAND_WINDOW = 30
@@ -81,7 +77,7 @@ def read_pond_counts(
                     p=np.zeros(len(CLASSES)),
                 )
                 for d in detections
-                if d.conf >= POND_DETECTION_CONFIDENCE and not d.back
+                if d.conf >= POND_DETECTION_CONFIDENCE
             ]
             rejected = assign_pond(boxes, image.shape[0], image.shape[1])
             out[iv.region.partition(":")[2]].append(
@@ -181,20 +177,20 @@ def site_entries(
 
 
 def run_header(
-    path: str | Path,
-    cal: Calibration,
-    games: list[Game],
-    work: Path,
-    *,
-    force: bool = False,
+    context: ReadContext, games: list[Game], *, force: bool = False
 ) -> tuple[list[dict], list[str]]:
-    """Cache table evidence, then align physical hand order to scoremj records."""
+    """Cache table evidence, then align physical hand order to scoremj records.
+
+    Only the context's detector is used: it counts pond tiles when the
+    table-timing cache, which binds its identity, is missing or stale.
+    """
+    path, cal, work = context.path, context.calibration, context.work
+    detector = context.detector
     work.mkdir(parents=True, exist_ok=True)
     intervals = calm.run_calm(path, cal, work, force=force, log=LOGGER.info)
-    detector = detector_backend.Detector()
     signature = {
         "version": 1,
-        "source": source_identity(path, refresh=True),
+        "source": source_identity(path),
         "geometry": calm.geometry_key(cal),
         "detector": detector.id,
         "intervals": [
@@ -207,28 +203,10 @@ def run_header(
     if not force:
         with contextlib.suppress(FileNotFoundError, json.JSONDecodeError):
             saved = json.loads(cache_path.read_text(encoding="utf-8"))
-    valid_cache = (
-        isinstance(saved, dict)
-        and saved.get("signature") == signature
-        and "observations" in saved
-        and saved.get("sha256")
-        == hashlib.sha256(
-            json.dumps(saved["observations"], sort_keys=True).encode()
-        ).hexdigest()
-    )
-    if not valid_cache:
+    if not (isinstance(saved, dict) and saved.get("signature") == signature):
         observations = read_pond_counts(path, cal, intervals, detector, log=LOGGER.info)
-        saved = {
-            "signature": signature,
-            "observations": observations,
-            "sha256": hashlib.sha256(
-                json.dumps(observations, sort_keys=True).encode()
-            ).hexdigest(),
-        }
+        saved = {"signature": signature, "observations": observations}
         atomic_write_json(cache_path, saved)
-    if saved is None:
-        msg = "Table timing did not produce an observation cache"
-        raise RuntimeError(msg)
     windows = hand_windows(saved["observations"], video.probe(str(path)).duration)
     entries, problems = site_entries(windows, games)
     if not problems:

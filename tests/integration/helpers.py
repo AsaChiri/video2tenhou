@@ -3,6 +3,8 @@
 
 """Restore recorded solver inputs without changing their evidence or constraints."""
 
+from __future__ import annotations
+
 import numpy as np
 
 from video2tenhou.engine.solver import (

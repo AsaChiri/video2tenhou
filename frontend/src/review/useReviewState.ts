@@ -1,246 +1,227 @@
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { api as request } from "../shared/api";
+import { errorText } from "../shared/useAction";
+import type { JobState } from "../shared/useJob";
 import { reviewDecisions } from "./decisions";
-import type { RequestOptions } from "../shared/api";
 import type {
-  HandEntry,
-  ReviewItem,
-  Facts,
-  Fact,
   Decision,
-  Job,
+  Fact,
+  FactBody,
+  Facts,
+  HandRow,
+  JobStatus,
+  ReviewItem,
 } from "../types";
 
-export function useReviewState(base: string) {
-  const hands = ref<HandEntry[]>([]),
+/**
+ * Review data of one project. A hand with new or deleted answers is pending: its
+ * questions wait until the server has updated it, and the update then asks again
+ * only what is still open. Job progress comes from the studio's status poll.
+ */
+export function useReviewState(projectId: string, status: JobState) {
+  const url = (path: string) => `/review/${projectId}/api/${path}`;
+  const api = <T>(path: string, body?: unknown) => request<T>(url(path), body);
+  const hands = ref<HandRow[]>([]),
     items = ref<ReviewItem[]>([]),
     facts = ref<Facts>({}),
     selection = ref<Decision | null>(null);
   const guided = ref(false),
     saving = ref(false),
-    deferred = ref(new Set<string>());
+    requesting = ref(false),
+    skipped = ref(new Set<string>()),
+    answered = ref(new Set<number>());
   const dirty = ref(false),
     players = ref(0),
     error = ref(""),
     message = ref(""),
     updates = ref(false),
-    revision = ref("");
-  const job = ref<Job>({ running: false, pending: [] }),
-    localPending = ref<number[]>([]),
-    requesting = ref(false);
-  const url = (path: string) => `${base}/api/${path}`;
-  const api = <T>(path: string, body?: unknown, options?: RequestOptions) =>
-    request<T>(url(path), body, options);
-  const decisions = computed(() =>
-    reviewDecisions(items.value, hands.value, facts.value),
-  );
-  const key = ({ item, decision }: Decision) =>
-    JSON.stringify([
-      item.hand,
-      decision.field || decision.kind,
-      decision.seat,
-      decision.j,
-      decision.t,
-      decision.text,
-    ]);
-  const questions = computed(() =>
-    decisions.value.filter(
-      (row) =>
-        !deferred.value.has(key(row)) && !blocked.value.has(row.item.hand),
-    ),
-  );
-  const skipped = computed(() =>
-    decisions.value.filter(
-      (row) =>
-        deferred.value.has(key(row)) && !blocked.value.has(row.item.hand),
-    ),
+    loads = ref(0);
+  // `loaded` is the revision the data reflects; `ownChange` marks a revision
+  // change caused by this tab's own answer; `queued` allows one automatic update.
+  let loaded: string | null = null,
+    ownChange = false,
+    queued = true,
+    mutation = 0,
+    disposed = false;
+  onBeforeUnmount(() => (disposed = true));
+  const job = computed(() =>
+    status.job.value?.project === projectId ? status.job.value : null,
   );
   const updating = computed(
-    () => saving.value || requesting.value || job.value.running,
+    () => !!job.value?.running && job.value.kind === "rebuild",
   );
+  const busy = computed(() => !!status.job.value?.running);
   const pending = computed(() =>
     [
       ...new Set([
-        ...(job.value.pending || []),
-        ...localPending.value,
-        ...hands.value
-          .filter((hand) => hand.pending_rebuild || (hand.facts_newer ?? 0) > 0)
-          .map((hand) => hand.hand),
+        ...hands.value.filter((hand) => hand.pending).map((hand) => hand.hand),
+        ...answered.value,
+        ...(updating.value ? job.value?.hands || [] : []),
       ]),
     ].sort((a, b) => a - b),
   );
-  const blocked = computed(
-    () =>
-      new Set([
-        ...pending.value,
-        ...(job.value.running
-          ? job.value.hands || hands.value.map((hand) => hand.hand)
-          : []),
-      ]),
-  );
-  let disposed = false,
-    mutation = 0,
-    timer: ReturnType<typeof setTimeout> | undefined,
-    polling = false;
-  onBeforeUnmount(() => {
-    disposed = true;
-    clearTimeout(timer);
+  const decisions = computed(() => reviewDecisions(items.value));
+  const open = computed(() => {
+    const waiting = new Set(pending.value);
+    return decisions.value.filter((row) => !waiting.has(row.item.hand));
   });
+  const questions = computed(() =>
+    open.value.filter((row) => !skipped.value.has(row.key)),
+  );
+  const deferred = computed(() =>
+    open.value.filter((row) => skipped.value.has(row.key)),
+  );
+  const waiting = computed(() => decisions.value.length - open.value.length);
+
   function select(decision: Decision | null) {
     selection.value = decision;
     dirty.value = false;
   }
   function keepSelection() {
-    if (
-      !selection.value ||
-      !questions.value.some((row) => key(row) === key(selection.value!))
-    )
+    const key = selection.value?.key;
+    if (!questions.value.some((row) => row.key === key))
       select(questions.value[0] || null);
   }
   function next() {
     if (saving.value) return;
-    if (selection.value) deferred.value.add(key(selection.value));
+    if (selection.value)
+      skipped.value = new Set([...skipped.value, selection.value.key]);
     select(questions.value[0] || null);
   }
   function revisit() {
-    deferred.value.clear();
+    skipped.value = new Set();
     select(questions.value[0] || null);
   }
   async function load() {
-    const version = mutation;
-    const [newHands, newItems, newFacts, status] = await Promise.all([
-      api<HandEntry[]>("hands"),
+    const at = mutation;
+    const [newHands, newItems, newFacts] = await Promise.all([
+      api<HandRow[]>("hands"),
       api<ReviewItem[]>("items"),
       api<Fact[]>("facts"),
-      api<Job>("decode_pending", undefined, { jobStatus: true }),
     ]);
-    if (disposed || version !== mutation) return false;
+    if (disposed || at !== mutation) return false;
     hands.value = newHands;
     items.value = newItems;
     facts.value = Object.groupBy(newFacts, (fact) => fact.hand);
-    job.value = status;
-    if (status.running && !requesting.value && !timer)
-      timer = setTimeout(() => rebuild("decode_pending", true), 2000);
-    localPending.value = [];
-    if (status.error) error.value = status.error;
+    answered.value = new Set();
+    loads.value++;
     return true;
   }
   async function refresh(preserve = false) {
-    const loaded = await load();
-    if (disposed) return;
-    if (!loaded) return;
+    loaded = status.revision.value;
+    if (!(await load())) return;
     if (preserve) keepSelection();
     else select(questions.value[0] || null);
     updates.value = false;
-    revision.value = JSON.stringify(await api("revision"));
   }
-  async function poll() {
-    if (polling || updating.value) return;
-    polling = true;
-    try {
-      const value = JSON.stringify(await api("revision"));
-      if (disposed || updating.value) return;
-      if (revision.value && value !== revision.value) {
-        if (dirty.value || players.value) updates.value = true;
-        else await refresh();
-      }
-      if (!dirty.value && !players.value) revision.value = value;
-    } catch {
-      /* Retry transient file writes without dropping the current answer. */
-    } finally {
-      polling = false;
+  watch(status.revision, (value) => {
+    if (!value || value === loaded) return;
+    if (loaded === null || ownChange) {
+      loaded = value;
+      ownChange = false;
+    } else if (!saving.value && !updating.value) {
+      if (dirty.value || players.value) updates.value = true;
+      else void refresh(true);
     }
+  });
+  async function post(fact: FactBody) {
+    mutation++;
+    const row = await api<Fact>("facts", fact);
+    mutation++;
+    ownChange = true;
+    (facts.value[row.hand] ??= []).push(row);
+    if (row.kind !== "dismiss") {
+      answered.value = new Set([...answered.value, row.hand]);
+      queued = true;
+    }
+    return row;
   }
-  async function save(fact: Fact) {
-    if (saving.value || (guided.value && blocked.value.has(fact.hand)))
+  async function save(fact: FactBody & { hand: number }) {
+    if (saving.value) return undefined;
+    if (guided.value && pending.value.includes(fact.hand))
       throw new Error(
-        "This hand is already waiting for an update. Answer another hand first.",
+        "This hand is being updated. Answer a question from another hand.",
       );
     saving.value = true;
-    mutation++;
     try {
-      const current = selection.value;
-      const result = await api<Fact>("facts", fact);
-      mutation++;
-      (facts.value[fact.hand] ??= []).push(result);
-      localPending.value.push(fact.hand);
+      const row = await post(fact);
       dirty.value = false;
       message.value = guided.value ? "" : "Answer saved.";
-      if (guided.value) {
-        if (fact.kind === "lost" && current) deferred.value.add(key(current));
-        select(questions.value[0] || null);
-      }
-      return result;
+      if (guided.value) select(questions.value[0] || null);
+      return row;
     } finally {
       saving.value = false;
-      startQueued();
+      maybeStart();
+    }
+  }
+  /** Close a question that needs no tile answer; this never updates the hand. */
+  async function dismiss(item: ReviewItem) {
+    if (saving.value) return;
+    saving.value = true;
+    try {
+      await post({ kind: "dismiss", hand: item.hand, item: item.id });
+      items.value = items.value.filter(
+        (row) => row.hand !== item.hand || row.id !== item.id,
+      );
+      select(questions.value[0] || null);
+    } finally {
+      saving.value = false;
     }
   }
   async function remove(fact: Fact) {
     mutation++;
     await api("facts/delete", { ts: fact.ts });
     mutation++;
+    ownChange = true;
     facts.value[fact.hand] = (facts.value[fact.hand] || []).filter(
       (row) => row.ts !== fact.ts,
     );
-    localPending.value.push(fact.hand);
+    if (fact.kind === "dismiss") await refresh(true);
+    else {
+      answered.value = new Set([...answered.value, fact.hand]);
+      queued = true;
+    }
   }
-  function startQueued() {
+  function maybeStart() {
     if (
       !disposed &&
       guided.value &&
+      queued &&
       pending.value.length &&
-      !updating.value &&
+      !busy.value &&
+      !requesting.value &&
       !error.value
     )
       void rebuild();
   }
-  async function rebuild(path = "decode_pending", resume = false) {
-    if (requesting.value) return;
-    if (!resume && job.value.running) return;
-    clearTimeout(timer);
-    timer = undefined;
-    if (!resume && dirty.value && !guided.value) {
-      message.value = "Save the current answer before rebuilding changes.";
+  /** Update pending hands, every hand, or the listed hands from saved answers. */
+  async function rebuild(hands: "pending" | "all" | number[] = "pending") {
+    if (busy.value || requesting.value) return;
+    if (dirty.value && !guided.value) {
+      message.value = "Save the current answer before applying changes.";
       return;
     }
     requesting.value = true;
     error.value = "";
+    queued = false;
     try {
-      const status = await api<Job>(path, resume ? undefined : {}, {
-        jobStatus: true,
-      });
-      if (disposed) return;
-      job.value = {
-        ...status,
-        pending: status.pending || pending.value,
-        hands:
-          status.hands ||
-          (path === "decode_all"
-            ? hands.value.map((hand) => hand.hand)
-            : path.startsWith("decode/")
-              ? [Number(path.slice(7))]
-              : status.pending || pending.value),
-      };
-      if (status.running) {
-        if (guided.value) keepSelection();
-        timer = setTimeout(() => rebuild(path, true), 2000);
-      } else {
-        if (status.error) error.value = status.error;
-        if (!guided.value && (dirty.value || players.value))
-          updates.value = true;
-        else await refresh(true);
-      }
+      const started = await request<JobStatus>(url("rebuild"), { hands });
+      status.show(started);
+      if (!started.job?.running) await refresh(true);
     } catch (failure) {
-      error.value =
-        failure instanceof Error ? failure.message : String(failure);
-      job.value.running = false;
+      error.value = errorText(failure);
     } finally {
       requesting.value = false;
-      startQueued();
     }
   }
+  status.onFinished((finished) => {
+    if (finished.project !== projectId || finished.kind !== "rebuild") return;
+    if (finished.error) error.value = finished.error;
+    if (!guided.value && (dirty.value || players.value)) updates.value = true;
+    else void refresh(true).then(maybeStart);
+  });
   return {
+    projectId,
     url,
     api,
     hands,
@@ -248,28 +229,30 @@ export function useReviewState(base: string) {
     facts,
     guided,
     saving,
+    requesting,
     selection,
     dirty,
     players,
     error,
     message,
     updates,
-    revision,
+    loads,
     job,
-    pending,
-    requesting,
     updating,
+    busy,
+    pending,
+    waiting,
     decisions,
-    skipped,
     questions,
+    deferred,
     select,
     next,
     revisit,
-    load,
     refresh,
-    poll,
     save,
+    dismiss,
     remove,
     rebuild,
+    maybeStart,
   };
 }

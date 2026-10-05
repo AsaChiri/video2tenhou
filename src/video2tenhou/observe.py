@@ -23,19 +23,16 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .calm import REGIONS, Interval
-from .files import atomic_write_json, sha256_file
+from .files import atomic_write_json, atomic_write_text, json_digest, sha256_text
 from .perception.evidence_policy import prepare_reading, resolve_policy
-from .read import load_reads
-from .train.data import CLASSES
+from .perception.tiles import CLASSES
+from .read import load_reads, manifest
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from video2tenhou.perception.evidence_policy import EvidencePolicy
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 MIN_CALM_READING_RUN = 2
 MERGEABLE_RUN_COUNT = 2
@@ -103,9 +100,8 @@ class Observation:
     partial: bool = False
     iv_t0: float = 0.0  # the calm interval's bounds
     iv_t1: float = 0.0
-    extra: list[list[Slot]] = field(
-        default_factory=list
-    )  # hands: groups lying beside the row (melds moved at a reveal)
+    # hands: groups lying beside the row (melds moved at a reveal)
+    extra: list[list[Slot]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Return the stage-4 cache representation, including partial-view status."""
@@ -164,12 +160,7 @@ def _prepared(
         (r for r in readings if iv.t0 - 1e-6 <= r["t"] <= iv.t1 + 1e-6),
         key=lambda r: r["t"],
     )
-    return [
-        prepare_reading(
-            kind, r, stage="sparse", policy=effective, none_index=CLASSES.index("none")
-        )
-        for r in rs
-    ]
+    return [prepare_reading(kind, r, stage="sparse", policy=effective) for r in rs]
 
 
 def _count(r: dict) -> int:
@@ -183,13 +174,13 @@ def observe_interval(
     *,
     policy: EvidencePolicy | dict | None = None,
 ) -> list[Observation]:
-    """Aggregate one calm interval, splitting a persistent count change.
+    """Vote one calm interval: one observation, or two when its count changed once.
 
-    The observations of one calm interval: one, or two when the box count changed once
-    and stayed changed (a discard or a draw made quickly enough to leave the interval
-    calm). Two runs of at least two readings each are two states; a single odd reading
-    is noise and the mode decides (`observe`). Confidence floors follow the supplied
-    policy; raw reading objects remain reusable.
+    A box count that changes once and stays changed is a discard or a draw made
+    quickly enough to leave the interval calm. Two runs of at least two readings each
+    are two states; a single odd reading is noise and the mode decides. Readings off
+    the mode count are dropped. Confidence floors follow the supplied policy; raw
+    reading objects remain reusable.
     """
     kind = region.partition(":")[0]
     prepared = _prepared(kind, readings, iv, policy=policy)
@@ -219,23 +210,6 @@ def observe_interval(
             ),
         ]
     return [_observe_prepared(region, prepared, iv)]
-
-
-def observe(
-    region: str,
-    readings: list[dict],
-    iv: Interval,
-    *,
-    policy: EvidencePolicy | dict | None = None,
-) -> Observation:
-    """Vote readings inside a calm interval into one observation.
-
-    One voted observation of the readings inside `iv`: readings off the mode count are
-    dropped.
-    """
-    return _observe_prepared(
-        region, _prepared(region.partition(":")[0], readings, iv, policy=policy), iv
-    )
 
 
 def _group_reading_boxes(kind: str, used: list[dict]) -> tuple[dict, dict, dict]:
@@ -328,10 +302,21 @@ def _observe_prepared(region: str, rs: list[dict], iv: Interval) -> Observation:
     return obs
 
 
-def _digest(path: Path) -> str | None:
-    if not path.exists():
+def _provenance_path(work: Path, hand: int) -> Path:
+    return work / "obs" / "provenance" / f"{hand:02d}.json"
+
+
+def provenance(work: Path, hand: int) -> dict | None:
+    """Return a hand's observation completion record, or None when none is complete.
+
+    The record holds the inputs the vote was bound to, including the digest of the
+    reading manifest, and the digest of the observation text as written.
+    """
+    try:
+        record = json.loads(_provenance_path(work, hand).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeError):
         return None
-    return sha256_file(path)
+    return record if isinstance(record, dict) else None
 
 
 def _observation_inputs(
@@ -341,7 +326,7 @@ def _observation_inputs(
     *,
     policy: EvidencePolicy | dict | None = None,
 ) -> dict:
-    hdir = work / "reads" / f"{hand['hand']:02d}"
+    reads = manifest(work, hand["hand"])
     intervals = [
         [iv.region, iv.t0, iv.t1, bool(iv.partial)]
         for iv in ivs
@@ -353,11 +338,7 @@ def _observation_inputs(
     return {
         "version": OBSERVATION_VERSION,
         "window": [hand["t_start"], hand["t_end"]],
-        "manifest": _digest(hdir / "done.json"),
-        "readings": {
-            region: _digest(hdir / f"{region.replace(':', '_')}.jsonl")
-            for region in REGIONS
-        },
+        "reads": None if reads is None else json_digest(reads),
         "intervals": intervals,
         "classes": list(CLASSES),
         "evidence_policy": resolve_policy(policy).fingerprint_for("sparse"),
@@ -366,22 +347,12 @@ def _observation_inputs(
 
 
 def _observation_current(work: Path, hand: dict, inputs: dict) -> bool:
-    try:
-        manifest = json.loads(
-            (work / "obs" / "provenance" / f"{hand['hand']:02d}.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        return (
-            inputs["manifest"] is not None
-            and isinstance(manifest, dict)
-            and manifest.get("inputs") == inputs
-            and manifest.get("output_sha256") is not None
-            and manifest["output_sha256"]
-            == _digest(work / "obs" / f"{hand['hand']:02d}.json")
-        )
-    except (FileNotFoundError, json.JSONDecodeError, UnicodeError):
-        return False
+    record = provenance(work, hand["hand"])
+    return (
+        inputs["reads"] is not None
+        and record is not None
+        and record.get("inputs") == inputs
+    )
 
 
 def validate_observation_cache(
@@ -393,9 +364,9 @@ def validate_observation_cache(
 ) -> None:
     """Require voted evidence derived from the current reads and calm intervals.
 
-    Review rebuilds use the saved calm intervals when ``ivs`` is omitted. Unproven,
-    corrupted or interrupted observation publications must be refreshed through
-    normal analysis before any hand is decoded; this check does not alter files.
+    Review rebuilds use the saved calm intervals when ``ivs`` is omitted. Unproven
+    or interrupted observation publications must be refreshed through normal
+    analysis before any hand is decoded; this check does not alter files.
     The effective sparse policy must match the vote that produced the cache.
     """
     if not hands:
@@ -415,11 +386,10 @@ def validate_observation_cache(
             UnicodeError,
             TypeError,
         ) as error:
-            msg = (
+            raise ValueError(
                 "Saved observations cannot be verified. Choose Analyze recording to"
                 " refresh evidence before rebuilding logs."
-            )
-            raise ValueError(msg) from error
+            ) from error
     stale = [
         str(hand["hand"])
         for hand in hands
@@ -428,20 +398,10 @@ def validate_observation_cache(
         )
     ]
     if stale:
-        msg = (
+        raise ValueError(
             f"Saved observations are stale for hand(s) {', '.join(stale)}. "
             "Choose Analyze recording to refresh evidence before rebuilding logs."
         )
-        raise ValueError(msg)
-
-
-@dataclass(frozen=True, kw_only=True)
-class ObservationOptions:
-    """Refresh selection and sparse evidence policy for observation publication."""
-
-    force: bool = False
-    touched: set[int] | None = None
-    policy: EvidencePolicy | dict | None = None
 
 
 def run_observe(
@@ -449,32 +409,30 @@ def run_observe(
     hands: list[dict],
     ivs: list[Interval],
     *,
+    force: bool = False,
+    touched: set[int] | None = None,
+    policy: EvidencePolicy | dict | None = None,
     log: Callable[[str], None] = LOGGER.info,
-    options: ObservationOptions | None = None,
 ) -> dict:
     """Vote current readings, atomically publishing observations and their provenance.
 
-    Reuse requires identical reading bytes, completion manifest, relevant calm
-    intervals, effective sparse evidence policy and voting settings, plus an intact
-    output. ``touched`` forces recomputation but is not the sole invalidation signal:
-    a prior process may
-    have stopped after publishing readings and before updating observations.
-    Returned ``changed_hands`` identifies results whose downstream decode must
-    be refreshed, including changes recovered from an earlier interrupted run.
+    Reuse requires the same reading manifest (which records the digest of every
+    reading file), relevant calm intervals, effective sparse evidence policy and
+    voting settings. ``touched`` forces recomputation but is not the sole
+    invalidation signal: a prior process may have stopped after publishing readings
+    and before updating observations. A rewrite removes the old provenance before
+    replacing the observations and writes the new one last. Returned
+    ``changed_hands`` identifies results whose downstream decode must be refreshed,
+    including changes recovered from an earlier interrupted run.
     """
-    options = options or ObservationOptions()
-    force, touched, policy = (options.force, options.touched, options.policy)
     policy = resolve_policy(policy)
     stats = defaultdict(int)
     changed = []
     odir = work / "obs"
     odir.mkdir(parents=True, exist_ok=True)
     for h in hands:
-        out = odir / f"{h['hand']:02d}.json"
-        if not (work / "reads" / f"{h['hand']:02d}" / "done.json").exists():
-            continue
         inputs = _observation_inputs(work, h, ivs, policy=policy)
-        if (
+        if inputs["reads"] is None or (
             not force
             and h["hand"] not in (touched or set())
             and _observation_current(work, h, inputs)
@@ -502,12 +460,15 @@ def run_observe(
             result[region] = obs_list
             stats["observations"] += len(obs_list)
         if inputs != _observation_inputs(work, h, ivs, policy=policy):
-            msg = "Reading inputs changed while building observations; retry analysis."
-            raise ValueError(msg)
-        atomic_write_json(out, result)
+            raise ValueError(
+                "Reading inputs changed while building observations; retry analysis."
+            )
+        text = json.dumps(result, ensure_ascii=False)
+        record = _provenance_path(work, h["hand"])
+        record.unlink(missing_ok=True)
+        atomic_write_text(odir / f"{h['hand']:02d}.json", text)
         atomic_write_json(
-            odir / "provenance" / f"{h['hand']:02d}.json",
-            {"inputs": inputs, "output_sha256": _digest(out)},
+            record, {"inputs": inputs, "output_sha256": sha256_text(text)}
         )
         changed.append(h["hand"])
         stats["hands"] += 1

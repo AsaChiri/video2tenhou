@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Recognition identities for tests that replace the inference boundary."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,8 +13,8 @@ import pytest
 from video2tenhou.layout import Calibration
 from video2tenhou.perception.detector import Det
 from video2tenhou.perception.evidence_policy import DEFAULT_POLICY, EvidencePolicy
+from video2tenhou.perception.tiles import CLASSES
 from video2tenhou.read import ReadModels
-from video2tenhou.train.data import CLASSES
 
 
 def models_stub() -> ReadModels:

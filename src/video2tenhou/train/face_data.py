@@ -4,7 +4,7 @@
 """Build a face-localization dataset without mixing pseudo-labels into validation.
 
 Human PML images keep their original held-out hand split. Archive drafts are
-training-only and explicitly unreviewed; unknown-class images are excluded.
+training-only and explicitly unreviewed; images without drafts are excluded.
 Exact duplicate images share a split or fail, never silently leak into validation.
 """
 
@@ -12,16 +12,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from video2tenhou.files import atomic_write_json, atomic_write_text
 from video2tenhou.files import sha256_file as file_hash
 from video2tenhou.logging_setup import RESULT, command_logging
 
-from .data import HELD_OUT_HANDS, hand_of, hand_table, load_labels
+from .data import (
+    HELD_OUT_HANDS,
+    annotation_key,
+    hand_of,
+    hand_table,
+    load_labels,
+    split_of,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -51,8 +58,7 @@ class FaceDataset:
         if digest in self.seen:
             previous = self.seen[digest]
             if previous["split"] != source.split:
-                msg = f"Image duplicated across train/validation: {image}"
-                raise ValueError(msg)
+                raise ValueError(f"Image duplicated across train/validation: {image}")
             self.stats[f"{source.origin}_exact_duplicates_skipped"] += 1
             return
         name = f"{source.origin}_{image.stem}_{digest[:12]}{image.suffix.lower()}"
@@ -82,33 +88,21 @@ class FaceDataset:
         self.stats[f"{source.origin}_{source.split}_boxes"] += len(lines)
 
     def add_human(self, human: Path, video: Path, hands: list[dict]) -> None:
-        """Preserve the reviewed hand split and reject nonface annotations."""
-        source_annotations = {
-            f"{row['kind']}_{row['corner']}_{round(row['t'])}": row
-            for row in load_labels(video)
-        }
+        """Preserve the reviewed hand split of face-only human labels."""
+        source_annotations = {annotation_key(row): row for row in load_labels(video)}
         for split in ("val", "train"):
             for image in sorted((human / "images" / split).glob("*")):
                 if not image.is_file():
                     continue
-                match = re.fullmatch(
-                    r"(pond|hand|meld)_(TL|TR|BL|BR)_(\d+)", image.stem
-                )
-                if not match:
-                    msg = f"Cannot establish PML hand identity for {image}"
-                    raise ValueError(msg)
-                view, _, _timestamp = match.groups()
                 annotation = source_annotations.get(image.stem)
                 if annotation is None:
-                    msg = f"Human source annotation is missing: {image}"
-                    raise ValueError(msg)
-                # Filenames round seconds and can cross a hand boundary. Use the
-                # original human annotation timestamp, as the original builder did.
-                hand = hand_of(float(annotation["t"]), hands)
-                expected = "val" if hand in HELD_OUT_HANDS else "train"
-                if split != expected:
-                    msg = f"Human image split disagrees with held-out hand: {image}"
-                    raise ValueError(msg)
+                    raise ValueError(f"Human source annotation is missing: {image}")
+                # The file name rounds seconds and can cross a hand boundary.
+                t = float(annotation["t"])
+                if split != split_of(t, hands):
+                    raise ValueError(
+                        f"Human image split disagrees with held-out hand: {image}"
+                    )
                 label = human / "labels" / split / (image.stem + ".txt")
                 lines = [
                     line
@@ -116,8 +110,10 @@ class FaceDataset:
                     if line.strip()
                 ]
                 if any(line.split()[0] != "0" for line in lines):
-                    self.stats["human_nonface_images_excluded"] += 1
-                    continue
+                    raise ValueError(
+                        f"Human detector labels must be face boxes: {label}"
+                    )
+                hand = hand_of(t, hands)
                 self.save(
                     image,
                     lines,
@@ -128,7 +124,7 @@ class FaceDataset:
                         group=f"{video.stem}:hand:{hand}"
                         if hand is not None
                         else f"{video.stem}:outside_hand_windows",
-                        view=view,
+                        view=annotation["kind"],
                         source_row=str(label),
                     ),
                 )
@@ -142,28 +138,26 @@ class FaceDataset:
         )
         for line in draft_lines:
             if summary is None:
-                msg = "Draft images require their completed provenance summary"
-                raise ValueError(msg)
+                raise ValueError(
+                    "Draft images require their completed provenance summary"
+                )
             row = json.loads(line)
             if row.get("status") not in (
                 "unreviewed_predictions",
                 "unreviewed_zero_detections",
             ):
-                msg = "Draft manifest contains an incomplete/error image"
-                raise ValueError(msg)
+                raise ValueError("Draft manifest contains an incomplete/error image")
             image = (drafts / row["image"]).resolve()
             prediction = (drafts / row["predictions"]).resolve()
             if not image.is_relative_to(drafts) or not prediction.is_relative_to(
                 drafts
             ):
-                msg = "Draft path leaves its input directory"
-                raise ValueError(msg)
+                raise ValueError("Draft path leaves its input directory")
             if file_hash(image) != row["sha256"]:
-                msg = f"Draft image changed after prediction: {image}"
-                raise ValueError(msg)
+                raise ValueError(f"Draft image changed after prediction: {image}")
             boxes = json.loads(prediction.read_text(encoding="utf-8"))["boxes"]
-            if not boxes or any(box["class_id"] != 0 for box in boxes):
-                self.stats["pseudo_empty_or_unknown_images_excluded"] += 1
+            if not boxes:  # An empty draft is not a reviewed negative.
+                self.stats["pseudo_empty_images_excluded"] += 1
                 continue
             lines = [
                 "0 " + " ".join(f"{value:.9f}" for value in box["yolo"])
@@ -189,22 +183,16 @@ def build_face_dataset(
     """Copy the verified human split and optional unique drafts into a new dataset.
 
     This uses all retained teacher confidences; it does not claim they are human
-    labels. Any image containing nonface annotations is excluded rather than
-    silently teaching those omitted objects as background. Human empty labels are
-    retained as reviewed negatives; empty pseudo-labels are never negatives.
+    labels. Human empty labels are retained as reviewed negatives; empty
+    pseudo-labels are never negatives.
     """
     human, output = (Path(path).resolve() for path in (human, output))
     drafts = Path(drafts).resolve() if drafts is not None else None
     summary = None
     if drafts is not None:
         summary = json.loads((drafts / "summary.json").read_text(encoding="utf-8"))
-        if not summary.get("complete") or summary.get("class_mode") != "face":
-            msg = "Use a completed face-localization draft export"
-            raise ValueError(msg)
-        names = {int(key): value for key, value in summary["classes"].items()}
-        if names != {0: "face"}:
-            msg = "Expected the face-localization class mapping {0: face}"
-            raise ValueError(msg)
+        if not summary.get("complete"):
+            raise ValueError("Use a completed draft export")
     output.mkdir(parents=True, exist_ok=False)
     for split in ("train", "val"):
         for kind in ("images", "labels"):
@@ -229,20 +217,16 @@ def build_face_dataset(
             "similar train/validation images. No back class is trained."
         ),
     }
-    (output / "manifest.jsonl").write_text(
+    atomic_write_text(
+        output / "manifest.jsonl",
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in dataset.rows),
-        encoding="utf-8",
     )
-    (output / "data.yaml").write_text(
-        (
-            f"path: {output.as_posix()}\ntrain: images/train\nval: images/val\nnc: "
-            "1\nnames:\n  0: face\n"
-        ),
-        encoding="utf-8",
+    atomic_write_text(
+        output / "data.yaml",
+        f"path: {output.as_posix()}\ntrain: images/train\nval: images/val\n"
+        "nc: 1\nnames:\n  0: face\n",
     )
-    (output / "provenance.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8"
-    )
+    atomic_write_json(output / "provenance.json", report, indent=2)
     return report
 
 

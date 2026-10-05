@@ -5,6 +5,7 @@ import { ref } from "vue";
 import { expect, it, vi } from "vitest";
 import CalibrationEditor from "../src/review/CalibrationEditor.vue";
 import { reviewKey } from "../src/review/context";
+import { jobKey } from "../src/shared/useJob";
 import {
   calibrationBody,
   dragRegion,
@@ -37,15 +38,29 @@ const saved: Calibration = {
       ],
     },
   },
-  checks: { "hand:TL": { level: "ok", held: 0, cut: 0 } },
+  checks: { "hand:TL": { level: "ok" } },
   fit: {},
+};
+const jobs = {
+  job: ref(null),
+  revision: ref(null),
+  now: ref(0),
+  refresh: vi.fn(),
+  show: vi.fn(),
+  onFinished: vi.fn(),
 };
 async function editor() {
   const api = vi.fn().mockImplementation(async () => structuredClone(saved));
   const wrapper = mount(CalibrationEditor, {
     global: {
       provide: {
-        [reviewKey]: { api, url: (p: string) => `/api/${p}`, hands: ref([]) },
+        [reviewKey]: {
+          api,
+          url: (p: string) => `/api/${p}`,
+          hands: ref([]),
+          projectId: "id",
+        },
+        [jobKey]: jobs,
       },
     },
   });
@@ -197,4 +212,22 @@ it("uses the current layout overhead before the first fit exists", async () => {
     .findAll<HTMLInputElement>(".calibration-details input")
     .map((input) => input.element.value);
   expect(values).toEqual(["960", "540", "45", "1"]);
+});
+it("reports a finished border check and reloads its geometry", async () => {
+  const finished: ((job: object) => void)[] = [];
+  jobs.onFinished.mockImplementation((callback) => finished.push(callback));
+  const { wrapper, api } = await editor();
+  await button(wrapper, "Check borders").trigger("click");
+  await flushPromises();
+  expect(jobs.show).toHaveBeenCalled();
+  expect(wrapper.text()).toContain("Checking borders…");
+  finished[0]({
+    kind: "check",
+    project: "id",
+    running: false,
+    error: "Adjust the table borders in Calibration: pond:TL cuts tiles.",
+  });
+  await flushPromises();
+  expect(wrapper.text()).toContain("pond:TL cuts tiles");
+  expect(api.mock.calls.at(-1)).toEqual(["calib"]);
 });

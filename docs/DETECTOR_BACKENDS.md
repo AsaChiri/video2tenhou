@@ -18,14 +18,18 @@ requires `backend`, `architecture` (for example `yolo9-s`), a string-keyed
 settings override metadata defaults. Invalid settings, incompatible classes
 and mismatched hashes fail during loading.
 
-All inference uses LibreYOLO's public `predict()` API. CUDA graphs are enabled
-on CUDA through metadata or `cuda_graph=True`. The adapter calls public
-`release_graphs()` before the padded input shape changes, because YOLO9 replaces
-its anchor/stride grids on a shape change. Only the current padded shape retains
-captures; consecutive calls of that shape can replay. Returning to an earlier
-shape requires a new capture and can increase mixed-shape processing time.
-CPU uses eager inference. Validate mixed-shape sequences and performance before
-enabling graphs for a checkpoint.
+Inference takes the direct path in `perception/yolo9_direct.py`: it letterboxes
+uint8 pixels exactly as LibreYOLO's public `predict()` does, uploads bytes and
+maps them through the same float32 division, then calls two private LibreYOLO 1.5
+members, the model's graph dispatch and its postprocessing. Inputs and
+detections are bit-identical to `predict()`; `tests/perception/test_yolo9_direct.py`
+checks the private signatures and compares both paths. CUDA graphs are enabled
+on CUDA through metadata or `cuda_graph=True`. YOLO9 replaces its anchor/stride
+grids when the padded input shape changes, so each padded shape gets its own
+model instance that captures once and then only replays; the first shape uses
+the validated model and later instances load from the verified checkpoint,
+failing if its file changed. CPU uses eager inference, and so does the studio's
+label prefill.
 
 Recognition identities include weights, preprocessing, class mapping, inference
 settings, device and numerical runtime. Set runtime flags before constructing
@@ -56,10 +60,11 @@ Generate face-box drafts with the deployed detector:
 uv run python tools/pseudolabel_images.py --archive path/to/images.zip --weights models/detector/weights.pt --out work/drafts/faces --device cuda:0
 ```
 
-The destination must be new. The exporter preserves image bytes and writes
-predictions, normalized YOLO files under `draft_labels/`, a manifest and a
-completion summary. It records source/model hashes, settings and exact duplicate
-groups. ZIP paths are validated without extracting archive paths.
+The destination must be new. The exporter preserves image bytes under generated
+names and writes predictions, normalized YOLO files under `draft_labels/`, a
+manifest with each image hash and a summary with the archive hash, the
+detector's recognition identity and confidence threshold. Archive paths never
+become output paths. A failed run keeps its partial output marked incomplete.
 
 Drafts require review for missed objects, extra boxes and boundaries. An empty
 draft is not a reviewed negative. The exporter keeps drafts separate from accepted
@@ -90,8 +95,9 @@ uv run --no-project --python $trainingPython python -m video2tenhou.train.train_
 
 Dataset and run destinations must be new. The builder preserves whole-hand
 validation groups and reviewed negatives, rejects exact duplicates across
-splits, and places archive drafts only in training. It excludes drafts with
-unknown classes or no detections. Manifests distinguish human and machine labels
+splits, and places archive drafts only in training. It requires a completed
+draft export, excludes drafts with no detections and rejects human labels other
+than class 0 (face). Manifests distinguish human and machine labels
 and retain group identities and image/label hashes. Split unknown-session
 archives conservatively; exact hashes do not identify near duplicates.
 

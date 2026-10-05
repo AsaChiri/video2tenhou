@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import type { Decode, FactBody } from "../types";
+import type { Decode, FactBody, ReviewItem } from "../types";
 import type { PropType } from "vue";
 import { useReview } from "./context";
 import TileListEditor from "./TileListEditor.vue";
@@ -8,7 +8,7 @@ import TilePalette from "./TilePalette.vue";
 import EvidenceDetails from "./EvidenceDetails.vue";
 import MeldEditor from "./MeldEditor.vue";
 const props = defineProps({
-  item: { type: Object, required: true },
+  item: { type: Object as PropType<ReviewItem>, required: true },
   decode: { type: Object as PropType<Decode>, required: true },
   kind: { type: String, required: true },
   busy: Boolean,

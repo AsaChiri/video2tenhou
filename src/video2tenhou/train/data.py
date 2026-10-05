@@ -1,10 +1,7 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build cached frames and training crops from human box annotations.
-
-Training data from labels/<video>/boxes: cached frames, detector and classifier
-datasets.
+"""Build cached frames and detector/classifier datasets from labels/<video>/boxes.
 
 Split is by hand of the game (HELD_OUT_HANDS are never trained on), never by random
 frame, so the metrics say how the models do on unseen play.
@@ -18,6 +15,7 @@ import argparse
 import json
 import logging
 import random
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,33 +29,31 @@ from video2tenhou.files import atomic_write_json
 from video2tenhou.layout import Calibration, quad_to_box
 from video2tenhou.logging_setup import RESULT, command_logging
 from video2tenhou.paths import DATA_DIR as ROOT
+from video2tenhou.perception.crops import (
+    CROP_H,
+    CROP_W,
+    crop_box,
+    region_upright,
+    to_crop,
+)
+from video2tenhou.perception.tiles import CLASS_INDEX, CLASSES
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable
 
-MIN_ROLL_CORRECTION = 0.5
-MIN_FACE_CROP_SIDE = 8
 MIN_DETECTOR_BOX_SIDE = 4
 
 
 HELD_OUT_HANDS = (4, 9, 16, 20)
-KINDS = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + [
-    f"{n}z" for n in range(1, 8)
-]
-CLASSES = [*KINDS, "0m", "0p", "0s", "X", "none"]  # 39
-CLASS_INDEX = {c: i for i, c in enumerate(CLASSES)}
-CROP_W, CROP_H = 64, 96
-DET_CLASSES = ["face", "back"]
 
 
 LOGGER = logging.getLogger("video2tenhou.train.data")
 
 
 def labels_dir(video_path: str | Path) -> Path:
-    """Return the annotation directory for a unique video stem.
+    """Return the annotation directory keyed by video stem.
 
-    Local annotation directory keyed by video stem; do not reuse a stem for different
-    recordings.
+    Do not reuse a stem for different recordings.
     """
     return ROOT / "labels" / Path(video_path).stem
 
@@ -86,9 +82,40 @@ def hand_of(t: float, hands: list[dict]) -> int | None:
     )
 
 
+def held_out(hand: int | None) -> bool:
+    """Report whether a physical hand belongs to validation, never to training."""
+    return hand in HELD_OUT_HANDS
+
+
 def split_of(t: float, hands: list[dict]) -> str:
     """Split frames by whole hand to prevent training/validation leakage."""
-    return "val" if hand_of(t, hands) in HELD_OUT_HANDS else "train"
+    return "val" if held_out(hand_of(t, hands)) else "train"
+
+
+def annotation_key(annotation: dict) -> str:
+    """Name a region annotation as dataset files do; the time is rounded.
+
+    Rounding can move a time across a hand boundary, so splits always use the
+    annotation's exact ``t``, never this name.
+    """
+    return f"{annotation['kind']}_{annotation['corner']}_{round(annotation['t'])}"
+
+
+def annotation_key_of(path: str | Path) -> str:
+    """Recover the annotation key that prefixes a dataset file name."""
+    name = re.split(r"[\\/]", str(path))[-1]  # Manifests come from either OS.
+    match = re.match(r"(hand|pond|meld)_(TL|TR|BL|BR)_\d+", name)
+    if not match:
+        raise ValueError(f"Cannot locate original human annotation for {path}")
+    return match.group()
+
+
+def clipped_box(
+    transform: np.ndarray, quad: list, width: int, height: int
+) -> tuple[float, float, float, float]:
+    """Map a reviewed frame quad into region pixels, clipped to the region."""
+    x0, y0, x1, y1 = quad_to_box(transform, quad)
+    return max(0.0, x0), max(0.0, y0), min(float(width), x1), min(float(height), y1)
 
 
 # ---------------------------------------------------------------------------
@@ -117,61 +144,6 @@ def ensure_frames(
         if (i + 1) % 25 == 0:
             log(f"  frames: {i + 1}/{len(todo)}")
     return out
-
-
-# ---------------------------------------------------------------------------
-# region rendering with roll
-# ---------------------------------------------------------------------------
-
-
-def region_upright(
-    frame: np.ndarray, cal: Calibration, kind: str, corner: str
-) -> tuple[np.ndarray, np.ndarray]:
-    """Region image turned so tiles stand upright, and the frame->image matrix.
-
-    Ponds and melds are upright already; hand bands are rotated by -roll about
-    their centre (the canvas grows so nothing is cut off).
-    """
-    img, transform = cal.region(frame, f"{kind}:{corner}")
-    roll = cal.roll(corner) if kind == "hand" else 0.0
-    if abs(roll) < MIN_ROLL_CORRECTION:
-        return img, transform
-    h, w = img.shape[:2]
-    rotation = cv2.getRotationMatrix2D(
-        (w / 2, h / 2), roll, 1.0
-    )  # positive angle = counter-clockwise: undoes a descending row
-    cos, sin = abs(rotation[0, 0]), abs(rotation[0, 1])
-    nw, nh = int(w * cos + h * sin), int(w * sin + h * cos)
-    rotation[0, 2] += nw / 2 - w / 2
-    rotation[1, 2] += nh / 2 - h / 2
-    out = cv2.warpAffine(img, rotation, (nw, nh), flags=cv2.INTER_CUBIC)
-    return out, np.vstack([rotation, [0, 0, 1]]) @ transform
-
-
-def crop_box(
-    img: np.ndarray, box: Sequence[float], margin: float = 0.08
-) -> np.ndarray | None:
-    """Crop an expanded box, or return None for an empty intersection.
-
-    Crop an expanded detection box, clipped to the image; return None when it has no
-    area.
-    """
-    x0, y0, x1, y1 = box
-    mx, my = (x1 - x0) * margin, (y1 - y0) * margin
-    x0, y0 = int(max(0, x0 - mx)), int(max(0, y0 - my))
-    x1, y1 = int(min(img.shape[1], x1 + mx)), int(min(img.shape[0], y1 + my))
-    if x1 - x0 < MIN_FACE_CROP_SIDE or y1 - y0 < MIN_FACE_CROP_SIDE:
-        return None
-    return img[y0:y1, x0:x1]
-
-
-def to_crop(img: np.ndarray) -> np.ndarray:
-    """Resize a BGR face crop without changing channel order."""
-    return cv2.resize(
-        img,
-        (CROP_W, CROP_H),
-        interpolation=cv2.INTER_AREA if img.shape[0] > CROP_H else cv2.INTER_CUBIC,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -223,28 +195,38 @@ class TrainingWriter:
                 self.stats[f"clf_{source.split}_none"] += 1
 
     def labelled(self, img: np.ndarray, boxes: list[tuple], source: CropSource) -> None:
-        """Write every valid box and derive its classifier examples."""
+        """Write face boxes for the detector and every tile for the classifier.
+
+        The detector localizes faces only. A region with reviewed face-down
+        tiles is left out of its dataset rather than teaching them as background.
+        """
+        if any(b["tile"] == "X" for _, b in boxes):
+            self.stats[f"det_{source.split}_back_images_excluded"] += 1
+        else:
+            self._detector(img, boxes, source)
+        self._classifier(img, boxes, source)
+        self._background(img, boxes, source)
+
+    def _detector(
+        self, img: np.ndarray, boxes: list[tuple], source: CropSource
+    ) -> None:
+        """Write the region image with one class-0 YOLO line per face box."""
         h, w = img.shape[:2]
-        # detector: every box, class face (back when the tile is X)
         cv2.imwrite(
             str(self.det / "images" / source.split / f"{source.name}.jpg"),
             img,
             [cv2.IMWRITE_JPEG_QUALITY, 95],
         )
-        lines = []
-        for (x0, y0, x1, y1), b in boxes:
-            cls = 1 if b["tile"] == "X" else 0
-            lines.append(
-                f"{cls} {(x0 + x1) / 2 / w:.5f} {(y0 + y1) / 2 / h:.5f} "
-                f"{(x1 - x0) / w:.5f} {(y1 - y0) / h:.5f}"
-            )
+        lines = [
+            f"0 {(x0 + x1) / 2 / w:.5f} {(y0 + y1) / 2 / h:.5f} "
+            f"{(x1 - x0) / w:.5f} {(y1 - y0) / h:.5f}"
+            for (x0, y0, x1, y1), _ in boxes
+        ]
         (self.det / "labels" / source.split / f"{source.name}.txt").write_text(
             "\n".join(lines) + ("\n" if lines else "")
         )
         self.stats[f"det_{source.split}_images"] += 1
         self.stats[f"det_{source.split}_boxes"] += len(lines)
-        self._classifier(img, boxes, source)
-        self._background(img, boxes, source)
 
     def _classifier(
         self, img: np.ndarray, boxes: list[tuple], source: CropSource
@@ -313,13 +295,7 @@ def _training_boxes(d: dict, img: np.ndarray, transform: np.ndarray) -> list[tup
     h, w = img.shape[:2]
     boxes = []
     for b in d["boxes"]:
-        x0, y0, x1, y1 = quad_to_box(transform, b["quad"])
-        x0, y0, x1, y1 = (
-            max(0.0, x0),
-            max(0.0, y0),
-            min(float(w), x1),
-            min(float(h), y1),
-        )
+        x0, y0, x1, y1 = clipped_box(transform, b["quad"], w, h)
         if x1 - x0 < MIN_DETECTOR_BOX_SIDE or y1 - y0 < MIN_DETECTOR_BOX_SIDE:
             continue
         boxes.append(((x0, y0, x1, y1), b))
@@ -334,11 +310,7 @@ def build(
     *,
     seed: int = 0,
 ) -> dict:
-    """Build detector and classifier datasets from human annotations.
-
-    Write detector and classifier datasets from human labels, using a hand-level
-    validation split.
-    """
+    """Write detector and classifier datasets from human labels, split by hand."""
     random.seed(seed)
     labels = load_labels(video_path)
     hands = hand_table(video_path, work)
@@ -357,22 +329,17 @@ def build(
             continue
         frame = cv2.imread(str(frames[t]))
         if frame is None:
-            msg = f"Cannot read cached training frame: {frames[t]}"
-            raise OSError(msg)
+            raise OSError(f"Cannot read cached training frame: {frames[t]}")
         img, transform = region_upright(frame, cal, kind, corner)
-        source = CropSource(split_of(t, hands), f"{kind}_{corner}_{round(t)}", kind)
+        source = CropSource(split_of(t, hands), annotation_key(d), kind)
         if d["boxes"]:
             writer.labelled(img, _training_boxes(d, img, transform), source)
         else:
             writer.negative(img, source)
     stats = writer.stats
-    nl = "\n"
     (det / "data.yaml").write_text(
-        (
-            f"path: {det.resolve().as_posix()}{nl}train: images/train{nl}val: "
-            f"images/val{nl}names:{nl}"
-        )
-        + "".join(f"  {i}: {c}{nl}" for i, c in enumerate(DET_CLASSES))
+        f"path: {det.resolve().as_posix()}\ntrain: images/train\nval: images/val\n"
+        "nc: 1\nnames:\n  0: face\n"
     )
     atomic_write_json(
         out / "meta.json",

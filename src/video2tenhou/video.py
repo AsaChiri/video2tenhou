@@ -1,10 +1,7 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Download recordings, sample video sequentially and seek individual frames.
-
-Frame access: sequential sampling through an ffmpeg pipe, seeking for single frames,
-download.
+"""Download recordings, sample video through an ffmpeg pipe and seek single frames.
 
 Stages that read a whole video use `sample`, one sequential decode with no seeking; the
 tool and evidence crops use `frame_at`. Every frame is returned as a 1080p BGR array,
@@ -19,14 +16,16 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING
+from queue import Empty, Queue
+from threading import Event
+from typing import IO, TYPE_CHECKING, cast
 
-import cv2
 import numpy as np
-from yt_dlp.utils import parse_duration
 
 from video2tenhou.commands import executable
 
@@ -34,6 +33,9 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
 FRAME_W, FRAME_H = 1920, 1080
+# Decoded frames buffered ahead of the consumer: pipes are small on Windows, so
+# without a reader ffmpeg waits while each frame is processed.
+READ_AHEAD = 16
 
 
 @dataclass(frozen=True)
@@ -91,11 +93,14 @@ def sample(
     (start + k / fps), not the decoded frame's presentation timestamp. FFmpeg
     quantizes the requested duration; filtering these labels from a longer
     sample does not necessarily reproduce a separately decoded shorter window.
+    A reader thread keeps up to ``READ_AHEAD`` frames decoded ahead. Closing the
+    generator stops ffmpeg and joins the reader; decoder failures raise.
     """
     w, h = size
     if fps <= 0 or w <= 0 or h <= 0 or start < 0:
-        msg = "fps and dimensions must be positive; start must be nonnegative"
-        raise ValueError(msg)
+        raise ValueError(
+            "fps and dimensions must be positive; start must be nonnegative"
+        )
     if end is not None and end <= start:
         return
     cmd = [executable("ffmpeg"), "-v", "error", "-nostdin"]
@@ -118,30 +123,45 @@ def sample(
         subprocess.Popen(  # noqa: S603
             cmd, stdout=subprocess.PIPE, stderr=errors, bufsize=w * h * 3 * 4
         ) as proc,
+        ThreadPoolExecutor(1, thread_name_prefix="video-read-ahead") as pool,
     ):
-        if proc.stdout is None:
-            proc.terminate()
-            msg = "Video decoder did not provide its requested frame pipe"
-            raise RuntimeError(msg)
-        n = w * h * 3
-        k = 0
+        stdout = cast("IO[bytes]", proc.stdout)
+        frames: Queue[bytes | None] = Queue(READ_AHEAD)
+        stop = Event()
+        reader = pool.submit(_read_frames, stdout, w * h * 3, frames, stop)
         try:
-            while True:
-                buf = proc.stdout.read(n)
-                if len(buf) < n:
-                    break
+            k = 0
+            while (buf := frames.get()) is not None:
                 yield start + k / fps, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
                 k += 1
+            reader.result()
             returncode = proc.wait()
             if returncode:
                 errors.seek(0)
                 detail = errors.read().decode("utf-8", errors="replace").strip()
-                msg = f"ffmpeg could not sample {path}: {detail}"
-                raise RuntimeError(msg)
+                raise RuntimeError(f"ffmpeg could not sample {path}: {detail}")
         finally:
-            proc.stdout.close()
+            stop.set()
             if proc.poll() is None:
                 proc.terminate()
+            while not reader.done():  # a full queue may block the reader's put
+                with suppress(Empty):
+                    frames.get(timeout=0.1)
+            stdout.close()
+
+
+def _read_frames(
+    stdout: IO[bytes], size: int, frames: Queue[bytes | None], stop: Event
+) -> None:
+    """Queue complete raw frames until end of stream or ``stop``, then ``None``."""
+    try:
+        while not stop.is_set():
+            buf = stdout.read(size)
+            if len(buf) < size:
+                return
+            frames.put(buf)
+    finally:
+        frames.put(None)
 
 
 def frame_at(
@@ -173,28 +193,16 @@ def frame_at(
         check=True,
     ).stdout
     if len(out) < w * h * 3:
-        msg = f"no frame at t={t} in {path}"
-        raise ValueError(msg)
+        raise ValueError(f"no frame at t={t} in {path}")
     return np.frombuffer(out[: w * h * 3], np.uint8).reshape(h, w, 3).copy()
-
-
-def normalize(
-    frame: np.ndarray, size: tuple[int, int] = (FRAME_W, FRAME_H)
-) -> np.ndarray:
-    """Scale an arbitrary frame to the calibration size."""
-    if frame.shape[1] == size[0] and frame.shape[0] == size[1]:
-        return frame
-    return cv2.resize(
-        frame,
-        size,
-        interpolation=cv2.INTER_AREA if frame.shape[1] > size[0] else cv2.INTER_CUBIC,
-    )
 
 
 def time_range(
     start: str | float | None = None, end: str | float | None = None
 ) -> tuple[float, float | None]:
     """Normalize optional seconds or MM:SS/HH:MM:SS bounds with yt-dlp's parser."""
+    from yt_dlp.utils import parse_duration  # noqa: PLC0415  a 0.3 s import
+
     values = []
     for label, supplied, default in (("Start", start, 0.0), ("End", end, None)):
         value = supplied
@@ -220,16 +228,14 @@ def time_range(
         except (ValueError, OverflowError):
             valid = False
         if not valid or not isinstance(value, (int, float)):
-            msg = (
+            raise ValueError(
                 f"{label} time must be nonnegative seconds, MM:SS, or HH:MM:SS "
                 "(fractional seconds are allowed)."
             )
-            raise ValueError(msg)
         values.append(float(value))
     start, end = values[0] or 0.0, values[1]
     if end is not None and end <= start:
-        msg = "End time must be later than start time."
-        raise ValueError(msg)
+        raise ValueError("End time must be later than start time.")
     return start, end
 
 
@@ -252,18 +258,17 @@ def trim(
     start, end = time_range(start, end)
     source, out = Path(source).resolve(), Path(out)
     if source == out.resolve() or (out.exists() and source.samefile(out)):
-        msg = "The trimmed recording must use a different file from the original."
-        raise ValueError(msg)
+        raise ValueError(
+            "The trimmed recording must use a different file from the original."
+        )
     info = probe(source)
     if not math.isfinite(info.duration) or info.duration <= 0:
-        msg = "The recording has no valid duration."
-        raise ValueError(msg)
+        raise ValueError("The recording has no valid duration.")
     if start >= info.duration or (end is not None and end > info.duration):
-        msg = (
+        raise ValueError(
             f"Start and end times must be within the recording's {info.duration:g} "
             "seconds."
         )
-        raise ValueError(msg)
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".trim-") as directory:
         pending = Path(directory) / "clip.mp4"
@@ -302,8 +307,7 @@ def trim(
         ]
         subprocess.run(cmd, check=True)  # noqa: S603
         if probe(pending).duration <= 0:
-            msg = "The selected time range contains no video frames."
-            raise ValueError(msg)
+            raise ValueError("The selected time range contains no video frames.")
         pending.replace(out)
     return out
 
@@ -343,7 +347,6 @@ def download(
         cmd += ["--", url]
         subprocess.run(cmd, check=True)  # noqa: S603
         if not pending.is_file() or not pending.stat().st_size:
-            msg = "The download did not produce a complete video."
-            raise ValueError(msg)
+            raise ValueError("The download did not produce a complete video.")
         pending.replace(out)
     return out

@@ -1,8 +1,9 @@
-import { defineComponent } from "vue";
+import { defineComponent, ref } from "vue";
 import { mount, flushPromises } from "@vue/test-utils";
 import { expect, it, vi } from "vitest";
 import { api } from "../src/shared/api";
-import type { Fact, ReviewItem } from "../src/types";
+import type { Fact, ReviewItem, WorkspaceJob } from "../src/types";
+import { useJobStatus } from "../src/shared/useJob";
 import { useReviewState } from "../src/review/useReviewState";
 vi.mock("../src/shared/api", () => ({ api: vi.fn() }));
 function setup() {
@@ -10,7 +11,7 @@ function setup() {
   const wrapper = mount(
     defineComponent({
       setup() {
-        state = useReviewState("/review/id");
+        state = useReviewState("id", useJobStatus(ref("id")));
         return () => null;
       },
     }),
@@ -18,306 +19,276 @@ function setup() {
   if (!state) throw new Error("Review state was not initialized.");
   return { state, wrapper };
 }
+/**
+ * A server whose rebuild jobs finish at the next status poll. Answers make
+ * their hand pending until a successful update; dismissals never do.
+ */
 function mockServer() {
-  let pending: number[] = [],
-    running = false,
-    fail = false;
-  const saved: Fact[] = [];
-  let selected: number[] = [];
-  let items: ReviewItem[] = [];
+  const pending = new Set<number>(),
+    saved: Fact[] = [];
+  let items: ReviewItem[] = [],
+    job: WorkspaceJob | null = null,
+    shown = false,
+    fail = false,
+    revision = 0,
+    clock = 0;
+  const status = () => ({ job, revision: String(revision) });
   vi.mocked(api).mockImplementation(async (path, body) => {
+    if (path.startsWith("/api/job")) {
+      if (job?.running && !shown) shown = true;
+      else if (job?.running) {
+        job = { ...job, running: false, finished: ++clock };
+        if (fail) job.error = "Hand 1 has no tile readings. Analyze recording.";
+        else for (const hand of job.hands || []) pending.delete(hand);
+        revision++;
+      }
+      return status();
+    }
     path = path.replace("/review/id/api/", "");
     if (path === "hands")
-      return [
-        { hand: 0, decoded_at: 0 },
-        { hand: 1, decoded_at: 0 },
-      ];
+      return [0, 1, 2].map((hand) => ({ hand, pending: pending.has(hand) }));
     if (path === "items") return items;
-    if (path.startsWith("hand/")) return { decode: { confidence: [] } };
-    if (path === "revision") return ["new"];
     if (path === "facts") {
-      if (body) {
-        const row = { ...(body as Fact), ts: 10 };
-        saved.push(row);
-        pending = [...new Set([...pending, row.hand])];
-        return row;
-      }
-      return saved;
+      if (!body) return saved;
+      const row = { ...(body as Fact), ts: ++clock };
+      saved.push(row);
+      if (row.kind !== "dismiss") pending.add(row.hand);
+      revision++;
+      return row;
     }
-    if (path === "decode_pending") {
-      if (body) {
-        running = true;
-        selected = [...pending];
-        return {
+    if (path === "rebuild") {
+      shown = true;
+      if (pending.size)
+        job = {
+          kind: "rebuild",
+          project: "id",
+          stage: "Updating hands",
+          hands: [...pending].sort(),
           running: true,
-          pending,
-          hands: selected,
-          hands_total: selected.length,
+          started: ++clock,
+          finished: null,
+          error: null,
+          log_lines: 0,
         };
-      }
-      if (running) {
-        running = false;
-        if (!fail) pending = pending.filter((hand) => !selected.includes(hand));
-      }
-      return {
-        running: false,
-        pending,
-        error: fail ? "Rebuild failed; Analyze recording" : null,
-      };
+      return status();
     }
     throw Error(path);
   });
+  const posts = () =>
+    vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("/rebuild"));
   return {
-    addPending: (hand: number) => pending.push(hand),
+    addPending: (hand: number) => pending.add(hand),
     fail: (value = true) => (fail = value),
     items: (value: ReviewItem[]) => (items = value),
+    touch: () => revision++,
+    running: (hands: number[]) =>
+      (job = {
+        kind: "rebuild",
+        project: "id",
+        stage: "Updating hands",
+        hands,
+        running: true,
+        started: ++clock,
+        finished: null,
+        error: null,
+        log_lines: 0,
+      }),
+    posts,
   };
 }
-it("rebuilds server pending deletions together with new answers and retains failed work", async () => {
+const draw = (hand: number, j: number, margin = 0): ReviewItem => ({
+  id: `draw:E:${j}`,
+  hand,
+  kind: "draw",
+  seat: "E",
+  j,
+  margin,
+});
+it("updates server pending deletions together with new answers and keeps failed work", async () => {
   vi.useFakeTimers();
   const server = mockServer();
   const { state } = setup();
-  await state.load();
+  await state.refresh();
   await state.save({ hand: 0, kind: "draw", tile: "2p" });
   server.addPending(1);
-  await state.load();
+  await state.refresh();
   expect(state.pending.value).toEqual([0, 1]);
   await state.rebuild();
-  expect(state.job.value.running).toBe(true);
-  await vi.advanceTimersByTimeAsync(2000);
+  expect(state.updating.value).toBe(true);
+  expect(state.job.value?.hands).toEqual([0, 1]);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(state.updating.value).toBe(false);
   expect(state.pending.value).toEqual([]);
   await state.save({ hand: 0, kind: "discard", tile: "1m" });
   server.fail();
   await state.rebuild();
-  await vi.advanceTimersByTimeAsync(2000);
+  await vi.advanceTimersByTimeAsync(1000);
   expect(state.pending.value).toEqual([0]);
   expect(state.error.value).toContain("Analyze recording");
 });
 it("holds refreshes during playback or unsaved edits and releases timers on unmount", async () => {
   vi.useFakeTimers();
-  mockServer();
+  const server = mockServer();
   const { state, wrapper } = setup();
-  await state.load();
-  state.revision.value = '["old"]';
+  await vi.advanceTimersByTimeAsync(0);
+  await state.refresh();
+  const loads = state.loads.value;
   state.players.value = 1;
-  await state.poll();
+  server.touch();
+  await vi.advanceTimersByTimeAsync(5000);
   expect(state.updates.value).toBe(true);
-  expect(state.revision.value).toBe('["old"]');
+  expect(state.loads.value).toBe(loads);
   state.players.value = 0;
+  state.updates.value = false;
   state.dirty.value = true;
-  await state.poll();
-  expect(state.revision.value).toBe('["old"]');
-  const calls = vi.mocked(api).mock.calls.length;
-  await state.rebuild();
-  expect(api).toHaveBeenCalledTimes(calls);
+  server.touch();
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(state.loads.value).toBe(loads);
+  await state.rebuild("all");
+  expect(state.message.value).toContain("Save the current answer");
+  expect(server.posts()).toHaveLength(0);
   state.dirty.value = false;
-  await state.poll();
-  expect(state.revision.value).toBe('["new"]');
-  await state.rebuild();
+  server.touch();
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(state.loads.value).toBe(loads + 1);
   wrapper.unmount();
   const count = vi.mocked(api).mock.calls.length;
   await vi.advanceTimersByTimeAsync(10000);
   expect(api).toHaveBeenCalledTimes(count);
 });
-it("reconnects to a running job without posting another one", async () => {
+it("follows a running update without starting another one", async () => {
   vi.useFakeTimers();
-  mockServer();
+  const server = mockServer();
+  server.running([1]);
   const { state } = setup();
-  await state.rebuild("decode_pending", true);
-  await flushPromises();
-  expect(
-    vi
-      .mocked(api)
-      .mock.calls.filter(
-        ([path, body]) => path.endsWith("decode_pending") && body,
-      ),
-  ).toEqual([]);
-});
-it("keeps checking a running job discovered by a refresh until it finishes", async () => {
-  vi.useFakeTimers();
-  let running = true;
-  vi.mocked(api).mockImplementation(async (path) => {
-    if (path.endsWith("decode_pending"))
-      return { running, pending: running ? [0] : [] };
-    if (path.endsWith("revision")) return [1];
-    return [];
-  });
-  const { state } = setup();
+  state.guided.value = true;
+  await vi.advanceTimersByTimeAsync(0);
   await state.refresh();
   expect(state.updating.value).toBe(true);
-  await vi.advanceTimersByTimeAsync(2000);
-  expect(state.updating.value).toBe(true);
-  running = false;
-  await vi.advanceTimersByTimeAsync(2000);
+  expect(state.pending.value).toEqual([1]);
+  state.maybeStart();
+  await vi.advanceTimersByTimeAsync(1000);
   expect(state.updating.value).toBe(false);
-  expect(
-    vi.mocked(api).mock.calls.every(([, body]) => body === undefined),
-  ).toBe(true);
+  expect(server.posts()).toEqual([]);
 });
-it("lets another hand be answered while updating and batches its queued answer without repeating related questions", async () => {
+it("lets another hand be answered while updating and keeps an unrelated draft", async () => {
   vi.useFakeTimers();
   const server = mockServer();
   server.items([
-    { hand: 0, idx: 0, kind: "draw", seat: "N", j: 0, margin: 1 },
+    draw(0, 0, 1),
     {
+      id: "uncertain_tiles::",
       hand: 1,
-      idx: 0,
       kind: "uncertain_tiles",
       choices: [
-        { field: "draw", seat: "E", j: 0, margin: 0 },
-        { field: "draw", seat: "E", j: 1, margin: 0.1 },
+        { id: "draw:E:0", field: "draw", seat: "E", j: 0, margin: 0 },
+        { id: "draw:E:1", field: "draw", seat: "E", j: 1, margin: 0.1 },
       ],
     },
-    { hand: 0, idx: 1, kind: "draw", seat: "N", j: 1, margin: 0.5 },
+    draw(0, 1, 0.5),
   ]);
   const { state } = setup();
   state.guided.value = true;
+  await vi.advanceTimersByTimeAsync(0);
   await state.refresh();
-  expect(state.selection.value?.item.hand).toBe(1);
-  expect(state.selection.value?.decision.j).toBe(0);
+  expect(state.selection.value?.key).toBe("1:draw:E:0");
   await state.save({ hand: 1, kind: "draw", seat: "E", j: 0, tile: "2p" });
   await flushPromises();
   expect(state.updating.value).toBe(true);
-  expect(state.selection.value?.item.hand).toBe(0);
-  expect(state.selection.value?.decision.j).toBe(1);
-  // A draft and its video must survive the unrelated hand's background update.
+  // Both questions of the updating hand wait; another hand is offered.
+  expect(state.selection.value?.key).toBe("0:draw:E:1");
   const current = state.selection.value;
   state.dirty.value = true;
   state.players.value = 1;
-  const count = vi.mocked(api).mock.calls.length;
-  await state.poll();
-  expect(api).toHaveBeenCalledTimes(count);
-  expect(state.selection.value).toBe(current);
-  // Reconstruction settles both draws in hand 1 from the one supplied answer.
-  server.items([
-    { hand: 0, idx: 0, kind: "draw", seat: "N", j: 0, margin: 1 },
-    { hand: 0, idx: 1, kind: "draw", seat: "N", j: 1, margin: 0.5 },
-  ]);
-  await vi.advanceTimersByTimeAsync(2000);
+  // The update settles both draws of hand 1 from the one answer.
+  server.items([draw(0, 0, 1), draw(0, 1, 0.5)]);
+  await vi.advanceTimersByTimeAsync(1000);
   expect(state.updating.value).toBe(false);
   expect(state.pending.value).toEqual([]);
   expect(state.decisions.value).toHaveLength(2);
-  expect(state.selection.value?.decision.j).toBe(1);
   expect(state.selection.value).toBe(current);
   expect(state.dirty.value).toBe(true);
-  expect(
-    vi
-      .mocked(api)
-      .mock.calls.filter(
-        ([path, body]) => path.endsWith("decode_pending") && body,
-      ),
-  ).toHaveLength(1);
+  expect(server.posts()).toHaveLength(1);
 });
-it("queues answers from different hands in one follow-up batch while a job runs", async () => {
+it("batches answers from different hands saved while an update runs", async () => {
   vi.useFakeTimers();
   const server = mockServer();
+  server.items([0, 1, 2].map((hand) => draw(hand, 0, hand)));
   const { state } = setup();
   state.guided.value = true;
-  server.items(
-    [0, 1, 2].map((hand) => ({
-      hand,
-      idx: 0,
-      kind: "draw",
-      seat: "E",
-      j: 0,
-      margin: hand,
-    })),
-  );
+  await vi.advanceTimersByTimeAsync(0);
   await state.refresh();
   await state.save({ hand: 0, kind: "draw", seat: "E", j: 0, tile: "2p" });
   await flushPromises();
   await state.save({ hand: 1, kind: "draw", seat: "E", j: 0, tile: "3p" });
   await state.save({ hand: 2, kind: "draw", seat: "E", j: 0, tile: "4p" });
   await flushPromises();
-  const posts = () =>
-    vi
-      .mocked(api)
-      .mock.calls.filter(
-        ([path, body]) => path.endsWith("decode_pending") && body,
-      );
-  expect(posts()).toHaveLength(1);
+  expect(server.posts()).toHaveLength(1);
   expect(state.selection.value).toBeNull();
-  await vi.advanceTimersByTimeAsync(2000);
-  expect(posts()).toHaveLength(2);
-  expect(state.job.value.hands).toEqual([1, 2]);
-  await vi.advanceTimersByTimeAsync(2000);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(server.posts()).toHaveLength(2);
+  expect(state.job.value?.hands).toEqual([1, 2]);
+  await vi.advanceTimersByTimeAsync(1000);
   expect(state.pending.value).toEqual([]);
-  expect(posts()).toHaveLength(2);
+  expect(server.posts()).toHaveLength(2);
+});
+it("dismisses a question without updating its hand", async () => {
+  vi.useFakeTimers();
+  const server = mockServer();
+  const conflict: ReviewItem = {
+    id: "conflict::120",
+    hand: 2,
+    kind: "conflict",
+    t: 120,
+  };
+  server.items([conflict, draw(0, 0, 1)]);
+  const { state } = setup();
+  state.guided.value = true;
+  await vi.advanceTimersByTimeAsync(0);
+  await state.refresh();
+  expect(state.selection.value?.key).toBe("2:conflict::120");
+  await state.dismiss(conflict);
+  await flushPromises();
+  expect(api).toHaveBeenCalledWith("/review/id/api/facts", {
+    kind: "dismiss",
+    hand: 2,
+    item: "conflict::120",
+  });
+  expect(state.pending.value).toEqual([]);
+  expect(state.selection.value?.key).toBe("0:draw:E:0");
+  expect(server.posts()).toHaveLength(0);
 });
 it("keeps skipped questions unresolved across refreshes and returns to them explicitly", async () => {
   const server = mockServer();
-  const item = { hand: 1, idx: 0, kind: "draw", seat: "E", j: 0, margin: 0 };
-  server.items([item]);
+  server.items([draw(1, 0)]);
   const { state } = setup();
   await state.refresh();
   state.next();
   expect(state.selection.value).toBeNull();
   expect(state.decisions.value).toHaveLength(1);
-  server.items([{ ...item, idx: 9 }]);
   await state.refresh();
   expect(state.questions.value).toHaveLength(0);
   expect(state.selection.value).toBeNull();
   state.revisit();
-  expect(state.selection.value?.decision.j).toBe(0);
-});
-it("offers timed-out confidence checks and incomplete processing directly in main review", async () => {
-  const server = mockServer();
-  server.items([
-    {
-      hand: 0,
-      idx: 0,
-      kind: "uncertain_tiles",
-      choices: [
-        {
-          field: "draw",
-          seat: "E",
-          j: 0,
-          margin: 0,
-          alternative_gap: 80,
-          runner_up: "2p",
-        },
-        {
-          field: "draw",
-          seat: "E",
-          j: 1,
-          margin: 0,
-          alternative_gap: 0,
-          runner_up: null,
-        },
-      ],
-    },
-    { hand: 1, idx: 0, kind: "solver_incomplete" },
-  ]);
-  const { state, wrapper } = setup();
-  await state.refresh();
-  expect(state.questions.value).toHaveLength(2);
-  expect(state.selection.value?.decision.j).toBe(0);
-  state.next();
-  expect(state.selection.value?.decision.j).toBe(1);
-  state.next();
-  expect(
-    state.questions.value.some(
-      (row) => row.decision.kind === "solver_incomplete",
-    ),
-  ).toBe(false);
-  expect(api).not.toHaveBeenCalledWith(expect.stringContaining("/hand/"));
-  wrapper.unmount();
+  expect(state.selection.value?.choice).toBeNull();
+  expect(state.selection.value?.item.j).toBe(0);
 });
 it("retains saved answers on an automatic update failure and clears the error on retry", async () => {
   vi.useFakeTimers();
   const server = mockServer();
   const { state } = setup();
   state.guided.value = true;
+  await vi.advanceTimersByTimeAsync(0);
   server.fail();
   await state.save({ hand: 0, kind: "draw", seat: "E", j: 0, tile: "2p" });
-  await vi.advanceTimersByTimeAsync(2000);
+  await vi.advanceTimersByTimeAsync(1000);
   expect(state.updating.value).toBe(false);
   expect(state.pending.value).toEqual([0]);
-  expect(state.error.value).toContain("Rebuild failed");
+  expect(state.error.value).toContain("no tile readings");
   expect(state.facts.value[0]).toHaveLength(1);
   server.fail(false);
   await state.rebuild();
-  await vi.advanceTimersByTimeAsync(2000);
   expect(state.error.value).toBe("");
+  await vi.advanceTimersByTimeAsync(1000);
   expect(state.pending.value).toEqual([]);
 });

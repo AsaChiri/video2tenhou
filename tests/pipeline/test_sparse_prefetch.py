@@ -3,9 +3,12 @@
 
 """Sparse overlap preserves planned evidence and joins decoding on failure."""
 
+from __future__ import annotations
+
 import json
 import threading
-from typing import TYPE_CHECKING
+from collections.abc import Iterator
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,20 +18,12 @@ from video2tenhou import read
 from video2tenhou.calm import Interval
 from video2tenhou.layout import Calibration
 from video2tenhou.perception.reader import Reading
-from video2tenhou.train.data import CLASSES
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from video2tenhou.perception.tiles import CLASSES
 
 
 def test_sparse_plan_holes_keep_window_order_batches_and_caller_inference(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify sparse plan holes keep window order batches and caller inference."""
     monkeypatch.setattr(
         read, "source_identity", lambda *_unused_a, **_unused_kw: "source"
     )
@@ -44,8 +39,8 @@ def test_sparse_plan_holes_keep_window_order_batches_and_caller_inference(
     ]
 
     def sample(
-        path: "str | Path", **kwargs: "object"
-    ) -> "Iterator[tuple[float, np.ndarray]]":
+        path: str | Path, **kwargs: object
+    ) -> Iterator[tuple[float, np.ndarray]]:
         windows.append(kwargs)
         try:
             for index in range(7):
@@ -56,7 +51,7 @@ def test_sparse_plan_holes_keep_window_order_batches_and_caller_inference(
         finally:
             closed.append(True)
 
-    def infer(items: "read.CropBatch", *_: object) -> list:
+    def infer(items: read.CropBatch, *_: object) -> list:
         assert threading.get_ident() == caller
         if not first_inference.is_set():
             first_inference.set()
@@ -100,9 +95,8 @@ def test_sparse_plan_holes_keep_window_order_batches_and_caller_inference(
 
 @pytest.mark.parametrize("failure", ["crop", "inference", "sampler"])
 def test_sparse_failure_joins_producer_and_preserves_previous_publication(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", failure: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Verify sparse failure joins producer and preserves previous publication."""
     monkeypatch.setattr(
         read, "source_identity", lambda *_unused_a, **_unused_kw: "source"
     )
@@ -116,27 +110,24 @@ def test_sparse_failure_joins_producer_and_preserves_previous_publication(
 
     def sample(
         *_unused_args: object, **_unused_kwargs: object
-    ) -> "Iterator[tuple[float, np.ndarray]]":
+    ) -> Iterator[tuple[float, np.ndarray]]:
         try:
             for i in range(20):
                 if failure == "sampler" and i == 2:
-                    msg = "sampler failed"
-                    raise RuntimeError(msg)
+                    raise RuntimeError("sampler failed")
                 produced.append(i)
                 yield i / 2, np.zeros((8, 8, 3), dtype=np.uint8)
         finally:
             closed.set()
 
-    def crop(image: "np.ndarray", *_: object) -> tuple:
+    def crop(image: np.ndarray, *_: object) -> tuple:
         if failure == "crop":
-            msg = "crop failed"
-            raise RuntimeError(msg)
+            raise RuntimeError("crop failed")
         return image, None
 
-    def infer(items: "read.CropBatch", *_: object) -> list:
+    def infer(items: read.CropBatch, *_: object) -> list:
         if failure == "inference":
-            msg = "inference failed"
-            raise RuntimeError(msg)
+            raise RuntimeError("inference failed")
         return [Reading(t, region, (8, 8)) for t, region, _ in items]
 
     monkeypatch.setattr(read.video, "sample", sample)
@@ -148,7 +139,8 @@ def test_sparse_failure_joins_producer_and_preserves_previous_publication(
             read.ReadContext("video", Calibration.load("pml"), tmp_path, model, model),
             [{"hand": 2, "t_start": 0.0, "t_end": 9.0}],
             [Interval("hand:TL", 0.0, 9.0, 19, calm=True, motion=0.0, skin=0.0)],
-            options=read.ReadOptions(cap=20, force=True),
+            cap=20,
+            force=True,
             log=lambda *_: None,
         )
     assert closed.is_set()

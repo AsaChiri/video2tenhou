@@ -22,9 +22,13 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 
 from video2tenhou.layout import box_iou
-from video2tenhou.train.data import CLASS_INDEX, crop_box
+
+from .crops import crop_box
+from .tiles import CLASS_INDEX
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .detector import Det
 
 BACK_POSTERIOR_MIN = 0.5
@@ -80,9 +84,8 @@ class Box:
     role: str = "tile"
     row: int | None = None
     col: int | None = None
-    group: int | None = (
-        None  # meld group index; hands: 0 = the row, 1.. = groups beside it
-    )
+    # meld group index; hands: 0 = the row, 1.. = groups beside it
+    group: int | None = None
 
     @property
     def cx(self) -> float:
@@ -142,10 +145,7 @@ class Reading:
 
 
 def _clipped(b: Box, region_h: float | None) -> bool:
-    """Check whether the region's far edge cuts a box.
-
-    The box is cut by the far edge of the region (the wall row lies there).
-    """
+    """Check whether the region's far edge, where the wall row lies, cuts a box."""
     return region_h is not None and b.xyxy[3] >= region_h - EDGE
 
 
@@ -158,18 +158,15 @@ def _at_right(b: Box, region_w: float | None) -> bool:
 
 
 def _at_side(b: Box, region_w: float | None) -> bool:
-    """Check whether a box touches a side where another pond can intrude.
-
-    The box touches a side edge of the region, where a neighbouring pond can spill in.
-    """
+    """Check whether a box touches a side edge, where another pond can spill in."""
     return _at_left(b) or _at_right(b, region_w)
 
 
 def _tile_size(boxes: list[Box], region_h: float | None = None) -> tuple[float, float]:
-    """Estimate upright tile size from intact face-up detections.
+    """Estimate the median upright tile width and height from intact face-up boxes.
 
-    Median width / height of the upright face-up tiles (sideways ones swapped); tile
-    backs and boxes cut by the region edge (the wall row) do not shape the estimate.
+    Sideways boxes are swapped; tile backs and boxes cut by the region edge (the wall
+    row) do not shape the estimate.
     """
     good = [
         b
@@ -182,10 +179,9 @@ def _tile_size(boxes: list[Box], region_h: float | None = None) -> tuple[float, 
 
 
 def _cluster_rows(boxes: list[Box], th: float) -> list[list[Box]]:
-    """Group boxes into rows by their relative vertical separation.
+    """Group boxes by height, top to bottom.
 
-    Boxes grouped by height, top to bottom: a box within 0.55 tile heights of the
-    cluster's mean joins it.
+    A box within 0.55 tile heights of the cluster's mean joins it.
     """
     clusters: list[list[Box]] = []
     for b in sorted(boxes, key=lambda b: b.cy):
@@ -199,12 +195,11 @@ def _cluster_rows(boxes: list[Box], th: float) -> list[list[Box]]:
 def assign_pond(
     boxes: list[Box], region_h: float | None = None, region_w: float | None = None
 ) -> bool:
-    """Assign ordered pond rows and columns, retaining gaps and indicators.
+    """Assign pond rows top-down and columns left to right; leftovers are indicators.
 
-    Rows top-down (row 0 nearest the centre), columns left to right with gaps; leftovers
-    are indicators. Returns True when the reading is rejected: a row of more than six
-    positions that no neighbouring pond can explain (its boxes are marked "other"; the
-    caller drops the reading).
+    Row 0 is nearest the centre and columns keep gaps. Returns True when the reading is
+    rejected: a row of more than six positions that no neighbouring pond can explain
+    (its boxes are marked "other"; the caller drops the reading).
     """
     if not boxes:
         return False
@@ -330,12 +325,11 @@ def _x_overlap(a: Box, b: Box) -> float:
 
 
 def _rows_without_overlap(cl: list[Box]) -> list[list[Box]]:
-    """Split a height cluster into rows without horizontal box overlap.
+    """Split a height cluster into rows in which no two boxes overlap along x.
 
-    Split a height cluster into rows in which no two boxes overlap along x: tiles of one
-    row lie side by side, so two boxes over the same x are in two rows (melds laid one
-    above the other at an angle). The one exception is a kakan: its added tile lies
-    across the pon's turned tile, both sideways, one on the other.
+    Tiles of one row lie side by side, so two boxes over the same x are in two rows
+    (melds laid one above the other at an angle). The one exception is a kakan: its
+    added tile lies across the pon's turned tile, both sideways, one on the other.
     """
 
     def fits(b: Box, r: list[Box]) -> bool:
@@ -367,12 +361,12 @@ def _distinct_meld_boxes(boxes: list[Box]) -> list[Box]:
 
 
 def assign_meld(boxes: list[Box]) -> None:
-    """Group meld boxes by row and consecutive horizontal spacing.
+    """Group meld boxes into rows by y (top to bottom), boxes left to right.
 
-    Meld rows by y (top to bottom), boxes left to right; consecutive boxes closer than a
-    tile width share a group. The same tile boxed twice keeps its better box (the other
-    becomes "other"), and boxes overlapping along x never share a row. Runs of more than
-    four boxes are split into melds by the engine (call rules).
+    Consecutive boxes closer than a tile width share a group. The same tile boxed twice
+    keeps its better box (the other becomes "other"), and boxes overlapping along x
+    never share a row. Runs of more than four boxes are split into melds by the engine
+    (call rules).
     """
     live = _distinct_meld_boxes(boxes)
     if not live:
@@ -394,12 +388,12 @@ def assign_meld(boxes: list[Box]) -> None:
 def assign_hand(boxes: list[Box]) -> None:
     """Separate the hand row from neighbouring melds and stray detections.
 
-    The hand row and what lies beside it. Boxes cluster by height as melds do and a
-    cluster splits at a gap wider than 0.8 tile widths; the longest group is the row
-    (role "tile", group 0). Every other group is a meld the player moved beside the row
-    at a reveal (role "extra", groups 1.. left to right): its tiles are not in the hand,
-    so they never enter the row's count. Ties go to the leftmost group: melds lie at the
-    player's right, which the hand camera sees on the right.
+    Boxes cluster by height as melds do and a cluster splits at a gap wider than 0.8
+    tile widths; the longest group is the row (role "tile", group 0). Every other group
+    is a meld the player moved beside the row at a reveal (role "extra", groups 1..
+    left to right): its tiles are not in the hand, so they never enter the row's count.
+    Ties go to the leftmost group: melds lie at the player's right, which the hand
+    camera sees on the right.
     """
     if not boxes:
         return
@@ -485,37 +479,29 @@ def _prepare(
             and (x1 - x0) > SIDEWAYS_ASPECT * (y1 - y0)
             and not (kind == "pond" and y1 >= img.shape[0] - EDGE)
         )
-        b = Box(d.xyxy, d.conf, sideways=side, p=np.zeros(len(CLASS_INDEX), np.float32))
-        if d.back:
-            b.p[CLASS_INDEX["X"]] = 1.0
-            boxes.append(b)
-            continue
         c = crop_box(img, d.xyxy)
         if c is None:
             continue
-        boxes.append(b)
+        p = np.zeros(len(CLASS_INDEX), np.float32)  # replaced by the classifier
+        boxes.append(Box(d.xyxy, d.conf, sideways=side, p=p))
         crops.append(c)
         sideways.append(side)
     return boxes, crops, sideways
 
 
 def _set_posteriors(boxes: list[Box], probabilities: np.ndarray) -> None:
-    j = 0
-    for b in boxes:
-        if b.p[CLASS_INDEX["X"]] == 1.0:
-            continue
-        b.p = probabilities[j]
-        j += 1
+    for b, p in zip(boxes, probabilities, strict=True):
+        b.p = p
 
 
-def _finish(img: np.ndarray, name: str, t: float, boxes: list[Box]) -> Reading:
-    kind = name.partition(":")[0]
-    # a detection the classifier calls "not a tile" is junk: it must not take a row /
-    # column position
-    boxes = [b for b in boxes if b.p[CLASS_INDEX["none"]] < NONE_MAX]
-    rejected = False
+def structure(kind: str, boxes: list[Box], size: Sequence[int]) -> bool:
+    """Assign roles, rows/columns or groups and sort ``boxes`` into reading order.
+
+    ``size`` is the region's (width, height). Returns True when a pond layout is
+    impossible and the reading must be rejected.
+    """
     if kind == "pond":
-        rejected = assign_pond(boxes, region_h=img.shape[0], region_w=img.shape[1])
+        rejected = assign_pond(boxes, region_h=size[1], region_w=size[0])
         boxes.sort(
             key=lambda b: (
                 b.role != "tile",
@@ -524,10 +510,16 @@ def _finish(img: np.ndarray, name: str, t: float, boxes: list[Box]) -> Reading:
                 b.cx,
             )
         )
-    elif kind == "meld":
-        assign_meld(boxes)
-        boxes.sort(key=lambda b: (b.group if b.group is not None else 99, b.cx))
-    else:
-        assign_hand(boxes)
-        boxes.sort(key=lambda b: (b.group if b.group is not None else 99, b.cx))
-    return Reading(t, name, (img.shape[1], img.shape[0]), boxes, rejected)
+        return rejected
+    (assign_meld if kind == "meld" else assign_hand)(boxes)
+    boxes.sort(key=lambda b: (b.group if b.group is not None else 99, b.cx))
+    return False
+
+
+def _finish(img: np.ndarray, name: str, t: float, boxes: list[Box]) -> Reading:
+    # a detection the classifier calls "not a tile" is junk: it must not take a row /
+    # column position
+    boxes = [b for b in boxes if b.p[CLASS_INDEX["none"]] < NONE_MAX]
+    size = (img.shape[1], img.shape[0])
+    rejected = structure(name.partition(":")[0], boxes, size)
+    return Reading(t, name, size, boxes, rejected)

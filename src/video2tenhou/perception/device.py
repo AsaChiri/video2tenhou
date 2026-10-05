@@ -24,15 +24,13 @@ def smoke_test(device: str) -> None:
             not torch.isfinite(result).all().item()
             or (matrix @ matrix)[0, 0].item() != matrix.shape[1]
         ):
-            msg = "Inference kernel check returned invalid values"
-            raise RuntimeError(msg)
+            raise RuntimeError("Inference kernel check returned invalid values")
         boxes = torch.tensor(
             [[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 2.0, 2.0]], device=device
         )
         scores = torch.tensor([0.9, 0.8], device=device)
         if nms(boxes, scores, 0.5).tolist() != [0]:
-            msg = "torchvision detection kernel check failed"
-            raise RuntimeError(msg)
+            raise RuntimeError("torchvision detection kernel check failed")
         if device.startswith("cuda"):
             torch.cuda.synchronize(device)
 
@@ -43,9 +41,8 @@ def _select(request: str) -> str:
 
     if request != "auto":
         selected = f"cuda:{request}" if request.isdigit() else request
-        smoke_test(
-            selected
-        )  # Explicit choices fail clearly, never silently change devices.
+        # Explicit choices fail clearly, never silently change devices.
+        smoke_test(selected)
         return selected
     try:
         if torch.cuda.is_available():
@@ -54,8 +51,8 @@ def _select(request: str) -> str:
     except (RuntimeError, AssertionError, OSError, ImportError) as exc:
         warnings.warn(
             f"GPU check failed: {exc}. Using CPU; processing will be slower. "
-            "Update uv and your NVIDIA driver, then relaunch Start.cmd or start.sh "
-            "to choose a compatible runtime.",
+            "Update uv and your NVIDIA driver, then run `Start.cmd --update` or "
+            "`sh start.sh --update` to choose a compatible runtime.",
             RuntimeWarning,
             stacklevel=2,
         )

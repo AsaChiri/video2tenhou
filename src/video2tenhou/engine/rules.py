@@ -11,19 +11,24 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-MELD_SIZE = 3
-
-
 SEATS = "ESWN"
+# seats are the winds of the hand being decoded, so the dealer is always East
+DEALER = "E"
+# the seat at each offset after a player, in turn order
+RELATIONS = ("self", "shimocha", "toimen", "kamicha")
+# the 34 kinds: numbered suits, then honors
 KINDS = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + [
     f"{n}z" for n in range(1, 8)
-]  # 34
-REDS = {"0m": "5m", "0p": "5p", "0s": "5s"}
+]
+RED_OF = {"5m": "0m", "5p": "0p", "5s": "0s"}  # plain five -> the red five of its suit
+PLAIN_OF = {red: five for five, red in RED_OF.items()}  # red five -> plain five
+OTHER_FIVE = RED_OF | PLAIN_OF  # a five read as the other one
+LIVE_WALL = 136 - 13 * 4 - 14  # 70 draws in a hand without kans
 
 
 def plain(tile: str) -> str:
     """Red five -> plain five; everything else unchanged."""
-    return REDS.get(tile, tile)
+    return PLAIN_OF.get(tile, tile)
 
 
 def suit(tile: str) -> str:
@@ -38,14 +43,10 @@ def number(tile: str) -> int:
 
 
 def max_count(tile: str) -> int:
-    """Return the inventory limit of a tile, distinguishing red fives.
-
-    How many copies of exactly this token exist: red fives once, plain fives three,
-    others four.
-    """
-    if tile in REDS:
+    """How many copies of exactly this token exist: red fives one, plain fives three."""
+    if tile in PLAIN_OF:
         return 1
-    if tile in ("5m", "5p", "5s"):
+    if tile in RED_OF:
         return 3
     return 4
 
@@ -63,40 +64,16 @@ def next_seat(seat: str) -> str:
 
 def relative(me: str, other: str) -> str:
     """Kamicha (the player before me), toimen, shimocha (after me)."""
-    d = (SEATS.index(other) - SEATS.index(me)) % 4
-    return {0: "self", 1: "shimocha", 2: "toimen", 3: "kamicha"}[d]
+    return RELATIONS[(SEATS.index(other) - SEATS.index(me)) % 4]
 
 
-def is_chi(tiles: list[str]) -> bool:
-    """Check a three-tile sequence, accepting red fives and excluding honors."""
-    if len(tiles) != MELD_SIZE:
-        return False
-    s = {suit(t) for t in tiles}
-    if len(s) != 1 or "z" in s:
-        return False
-    ns = sorted(number(t) for t in tiles)
-    return ns[1] == ns[0] + 1 and ns[2] == ns[1] + 1
-
-
-def is_pon(tiles: list[str]) -> bool:
-    """Check three matching ranks; physical copy limits are checked separately."""
-    return len(tiles) == MELD_SIZE and len({plain(t) for t in tiles}) == 1
+def seat_at(me: str, relation: str) -> str:
+    """Return the seat that is `relation` (kamicha, toimen, shimocha) of `me`."""
+    return SEATS[(SEATS.index(me) + RELATIONS.index(relation)) % 4]
 
 
 def kan_tiles(kind: str) -> list[str]:
-    """Return all four tiles of a kan, preserving its single red five.
-
-    The four tiles of any kan of `kind`: a kan of fives is all four fives, three plain
-    and the red one.
-    """
+    """Return the four tiles of a kan of `kind`: a kan of fives holds the red one."""
     k = plain(kind)
-    red = next((r for r, p in REDS.items() if p == k), None)
+    red = RED_OF.get(k)
     return [k] * 3 + [red] if red else [k] * 4
-
-
-DEALER = (
-    "E"  # seats are the winds of the hand being decoded, so the dealer is always East
-)
-
-
-LIVE_WALL = 136 - 13 * 4 - 14  # 70 draws in a hand without kans

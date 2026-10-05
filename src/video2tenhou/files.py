@@ -49,6 +49,16 @@ def sha256_file(path: str | Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def sha256_text(text: str) -> str:
+    """Hash the UTF-8 encoding of text, such as a file's contents before publication."""
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def json_digest(value: object) -> str:
+    """Hash canonical JSON: sorted keys, compact separators and ASCII escapes."""
+    return sha256_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
 @contextmanager
 def _atomic_text_file(path: Path, *, retry_windows: bool) -> "Iterator[IO[str]]":
     """Sync a sibling temporary file before replacing the destination."""
@@ -85,6 +95,22 @@ def _atomic_text_file(path: Path, *, retry_windows: bool) -> "Iterator[IO[str]]"
             # Cleanup must retain the original write/replacement failure.
             with suppress(OSError):
                 pending.unlink(missing_ok=True)
+
+
+def read_published_text(path: Path) -> str:
+    """Read UTF-8 text that another process may be atomically replacing.
+
+    Windows briefly denies opening a file while it is being replaced; such
+    denials are retried for at most 750 ms, like the writers' replacement.
+    """
+    for delay in (0.05, 0.1, 0.2, 0.4):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            time.sleep(delay)
+    return path.read_text(encoding="utf-8")
 
 
 def atomic_write_text(path: Path, content: str, *, retry_windows: bool = False) -> None:

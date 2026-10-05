@@ -3,10 +3,11 @@
 
 """A later partial camera view must not erase an independently witnessed call."""
 
+from __future__ import annotations
+
 import copy
 import gzip
 import json
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -14,28 +15,25 @@ import pytest
 from tests.paths import DATA
 from video2tenhou.engine.calls import CallAnchor
 from video2tenhou.engine.dense import DenseContext, place_taken
-from video2tenhou.engine.melds import Call, track_melds
-from video2tenhou.engine.ponds import tail_runs, track_pond
-from video2tenhou.train.data import CLASS_INDEX, CLASSES
-
-if TYPE_CHECKING:
-    from video2tenhou.engine.ponds import PondSlot
+from video2tenhou.engine.melds import Call, read_views, track_melds
+from video2tenhou.engine.ponds import PondSlot, tail_runs, track_pond
+from video2tenhou.perception.tiles import CLASS_INDEX, CLASSES
 
 
-def recorded() -> "dict":
+def recorded() -> dict:
     """Load the recorded contradictory-chi evidence fixture."""
     return json.loads(
         gzip.decompress((DATA / "week11_contradicted_chi.json.gz").read_bytes())
     )
 
 
-def hypothesis(data: "dict") -> "Call":
+def hypothesis(data: dict) -> Call:
     """Select the recorded chi hypothesis that needs further verification."""
-    calls = track_melds("E", data["meld_observations"], include_contradicted=True)
+    calls = track_melds("E", read_views(data["meld_observations"]))
     return next(c for c in calls if c.type == "chi" and c.t_first == 9818)
 
 
-def source_logs(data: "dict") -> "tuple[dict[str, list[PondSlot]], PondSlot]":
+def source_logs(data: dict) -> tuple[dict[str, list[PondSlot]], PondSlot]:
     """Build pond logs including the recorded short-lived called discard."""
     logs = {s: [] for s in "ESWN"}
     logs["N"] = track_pond(data["pond_observations"])
@@ -50,10 +48,7 @@ def source_logs(data: "dict") -> "tuple[dict[str, list[PondSlot]], PondSlot]":
 
 
 def test_recorded_chi_requires_independent_removed_discard() -> None:
-    """Verify recorded chi requires independent removed discard."""
     data = recorded()
-    ordinary = track_melds("E", data["meld_observations"])
-    assert not any(c.type == "chi" and c.t_first == 9818 for c in ordinary)
     ev = hypothesis(data)
     assert ev.contradicted
     assert ev.seen == 3
@@ -63,16 +58,14 @@ def test_recorded_chi_requires_independent_removed_discard() -> None:
     assert (
         CallAnchor(
             {s: [] for s in "ESWN"},
-            context=DenseContext(
-                entry={}, models=None, work_dir=None, t0=0, problems=[]
-            ),
+            context=DenseContext(entry={}, models=None, work_dir=None, t0=0),
         ).anchor([ev], 9500, 9970, None)
         == []
     )
     logs, slot = source_logs(data)
     anchor = CallAnchor(
         logs,
-        context=DenseContext(entry={}, models=None, work_dir=None, t0=0, problems=[]),
+        context=DenseContext(entry={}, models=None, work_dir=None, t0=0),
     )
     calls = anchor.anchor([ev, copy.deepcopy(ev)], 9500, 9970, None)
     assert len(calls) == 1  # the competing hypothesis cannot claim the same tile
@@ -91,7 +84,6 @@ def test_recorded_chi_requires_independent_removed_discard() -> None:
 def test_contradicted_camera_event_cannot_claim_unrelated_evidence(
     mismatch: str,
 ) -> None:
-    """Verify contradicted camera event cannot claim unrelated evidence."""
     data = recorded()
     ev = hypothesis(data)
     logs, slot = source_logs(data)
@@ -105,34 +97,31 @@ def test_contradicted_camera_event_cannot_claim_unrelated_evidence(
     assert (
         CallAnchor(
             logs,
-            context=DenseContext(
-                entry={}, models=None, work_dir=None, t0=0, problems=[]
-            ),
+            context=DenseContext(entry={}, models=None, work_dir=None, t0=0),
         ).anchor([ev], 9500, 9970, None)
         == []
     )
 
 
 def test_contradicted_external_kan_has_no_self_kan_fallback() -> None:
-    """Verify contradicted external kan has no self kan fallback."""
     p = np.eye(len(CLASSES))[CLASS_INDEX["2m"]]
     ev = Call(
-        "E",
-        50,
-        (45, 50),
-        "kan",
-        ["2m"] * 4,
-        0,
-        "kamicha",
-        "2m",
-        [p] * 4,
-        1,
+        seat="E",
+        t_first=50,
+        t_window=(45, 50),
+        type="kan",
+        tiles=["2m"] * 4,
+        called_pos=0,
+        source="kamicha",
+        called_tile="2m",
+        p=[p] * 4,
+        conf=1,
         seen=2,
         absent=3,
         contradicted=True,
     )
     anchor = CallAnchor(
         {s: [] for s in "ESWN"},
-        context=DenseContext(entry={}, models=None, work_dir=None, t0=0, problems=[]),
+        context=DenseContext(entry={}, models=None, work_dir=None, t0=0),
     )
     assert anchor.anchor([ev], 10, 90, None) == []

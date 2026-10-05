@@ -3,6 +3,8 @@
 
 """Frame transforms, region crops and per-recording calibration."""
 
+from __future__ import annotations
+
 import itertools
 import json
 
@@ -37,9 +39,8 @@ LABELS = DATA / "layout_boxes"
     ],
 )
 def test_rectangle_crop_matches_frame_coordinates_at_image_edges(
-    channels: "tuple[int, ...]", bounds: tuple[int, int, int, int]
+    channels: tuple[int, ...], bounds: tuple[int, int, int, int]
 ) -> None:
-    """Verify rectangle crop matches frame coordinates at image edges."""
     frame = np.arange(np.prod((5, 7, *channels)), dtype=np.uint8).reshape(
         5, 7, *channels
     )
@@ -55,19 +56,17 @@ def test_rectangle_crop_matches_frame_coordinates_at_image_edges(
 
 @pytest.mark.parametrize("size", [(0, 2), (2, 0), (-1, 2)])
 def test_rectangle_crop_rejects_nonpositive_dimensions(size: tuple[int, int]) -> None:
-    """Verify rectangle crop rejects nonpositive dimensions."""
     with pytest.raises(ValueError, match="Crop dimensions must be positive"):
         Rect(0, 0, *size).crop(np.zeros((5, 7, 3), np.uint8))
 
 
 @pytest.fixture(scope="module")
-def cal() -> "Calibration":
+def cal() -> Calibration:
     """Load the packaged reference calibration."""
     return Calibration.load("pml")
 
 
-def test_transforms_invert(cal: "Calibration") -> None:
-    """Verify transforms invert."""
+def test_transforms_invert(cal: Calibration) -> None:
     pts = np.array([[500.0, 400.0], [960.0, 540.0], [1300.0, 700.0]])
     for name in cal.regions():
         transform, (w, h) = cal.transform(name)
@@ -77,8 +76,7 @@ def test_transforms_invert(cal: "Calibration") -> None:
         assert np.allclose(back, pts, atol=1e-6)
 
 
-def test_region_shapes(cal: "Calibration") -> None:
-    """Verify region shapes."""
+def test_region_shapes(cal: Calibration) -> None:
     frame = np.zeros((1080, 1920, 3), np.uint8)
     for name in cal.regions():
         img, _transform = cal.region(frame, name)
@@ -86,14 +84,13 @@ def test_region_shapes(cal: "Calibration") -> None:
         assert img.shape[:2] == (h, w), name
 
 
-def test_contact_sheet_renders_table_only_layout(cal: "Calibration") -> None:
-    """Verify contact sheet renders table only layout."""
+def test_contact_sheet_renders_table_only_layout(cal: Calibration) -> None:
     assert "overlay" not in cal.data
     sheet = contact_sheet(np.zeros((1080, 1920, 3), np.uint8), cal)
     assert sheet.shape == (1620, 1920, 3)
 
 
-def _labels(kind: "str") -> "list[dict]":
+def _labels(kind: str) -> list[dict]:
     out = []
     for p in sorted(LABELS.glob(f"{kind}_*.json")):
         d = json.loads(p.read_text(encoding="utf-8"))
@@ -103,8 +100,7 @@ def _labels(kind: "str") -> "list[dict]":
 
 
 @pytest.mark.parametrize("kind", ["pond", "hand", "meld"])
-def test_labels_fall_inside_their_region(cal: "Calibration", kind: str) -> None:
-    """Verify labels fall inside their region."""
+def test_labels_fall_inside_their_region(cal: Calibration, kind: str) -> None:
     labels = _labels(kind)
     assert labels, "converted labels missing"
     outside = 0
@@ -121,10 +117,8 @@ def test_labels_fall_inside_their_region(cal: "Calibration", kind: str) -> None:
     )
 
 
-def test_pond_rows_grow_toward_player_and_cols_to_the_right(cal: "Calibration") -> None:
-    """Verify pond rows grow toward player and cols to the right.
-
-    In the upright pond region (owner at the bottom) row 0 is nearest the centre
+def test_pond_rows_grow_toward_player_and_cols_to_the_right(cal: Calibration) -> None:
+    """In the upright pond region (owner at the bottom) row 0 is nearest the centre
     (smallest y) and columns increase with x (the owner's left is the region's left).
     """
     bad_rows = bad_cols = checked = 0
@@ -152,8 +146,7 @@ def test_pond_rows_grow_toward_player_and_cols_to_the_right(cal: "Calibration") 
     assert bad_cols == 0
 
 
-def test_box_quad_roundtrip(cal: "Calibration") -> None:
-    """Verify box quad roundtrip."""
+def test_box_quad_roundtrip(cal: Calibration) -> None:
     transform, _ = cal.transform("pond:TL")
     box = (100.0, 50.0, 180.0, 160.0)
     q = box_to_quad(transform, box)

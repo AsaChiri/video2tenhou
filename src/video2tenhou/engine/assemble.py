@@ -1,10 +1,7 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stage 6: validated decoded hands as Tenhou games and score results.
-
-Stage 6: decoded hands -> tenhou.net/6 Game objects (one per hanchan) plus the
-confidence sidecar.
+"""Stage 6: decoded hands -> tenhou.net/6 Game objects (one per hanchan) and confidence.
 
 Seat index: tenhou seat 0 is the starting East (site seat E), 1 = S, 2 = W, 3 = N. The
 dealer's 14-tile haipai is written as 13 tiles plus a first draw (the first discard when
@@ -13,20 +10,18 @@ it is among the 14, so that discard shows as tsumogiri).
 
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING
 
 from video2tenhou import tenhou6
 
 from . import rules
-from .scoring import score_text
+from .melds import POSITION
+from .scoring import YAKUMAN_HAN, score_text
 
 if TYPE_CHECKING:
     from video2tenhou.record import Game as SiteGame
     from video2tenhou.record import HandResult
 
-YAKUMAN_HAN = 13
-FIRST_RED_TILE_ID = 51
 DEALER_STARTING_TILES = 14
 
 
@@ -99,30 +94,20 @@ YAKU_JA = {
 }
 
 
-def _yaku_text(yaku: list[str]) -> list[str]:
-    """Format a scoring-library yaku name for Tenhou, including yakuman."""
+def _yaku_text(yaku: list[dict]) -> list[str]:
+    """Format scored yaku ({name, han}) in Tenhou's form, a yakuman by name."""
     out = []
     for y in yaku:
-        name, _, han = y.rpartition(" (")
-        if not name:
-            name, han = y, ""
-        name = re.sub(r"\s*\d+$", "", name.strip())  # "Dora 2" -> "Dora"
-        n = han.rstrip(")").strip()
-        ja = YAKU_JA.get(name, name)
-        out.append(
-            f"{ja}(役満)"
-            if n and int(n) >= YAKUMAN_HAN
-            else (f"{ja}({n}飜)" if n else ja)
-        )
+        ja = YAKU_JA.get(y["name"], y["name"])
+        out.append(f"{ja}(役満)" if y["han"] >= YAKUMAN_HAN else f"{ja}({y['han']}飜)")
     return out
 
 
 def tenhou_deltas(result: HandResult) -> list[int]:
-    """Map site deltas to Tenhou order and account for riichi deposits.
+    """Map site deltas to Tenhou order (EAST..NORTH) with riichi deposits taken out.
 
-    The site's deltas in Tenhou order (EAST..NORTH is Tenhou's player 0..3) with
-    riichi deposits taken out: the site charges a declarer's 1000 in the hand's deltas,
-    the viewer charges it at the `r` discard.
+    The site charges a declarer's 1000 in the hand's deltas, the viewer charges it at
+    the `r` discard.
     """
     return [
         result.deltas[n] + (1000 if n in result.riichi else 0)
@@ -137,14 +122,13 @@ def _one_red(ids: list[int], protect: int = -1) -> list[int]:
     camera read; the tile at `protect` (the called or added one) keeps its reading when
     it can.
     """
-    kind = tenhou6.deaka(ids[0])
-    if kind not in (15, 25, 35):
+    red = tenhou6.RED_ID.get(tenhou6.deaka(ids[0]))
+    if red is None:
         return ids
-    red = {15: 51, 25: 52, 35: 53}[kind]
     keep = (
         protect
-        if 0 <= protect < len(ids) and ids[protect] >= FIRST_RED_TILE_ID
-        else next((i for i, x in enumerate(ids) if x >= FIRST_RED_TILE_ID), None)
+        if 0 <= protect < len(ids) and ids[protect] in tenhou6.PLAIN_ID
+        else next((i for i, x in enumerate(ids) if x in tenhou6.PLAIN_ID), None)
     )
     if keep is None:
         keep = next((i for i in range(len(ids)) if i != protect), 0)
@@ -157,10 +141,9 @@ def call_string(c: dict) -> str:
     if c["type"] == "ankan":
         base = rules.plain(known[0]) if known else None
         if base is None:
-            msg = "ankan without a known tile"
-            raise ValueError(msg)
+            raise ValueError("ankan without a known tile")
         # a concealed kan of fives is all four fives, the red one among them
-        return tenhou6.ankan(tenhou6.tile(base), has_aka=base in ("5m", "5p", "5s"))
+        return tenhou6.ankan(tenhou6.tile(base), has_aka=base in rules.RED_OF)
     tiles = [tenhou6.tile(t) for t in c["tiles"]]
     pos = c.get("called_pos")
     pos = pos if pos is not None else 0
@@ -172,8 +155,8 @@ def call_string(c: dict) -> str:
         rest = [x for i, x in enumerate(tiles) if i != pos]
         if typ == "chi":
             return tenhou6.chi(called, rest[0], rest[1])
-    src = c.get("source") or "kamicha"
-    rel = {"kamicha": 0, "toimen": 1, "shimocha": 2}[src]
+    # tenhou's feeder index is the position of the sideways tile in a pon
+    rel = POSITION["pon"][c.get("source") or "kamicha"]
     if typ == "pon":
         return tenhou6.pon(called, rest[0], rest[1], rel=rel)
     if typ == "kan":
@@ -214,9 +197,8 @@ def _turn_streams(
             _call_stream(t, draws, discards)
         elif t["kind"] == "draw" and t["draw"] is not None:
             draws.append(tenhou6.tile(t["draw"]))
-        dealer_first = (
-            is_dealer and t["j"] == 0 and t["kind"] == "draw"
-        )  # no draw of its own: the 14th tile
+        # the dealer's first turn has no draw of its own: the 14th tile
+        dealer_first = is_dealer and t["j"] == 0 and t["kind"] == "draw"
         if t["discard"] is not None:
             tsumogiri = first_tsumogiri if dealer_first else bool(t["tsumogiri"])
             discards.append(
@@ -227,6 +209,30 @@ def _turn_streams(
                 )
             )
     return draws, discards
+
+
+def stream_times(d: dict) -> dict[str, tuple[list, list]]:
+    """Return each seat's time of every entry of its tenhou draw and discard streams.
+
+    The entries follow ``kyoku_from_decode``: the dealer's split first draw, then
+    each turn's calls, draws and discards in event order. A turn without a time
+    gives its entries none.
+    """
+    out = {}
+    for s in rules.SEATS:
+        mine = [t for t in d["turns"] if t["seat"] == s]
+        dealer = s == d["dealer"]
+        split = dealer and len(d["haipai"].get(s, [])) == DEALER_STARTING_TILES
+        draw_times = [mine[0].get("t") if mine else None] if split else []
+        discard_times = []
+        for t in mine:
+            draws, discards = _turn_streams(
+                [t], is_dealer=dealer, first_tsumogiri=False
+            )
+            draw_times += [t.get("t")] * len(draws)
+            discard_times += [t.get("t")] * len(discards)
+        out[s] = (draw_times, discard_times)
+    return out
 
 
 def _hand_result(
@@ -311,10 +317,7 @@ def kyoku_from_decode(
                 }
             )
         k.haipai[i] = sorted(tenhou6.tile(t) for t in haipai)
-        draws: list = []
-        discards: list = []
-        if first_draw is not None:
-            draws.append(tenhou6.tile(first_draw))
+        draws: list = [] if first_draw is None else [tenhou6.tile(first_draw)]
         turn_draws, discards = _turn_streams(
             turns_by_seat[s], is_dealer=s == dealer, first_tsumogiri=first_tsumogiri
         )
@@ -333,23 +336,23 @@ def kyoku_from_decode(
 
 def game_from_decodes(
     decodes: list[dict], entries: list[dict], site: SiteGame, title: str
-) -> tuple[tenhou6.Game, dict[int, list[dict]], dict[int, list[str]]]:
+) -> tuple[tenhou6.Game, dict[int, list[dict]], dict[int, list[tenhou6.Violation]]]:
     """Build one hanchan log from the hands accepted for export.
 
-    The log of one hanchan: a kyoku per decoded hand, except the hands left out (section
-    6: nothing is written for a conflict) — those with no legal reconstruction, and
+    A kyoku per decoded hand, except the hands left out (section 6: nothing is written
+    for a conflict): those with no legal reconstruction (no violations listed), and
     those the replayer rejects. Returns the game, the confidence rows by hand, and the
-    reasons each left-out hand was left out.
+    replayer's violations of each left-out hand.
     """
     names = [site.players.get(n, "") for n in ("EAST", "SOUTH", "WEST", "NORTH")]
     g = tenhou6.Game(names=names, title=[title, f"scoremj game {site.id}"])
     conf: dict[int, list[dict]] = {}
-    left_out: dict[int, list[str]] = {}
+    left_out: dict[int, list[tenhou6.Violation]] = {}
     by_hand = {e["hand"]: e for e in entries}
     for d in sorted(decodes, key=lambda d: d["hand"]):
         e = by_hand[d["hand"]]
         if d["solver"]["status"] not in ("optimal", "feasible", "repaired"):
-            left_out[d["hand"]] = ["no legal reconstruction (a conflict): not written"]
+            left_out[d["hand"]] = []
             continue
         k, rows = kyoku_from_decode(d, e, site.hands[e["site_index"]])
         violations = tenhou6.replay_kyoku(k.dump())

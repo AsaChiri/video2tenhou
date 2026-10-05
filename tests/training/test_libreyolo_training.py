@@ -3,24 +3,22 @@
 
 """Refinement must not relabel pseudo data as reviewed human supervision."""
 
+from __future__ import annotations
+
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import pytest
 
 from video2tenhou.train import train_libreyolo
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 @pytest.mark.parametrize(("origin", "reviewed"), [("pseudo", False), ("human", False)])
 def test_human_refinement_rejects_unreviewed_inputs_before_model_loading(
-    *, tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", origin: str, reviewed: bool
+    *, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str, reviewed: bool
 ) -> None:
-    """Verify human refinement rejects unreviewed inputs before model loading."""
     dataset = tmp_path / "data"
     dataset.mkdir()
     (dataset / "data.yaml").write_text("nc: 1\n")
@@ -57,12 +55,11 @@ def test_human_refinement_rejects_unreviewed_inputs_before_model_loading(
 )
 @pytest.mark.parametrize("version", ["1.5.0", "1.5.1"])
 def test_training_forwards_portable_worker_default_and_explicit_override(
-    tmp_path: "Path",
-    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     worker_case: tuple[str, list[str], int],
     version: str,
 ) -> None:
-    """Verify training forwards portable worker default and explicit override."""
     system, override, expected = worker_case
     dataset = tmp_path / "data"
     dataset.mkdir()
@@ -76,10 +73,10 @@ def test_training_forwards_portable_worker_default_and_explicit_override(
     captured = {}
 
     class Model:
-        def __init__(self, *_args: "object", **_kwargs: "object") -> None:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
             self.names = {0: "face"}
 
-        def train(self, **kwargs: "object") -> dict:
+        def train(self, **kwargs: object) -> dict:
             captured.update(kwargs)
             return {}
 

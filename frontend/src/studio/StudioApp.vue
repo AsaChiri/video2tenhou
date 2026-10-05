@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref } from "vue";
-import type { Project, Workspace } from "../types";
+import { computed, onMounted, onBeforeUnmount, provide, ref } from "vue";
+import type { Project, ProjectJob, Workspace } from "../types";
 import { api } from "../shared/api";
-import { usePolling } from "../shared/usePolling";
+import { errorText, useAction } from "../shared/useAction";
+import { jobKey, useJobStatus } from "../shared/useJob";
+import { time } from "../review/format";
 import RecordingForm from "./RecordingForm.vue";
 import ProjectSettings from "./ProjectSettings.vue";
 import ProjectLibrary from "./ProjectLibrary.vue";
@@ -11,27 +13,43 @@ import ResultsPanel from "./ResultsPanel.vue";
 import ReviewWorkspace from "../review/ReviewWorkspace.vue";
 import "../review/review.css";
 
+const CHECK_AGAIN = 1000;
 const projects = ref<Project[]>([]),
   selected = ref<string | null>(null),
   view = ref("analyze"),
   error = ref(""),
-  missing = ref<string[]>([]),
-  busy = ref(false);
+  missing = ref<string[]>([]);
 const calibrationDirty = ref(false),
   reviewVersion = ref(0);
 const loading = ref(true),
   loaded = ref(false),
   loadError = ref(""),
   showIntake = ref(false);
-let revision = 0;
+const status = useJobStatus(selected);
+provide(jobKey, status);
+const { busy, run } = useAction((message) => (error.value = message));
+let revision = 0,
+  checkTimer: ReturnType<typeof setTimeout> | undefined;
 const project = computed(() =>
   projects.value.find((project) => project.id === selected.value),
 );
+/** The selected project's preparation or analysis, live while it runs. */
+const projectJob = computed<ProjectJob | null>(() => {
+  const live = status.job.value;
+  if (
+    live?.running &&
+    live.project === selected.value &&
+    (live.kind === "prepare" || live.kind === "analyze")
+  )
+    return { action: live.kind, ...live };
+  return project.value?.job ?? null;
+});
+const processing = computed(() => !!projectJob.value?.running);
 const hasResults = computed(() =>
   project.value?.artifacts.some((file) => /^g\d+\.json$/.test(file)),
 );
 const tabs = computed(() =>
-  project.value?.job.running
+  processing.value
     ? [
         ["analyze", "Analysis"],
         ...(hasResults.value ? [["results", "Results"]] : []),
@@ -52,10 +70,13 @@ const showReview = computed(
     project.value &&
     (view.value === "review" ||
       view.value === "calibration" ||
-      (view.value === "analyze" &&
-        project.value.has_fit &&
-        !project.value.job.running)),
+      (view.value === "analyze" && project.value.has_fit && !processing.value)),
 );
+const elapsed = computed(() => {
+  const job = projectJob.value;
+  if (!job?.started) return "";
+  return time((job.finished || status.now.value / 1000) - job.started);
+});
 function blocked() {
   if (!calibrationDirty.value) return false;
   error.value = "Save or discard your calibration changes before continuing.";
@@ -68,6 +89,7 @@ function open(id: string | null) {
   view.value = hasResults.value ? "review" : "analyze";
   if (location.hash.slice(1) !== (id || "")) location.hash = id || "";
   error.value = "";
+  if (!id && loaded.value) void refresh();
 }
 function newProject() {
   if (blocked()) return;
@@ -98,7 +120,10 @@ function hashChanged() {
   }
 }
 onMounted(() => window.addEventListener("hashchange", hashChanged));
-onBeforeUnmount(() => window.removeEventListener("hashchange", hashChanged));
+onBeforeUnmount(() => {
+  window.removeEventListener("hashchange", hashChanged);
+  clearTimeout(checkTimer);
+});
 function changeView(next: string) {
   if (!blocked()) view.value = next;
 }
@@ -109,20 +134,18 @@ function update(updated: Project) {
   );
 }
 async function action(kind: string) {
-  if (blocked() || busy.value || !project.value) return;
+  if (blocked() || !project.value) return;
   const id = selected.value;
-  busy.value = true;
   error.value = "";
-  try {
-    update(await api<Project>(`/api/projects/${id}/${kind}`, {}));
-    if (selected.value === id) view.value = "analyze";
-  } catch (failure) {
-    if (selected.value === id)
-      error.value =
-        failure instanceof Error ? failure.message : String(failure);
-  } finally {
-    busy.value = false;
-  }
+  await run(async () => {
+    try {
+      update(await api<Project>(`/api/projects/${id}/${kind}`, {}));
+      if (selected.value === id) view.value = "analyze";
+    } finally {
+      void status.refresh();
+    }
+  });
+  if (selected.value !== id) error.value = "";
 }
 async function created(project: Project) {
   revision++;
@@ -131,7 +154,7 @@ async function created(project: Project) {
     project,
   ];
   open(project.id);
-  if (!project.has_fit) await action("prepare");
+  if (!project.has_fit && !project.checking) await action("prepare");
 }
 function deleted(id: string) {
   revision++;
@@ -145,6 +168,7 @@ function saved(project: Project) {
 let first = true;
 async function refresh() {
   const requestedRevision = revision;
+  clearTimeout(checkTimer);
   try {
     const data = await api<Workspace>("/api/workspace");
     if (requestedRevision !== revision) return;
@@ -168,23 +192,21 @@ async function refresh() {
       error.value = "This project was removed. Choose another project below.";
     }
     if (project.value && !calibrationDirty.value) {
-      if (
-        view.value === "analyze" &&
-        hasResults.value &&
-        !project.value.job.running
-      )
+      if (view.value === "analyze" && hasResults.value && !processing.value)
         view.value = "review";
       if (!hasResults.value && ["review", "results"].includes(view.value))
         view.value = "analyze";
     }
+    if (data.projects.some((project) => project.checking))
+      checkTimer = setTimeout(refresh, CHECK_AGAIN);
   } catch (failure) {
-    loadError.value =
-      failure instanceof Error ? failure.message : String(failure);
+    loadError.value = errorText(failure);
   } finally {
     loading.value = false;
   }
 }
-usePolling(refresh, 2500);
+status.onFinished(() => void refresh());
+onMounted(refresh);
 </script>
 <template>
   <header>
@@ -215,6 +237,7 @@ usePolling(refresh, 2500);
       :projects="projects"
       :loading="loading"
       :unavailable="!loaded && !!loadError"
+      :job="status.job.value"
       @open="open"
       @settings="openSettings"
       @create="newProject"
@@ -227,9 +250,7 @@ usePolling(refresh, 2500);
       @error="error = $event"
     />
     <section v-if="project">
-      <h1 class="current-project-name">
-        {{ project.display_name || project.name }}
-      </h1>
+      <h1 class="current-project-name">{{ project.display_name }}</h1>
       <nav class="project-tabs" role="tablist" aria-label="Project">
         <button
           v-for="[key, label] in tabs"
@@ -241,10 +262,14 @@ usePolling(refresh, 2500);
           {{ label }}
         </button>
       </nav>
-      <div v-if="project.job.error" class="notice error" role="alert">
-        {{ project.job.error }}
+      <div
+        v-if="projectJob?.error && !processing"
+        class="notice error"
+        role="alert"
+      >
+        {{ projectJob.error }}
         <button
-          v-if="project.can_calibrate && !project.job.running"
+          v-if="project.can_calibrate && view !== 'settings'"
           @click="changeView('settings')"
         >
           Open settings
@@ -254,6 +279,7 @@ usePolling(refresh, 2500);
         v-if="view === 'settings'"
         :key="project.id"
         :project="project"
+        :locked="!!status.job.value?.running"
         @updated="saved"
         @error="error = $event"
         @calibrate="changeView('calibration')"
@@ -264,23 +290,21 @@ usePolling(refresh, 2500);
         v-if="view === 'results'"
         :key="project.id"
         :project="project"
+        :updating="
+          !!status.job.value?.running &&
+          status.job.value.project === project.id &&
+          status.job.value.kind === 'rebuild'
+        "
         @error="error = $event"
       />
       <button v-if="view === 'calibration'" @click="changeView('settings')">
         Back to settings
       </button>
       <section v-if="view === 'analyze'" class="processing">
-        <template v-if="project.job.running"
-          ><h2>{{ project.job.stage || "Analyzing recording" }}</h2>
-          <span
-            >{{
-              Math.floor(
-                ((project.job.finished || Date.now() / 1000) -
-                  (project.job.started || 0)) /
-                  60,
-              )
-            }}
-            min elapsed</span
+        <p v-if="project.checking" role="status">Checking the recording…</p>
+        <template v-else-if="processing"
+          ><h2>{{ projectJob?.stage || "Analyzing recording" }}</h2>
+          <span>Elapsed {{ elapsed }}</span
           ><progress class="progress" aria-label="Processing"
         /></template>
         <template v-else
@@ -298,29 +322,27 @@ usePolling(refresh, 2500);
           </h2>
           <button
             class="primary"
-            :disabled="busy"
+            :disabled="busy || !!status.job.value?.running"
             @click="action(project.has_fit ? 'analyze' : 'prepare')"
           >
             {{ project.has_fit ? "Analyze recording" : "Prepare recording" }}
           </button></template
         >
       </section>
-      <template v-for="entry in projects" :key="entry.id"
-        ><ProcessingLog
-          v-show="
-            entry.id === selected &&
-            ['settings', 'analyze'].includes(view) &&
-            entry.job.log?.length
-          "
-          :job="entry.job"
-      /></template>
+      <ProcessingLog
+        v-if="['settings', 'analyze'].includes(view) && projectJob?.started"
+        :key="project.id"
+        :project-id="project.id"
+        :job="projectJob"
+        :lines="status.job.value?.log_lines ?? 0"
+      />
       <ReviewWorkspace
         v-if="
           project.has_fit || (project.can_calibrate && view === 'calibration')
         "
         v-show="showReview"
-        :active="showReview"
         :key="`${selected}:${reviewVersion}`"
+        :active="showReview"
         :project-id="project.id"
         :calibration="['analyze', 'calibration'].includes(view)"
         @dirty="calibrationDirty = $event"

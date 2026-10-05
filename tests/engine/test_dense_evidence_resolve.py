@@ -3,21 +3,25 @@
 
 """Accepted dense partial views reach reconstruction without requiring a pinned draw."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
-import numpy as np
 import pytest
 
-from tests.engine.factories import hand_decoder
+from tests.builders import posterior
+from tests.engine import factories
 from tests.recognition import models_stub
-from tests.spies import record_results
-from video2tenhou.engine import decode, dense
-from video2tenhou.engine.solver import SeatTurn, Solution
+from video2tenhou.engine import dense, rules
+from video2tenhou.engine.confidence import Certificate
+from video2tenhou.engine.dense import DenseContext
+from video2tenhou.engine.questions import Report
+from video2tenhou.engine.reconstruct import fit_evidence
+from video2tenhou.engine.solver import HandModel, SeatTurn, Solution
 from video2tenhou.engine.turns import Turn
-from video2tenhou.train.data import CLASS_INDEX, CLASSES
 
 
-def _frame(t: "float", count: "int") -> "dict":
+def _frame(t: float, count: int) -> dict:
     tiles = [
         "1m",
         "2m",
@@ -34,18 +38,15 @@ def _frame(t: "float", count: "int") -> "dict":
         "9m",
         "2z",
     ]
-    boxes = []
-    for index, tile in enumerate(tiles[:count]):
-        posterior = np.full(len(CLASSES), 0.001)
-        posterior[CLASS_INDEX[tile]] = 0.95
-        boxes.append(
-            {
-                "role": "tile",
-                "xyxy": [index * 40, 0, index * 40 + 38, 58],
-                "p": (posterior / posterior.sum()).tolist(),
-                "conf": 0.95,
-            }
-        )
+    boxes = [
+        {
+            "role": "tile",
+            "xyxy": [index * 40, 0, index * 40 + 38, 58],
+            "p": posterior(tile, 0.95, floor=0.001).tolist(),
+            "conf": 0.95,
+        }
+        for index, tile in enumerate(tiles[:count])
+    ]
     return {"t": t, "boxes": boxes}
 
 
@@ -58,7 +59,7 @@ def _frame(t: "float", count: "int") -> "dict":
         ("draw", 2, 1),
         ("empty", 1, 0),
         ("moving", 1, 0),
-        ("not_selected", 1, 0),
+        ("not_selected", 1, None),  # nothing to reread: no note
         ("offline", 1, None),
         ("kan", 2, 1),
         ("kan_after", 2, 1),
@@ -66,7 +67,7 @@ def _frame(t: "float", count: "int") -> "dict":
     ],
 )
 def test_real_dense_evidence_changes_objective_before_resolve(
-    monkeypatch: "pytest.MonkeyPatch",
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     case: str,
     expected_solves: int,
@@ -91,13 +92,15 @@ def test_real_dense_evidence_changes_objective_before_resolve(
     if case.startswith("kan"):
         seat_turns[1].kind, seat_turns[1].kan = "kan", "daiminkan"
         seat_turns[1].removed = ["1m"] * 3
-    monkeypatch.setattr(
-        decode,
-        "seat_turns_of",
-        lambda _turns, seat, _dealer: (
-            seat_turns if seat == "S" else [],
-            {1: 1} if case.startswith("kan") and seat == "S" else {},
-        ),
+    model = HandModel("E", {s: seat_turns if s == "S" else [] for s in rules.SEATS}, [])
+    melds_before = {
+        s: {1: 1} if case.startswith("kan") and s == "S" else {} for s in rules.SEATS
+    }
+    # An ambiguous draw selects the window; a certified open-kan draw still does.
+    certificate = (
+        Certificate(10.0)
+        if case.startswith("kan")
+        else Certificate(0.0, 10.0 if case == "not_selected" else 0.0)
     )
     first = Solution(
         "optimal",
@@ -105,66 +108,68 @@ def test_real_dense_evidence_changes_objective_before_resolve(
         {},
         {},
         {},
-        margins={("S", 1): 0.0},
-        alternative_gaps={("S", 1): 10.0 if case == "not_selected" else 0.0},
+        certificates={("draw", "S", 1): certificate},
+        certified=True,
     )
-    if case.startswith("kan"):
-        first.margins[("S", 1)] = first.alternative_gaps[("S", 1)] = 10.0
     second = Solution("optimal", 1.0, {}, {}, {})
-    decoder = hand_decoder(
-        dealer="E",
-        dora=[],
-        ura=[],
-        tsumo_winner=None,
-        calls=[],
-        entry={"corner_wind": {"TL": "S", "TR": "W", "BL": "E", "BR": "N"}},
-        obs={},
-        t0=0.0,
-        t1=65.0,
-        problems=[],
-        work_dir=tmp_path,
-        models=None if case == "offline" else models_stub(),
-        turns=[
-            Turn(0, "S", "draw", None, 20.0),
-            Turn(1, "W", "draw", None, 30.0),
-            Turn(2, "S", "draw", None, 50.0),
-            Turn(3, "W", "draw", None, 60.0),
-        ],
-        riichi_alternatives=[],
-        _apply_hand_facts=lambda _model: None,
-        _result_constraint=lambda _model: None,
-    )
+    turns = [
+        Turn(0, "S", "draw", None, 20.0),
+        Turn(1, "W", "draw", None, 30.0),
+        Turn(2, "S", "draw", None, 50.0),
+        Turn(3, "W", "draw", None, 60.0),
+    ]
+    searcher = factories.search(model, turns)
     searched = []
 
-    def search(prior: "Solution | None" = None) -> "Solution":
+    def search(prior: Solution | None = None) -> Solution:
         # Confirm the accepted observations really enter the CP objective;
         # do not rely on a list-length assertion alone to establish usefulness.
-        program = decoder.model.build()[0]
+        program = model.build().model
         searched.append({"prior": prior, "terms": len(program.proto.objective.vars)})
         return first if len(searched) == 1 else second
 
-    monkeypatch.setattr(decoder, "_solve", search)
-    real_draws = dense.draws
-    pin_counts = []
-
-    monkeypatch.setattr(dense, "draws", record_results(real_draws, pin_counts))
-    decode.HandDecoder._fit_evidence(decoder)
+    monkeypatch.setattr(searcher, "solve", search)
+    report = Report()
+    sol, _ = fit_evidence(
+        searcher,
+        factories.hand(t1=65.0),
+        factories.sequence(turns),
+        factories.riichi(),
+        melds_before=melds_before,
+        context=DenseContext(
+            entry={"corner_wind": {"TL": "S", "TR": "W", "BL": "E", "BR": "N"}},
+            models=None if case == "offline" else models_stub(),
+            work_dir=tmp_path,
+            t0=0.0,
+            t1=65.0,
+            diagnostics=report.diagnostics,
+        ),
+        report=report,
+    )
     assert len(searched) == expected_solves
-    assert pin_counts == ([] if pinned is None else [pinned])
-    assert decoder.sol is (second if expected_solves == 2 else first)
+    # the diagnosis says how many of the reread draws a still view pins
+    assert report.diagnostics == (
+        []
+        if pinned is None
+        else [
+            f"dense hand reads for 1 uncertain draws: still views pin {pinned} of them"
+        ]
+    )
+    assert report.items == report.notes == []
+    assert sol is (second if expected_solves == 2 else first)
     if expected_solves == 2:
         assert searched[1]["prior"] is first
         assert searched[1]["terms"] > searched[0]["terms"]
         if case == "subset":
-            assert decoder.model.hand_ev
-            assert all(e.subset for e in decoder.model.hand_ev)
+            assert model.hand_ev
+            assert all(e.subset for e in model.hand_ev)
         elif case == "hidden":
-            assert all(e.hidden == 2 for e in decoder.model.hand_ev)
+            assert all(e.hidden == 2 for e in model.hand_ev)
         elif case == "draw":
-            assert decoder.model.draw_ev
+            assert model.draw_ev
     else:
-        assert not decoder.model.hand_ev
-        assert not decoder.model.draw_ev
+        assert not model.hand_ev
+        assert not model.draw_ev
     if case in ("not_selected", "offline"):
         assert reads == []
 

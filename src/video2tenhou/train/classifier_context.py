@@ -22,7 +22,6 @@ import argparse
 import json
 import logging
 import random
-import re
 import shutil
 import time
 from collections import Counter
@@ -36,20 +35,26 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
+from video2tenhou.cache import source_identity
+from video2tenhou.files import atomic_write_json, atomic_write_text
 from video2tenhou.files import sha256_file as file_hash
-from video2tenhou.layout import Calibration, fit_path, quad_to_box
+from video2tenhou.layout import Calibration, fit_path
 from video2tenhou.logging_setup import RESULT, command_logging
+from video2tenhou.perception.classifier import make_model, to_tensor
+from video2tenhou.perception.crops import region_upright, to_crop
+from video2tenhou.perception.tiles import CLASSES
 
 from .data import (
-    CLASSES,
     HELD_OUT_HANDS,
+    annotation_key,
+    annotation_key_of,
+    clipped_box,
     hand_of,
     hand_table,
+    held_out,
     load_labels,
-    region_upright,
-    to_crop,
 )
-from .train_classifier import Crops, make_model, predict_logits, to_tensor
+from .train_classifier import Crops, predict_logits
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -60,40 +65,20 @@ MIN_CONTEXT_SIDE = 8
 LOGGER = logging.getLogger("video2tenhou.train.classifier_context")
 
 
-def _key(annotation: dict) -> str:
-    return f"{annotation['kind']}_{annotation['corner']}_{round(annotation['t'])}"
-
-
-def _image_key(path: str | Path) -> str:
-    # Source manifests can have been written on Windows or POSIX.
-    name = re.split(r"[\\/]", str(path))[-1]
-    match = re.match(r"(hand|pond|meld)_(TL|TR|BL|BR)_\d+", name)
-    if not match:
-        msg = f"Cannot locate original human annotation for {path}"
-        raise ValueError(msg)
-    return match.group()
-
-
 def _json(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        msg = f"Expected a metadata object: {path}"
-        raise TypeError(msg)
+        raise TypeError(f"Expected a metadata object: {path}")
     return data
-
-
-def _write_json(path: Path, data: object) -> None:
-    Path(path).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def _annotation_index(labels: list[dict], hands: list[dict]) -> dict:
     """Bind rounded source keys to exact annotation times and hand splits."""
     annotations = {}
     for annotation in labels:
-        key = _key(annotation)
+        key = annotation_key(annotation)
         if key in annotations:
-            msg = f"Ambiguous rounded annotation key: {key}"
-            raise ValueError(msg)
+            raise ValueError(f"Ambiguous rounded annotation key: {key}")
         annotations[key] = annotation
     return {
         key: {"t": d["t"], "hand": hand_of(d["t"], hands)}
@@ -109,12 +94,14 @@ def _eligible_contexts(human_manifest: Path, index: dict) -> set[str]:
         if row.get("split") != "train":
             continue
         if row.get("origin") != "human" or row.get("reviewed") is not True:
-            msg = "Context input must contain only reviewed human TRAIN rows"
-            raise ValueError(msg)
-        key = _image_key(row["source"])
-        if key not in index or index[key]["hand"] in HELD_OUT_HANDS:
-            msg = f"Human TRAIN row has missing or held-out annotation: {key}"
-            raise ValueError(msg)
+            raise ValueError(
+                "Context input must contain only reviewed human TRAIN rows"
+            )
+        key = annotation_key_of(row["source"])
+        if key not in index or held_out(index[key]["hand"]):
+            raise ValueError(
+                f"Human TRAIN row has missing or held-out annotation: {key}"
+            )
         eligible.add(key)
     return eligible
 
@@ -127,10 +114,11 @@ def _anchor_rows(anchors: Path, index: dict, video: Path) -> tuple[list[dict], C
         if not folder.is_dir() or folder.name not in CLASSES:
             continue
         for image in sorted(folder.glob("*.png")):
-            key = _image_key(image)
-            if key not in index or index[key]["hand"] in HELD_OUT_HANDS:
-                msg = f"Anchor belongs to missing or held-out annotation: {image}"
-                raise ValueError(msg)
+            key = annotation_key_of(image)
+            if key not in index or held_out(index[key]["hand"]):
+                raise ValueError(
+                    f"Anchor belongs to missing or held-out annotation: {image}"
+                )
             hand = index[key]["hand"]
             rows.append(
                 {
@@ -146,85 +134,48 @@ def _anchor_rows(anchors: Path, index: dict, video: Path) -> tuple[list[dict], C
             )
             counts["anchors"] += 1
     if not rows:
-        msg = "The original human anchor corpus is empty"
-        raise ValueError(msg)
+        raise ValueError("The original human anchor corpus is empty")
     return rows, counts
 
 
-@dataclass(frozen=True)
-class ContextSource:
-    """Recording, cached frames and measured layout used to crop contexts."""
-
-    video: Path
-    work: Path
-    calib: str | Path = "pml"
-
-
-@dataclass
-class ContextWriter:
-    """Write context patches while retaining exact human and frame provenance."""
-
-    output: Path
-    video: Path
-    work: Path
-    cal: Calibration
-    index: dict
-    rows: list[dict]
-    counts: Counter
-    frame_hashes: dict[str, str]
-
-    def write(self, d: dict) -> None:
-        """Crop one eligible annotation in its original box order."""
-        key = _key(d)
-        frame_path = self.work / self.video.stem / "frames" / f"{d['t']:.3f}.png"
-        frame = cv2.imread(str(frame_path))
-        if frame is None:
-            msg = f"Missing cached lossless frame: {frame_path}"
-            raise ValueError(msg)
-        image, transform = region_upright(frame, self.cal, d["kind"], d["corner"])
-        height, width = image.shape[:2]
-        for i, box in enumerate(d["boxes"]):
-            if box["tile"] not in CLASSES or box["tile"] in ("X", "none"):
-                continue
-            x0, y0, x1, y1 = quad_to_box(transform, box["quad"])
-            x0, y0, x1, y1 = (
-                max(0.0, x0),
-                max(0.0, y0),
-                min(float(width), x1),
-                min(float(height), y1),
-            )
-            w, h = x1 - x0, y1 - y0
-            if min(w, h) < MIN_CONTEXT_SIDE:
-                self.counts["too_small_excluded"] += 1
-                continue
-            a, b = int(max(0, x0 - 0.35 * w)), int(max(0, y0 - 0.35 * h))
-            c, e = int(min(width, x1 + 0.35 * w)), int(min(height, y1 + 0.35 * h))
-            path = self.output / "contexts" / f"{key}_{i:02d}.png"
-            if not cv2.imwrite(str(path), image[b:e, a:c]):
-                msg = f"Could not save context patch: {path}"
-                raise OSError(msg)
-            if str(frame_path) not in self.frame_hashes:
-                self.frame_hashes[str(frame_path)] = file_hash(frame_path)
-            self.rows.append(
-                {
-                    "kind": "context",
-                    "image": str(path),
-                    "sha256": file_hash(path),
-                    "tile": box["tile"],
-                    "sideways": bool(box.get("sideways", False)),
-                    "box": [x0 - a, y0 - b, x1 - a, y1 - b],
-                    "group": f"{self.video.stem}:hand:{self.index[key]['hand']}",
-                    "annotation": key,
-                    "t": d["t"],
-                    "box_index": i,
-                    "quad": box["quad"],
-                    "frame_sha256": self.frame_hashes[str(frame_path)],
-                    "transform": transform.tolist(),
-                    "reviewed": True,
-                }
-            )
-            self.counts["contexts"] += 1
-            self.counts[f"context_{d['kind']}"] += 1
+def _context_patches(
+    d: dict, image: np.ndarray, transform: np.ndarray, contexts: Path, counts: Counter
+) -> list[dict]:
+    """Save a padded patch around each known-face box, in the annotation's order."""
+    height, width = image.shape[:2]
+    rows = []
+    for i, box in enumerate(d["boxes"]):
+        if box["tile"] not in CLASSES or box["tile"] in ("X", "none"):
+            continue
+        x0, y0, x1, y1 = clipped_box(transform, box["quad"], width, height)
+        w, h = x1 - x0, y1 - y0
+        if min(w, h) < MIN_CONTEXT_SIDE:
+            counts["too_small_excluded"] += 1
+            continue
+        a, b = int(max(0, x0 - 0.35 * w)), int(max(0, y0 - 0.35 * h))
+        c, e = int(min(width, x1 + 0.35 * w)), int(min(height, y1 + 0.35 * h))
+        path = contexts / f"{annotation_key(d)}_{i:02d}.png"
+        if not cv2.imwrite(str(path), image[b:e, a:c]):
+            raise OSError(f"Could not save context patch: {path}")
+        rows.append(
+            {
+                "kind": "context",
+                "image": str(path),
+                "sha256": file_hash(path),
+                "tile": box["tile"],
+                "sideways": bool(box.get("sideways", False)),
+                "box": [x0 - a, y0 - b, x1 - a, y1 - b],
+                "annotation": annotation_key(d),
+                "t": d["t"],
+                "box_index": i,
+                "quad": box["quad"],
+                "transform": transform.tolist(),
+                "reviewed": True,
+            }
+        )
+        counts["contexts"] += 1
+        counts[f"context_{d['kind']}"] += 1
+    return rows
 
 
 def build_context_dataset(
@@ -232,7 +183,9 @@ def build_context_dataset(
     human_manifest: Path,
     output: Path,
     *,
-    source: ContextSource,
+    video: Path,
+    work: Path,
+    calib: str | Path = "pml",
 ) -> dict:
     """Build new context patches from cached lossless frames and reviewed quads.
 
@@ -243,7 +196,6 @@ def build_context_dataset(
     Anchor files are referenced with content hashes, never recropped or changed.
     The output records annotation, frame, geometry, video and source identities.
     """
-    video, work, calib = source.video, source.work, source.calib
     anchors, human_manifest, output, video, work = (
         Path(p).resolve() for p in (anchors, human_manifest, output, video, work)
     )
@@ -263,7 +215,7 @@ def build_context_dataset(
         "classes": CLASSES,
         "held_out_hands": HELD_OUT_HANDS,
         "video": str(video),
-        "video_sha256": file_hash(video),
+        "video_sha256": source_identity(video),
         "annotations": index,
         "human_manifest_sha256": file_hash(human_manifest),
         "anchors": str(anchors),
@@ -278,13 +230,29 @@ def build_context_dataset(
             " labels. Rounded filenames never determine the hand split."
         ),
     }
-    _write_json(output / "provenance.json", report)
-    writer = ContextWriter(output, video, work, cal, index, rows, counts, frame_hashes)
+    atomic_write_json(output / "provenance.json", report, indent=2)
     for d in labels:  # Preserve the recorded recipe's annotation order.
-        if _key(d) in eligible and d["boxes"]:
-            writer.write(d)
-    (output / "manifest.jsonl").write_text(
-        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        key = annotation_key(d)
+        if key not in eligible or not d["boxes"]:
+            continue
+        frame_path = work / video.stem / "frames" / f"{d['t']:.3f}.png"
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            raise ValueError(f"Missing cached lossless frame: {frame_path}")
+        image, transform = region_upright(frame, cal, d["kind"], d["corner"])
+        patches = _context_patches(d, image, transform, output / "contexts", counts)
+        if patches and str(frame_path) not in frame_hashes:
+            frame_hashes[str(frame_path)] = file_hash(frame_path)
+        rows += [
+            row
+            | {
+                "group": f"{video.stem}:hand:{index[key]['hand']}",
+                "frame_sha256": frame_hashes[str(frame_path)],
+            }
+            for row in patches
+        ]
+    atomic_write_text(
+        output / "manifest.jsonl", "".join(json.dumps(row) + "\n" for row in rows)
     )
     report.update(
         complete=True,
@@ -292,7 +260,7 @@ def build_context_dataset(
         frames=frame_hashes,
         manifest_sha256=file_hash(output / "manifest.jsonl"),
     )
-    _write_json(output / "provenance.json", report)
+    atomic_write_json(output / "provenance.json", report, indent=2)
     return report
 
 
@@ -328,8 +296,7 @@ def context_crop(image: np.ndarray, row: dict, rng: CropRandom = random) -> np.n
     )
     image = image[b:d, a:c]
     if min(image.shape[:2]) < MIN_CONTEXT_SIDE:
-        msg = "Augmented context is too small"
-        raise ValueError(msg)
+        raise ValueError("Augmented context is too small")
     if row["sideways"]:
         image = cv2.rotate(
             image, rng.choice([cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE])
@@ -350,17 +317,12 @@ class ContextInputs(Dataset):
                 or row.get("tile") not in CLASSES
                 or (row["kind"] == "context" and row["tile"] in ("X", "none"))
             ):
-                msg = "Expected reviewed anchors or known-face contexts"
-                raise ValueError(msg)
+                raise ValueError("Expected reviewed anchors or known-face contexts")
             if file_hash(Path(row["image"])) != row["sha256"]:
-                msg = f"Training image changed: {row['image']}"
-                raise ValueError(msg)
+                raise ValueError(f"Training image changed: {row['image']}")
 
     def __len__(self) -> int:
-        """Return the number of anchor/context rows sampled per epoch.
-
-        Number of anchor/context rows sampled per training epoch.
-        """
+        """Return the number of anchor/context rows sampled per training epoch."""
         return len(self.rows)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int, bool]:
@@ -368,8 +330,7 @@ class ContextInputs(Dataset):
         row = self.rows[index]
         image = cv2.imread(row["image"])
         if image is None:
-            msg = f"Unreadable training image: {row['image']}"
-            raise ValueError(msg)
+            raise ValueError(f"Unreadable training image: {row['image']}")
         image = context_crop(image, row)
         return (
             to_tensor(to_crop(image)),
@@ -444,14 +405,14 @@ def _refinement_inputs(data: Path, validation: Path, base: Path) -> RefinementIn
     if not provenance.get("complete") or provenance["manifest_sha256"] != file_hash(
         data / "manifest.jsonl"
     ):
-        msg = "Use a complete, unmodified context dataset"
-        raise ValueError(msg)
+        raise ValueError("Use a complete, unmodified context dataset")
     annotation_index = provenance["annotations"]
     for row in rows:
         identity = annotation_index[row["annotation"]]
-        if identity["hand"] in HELD_OUT_HANDS or row["t"] != identity["t"]:
-            msg = "Training input violates the original annotation hand split"
-            raise ValueError(msg)
+        if held_out(identity["hand"]) or row["t"] != identity["t"]:
+            raise ValueError(
+                "Training input violates the original annotation hand split"
+            )
     dataset = ContextInputs(rows)
     counts = Counter(row["tile"] for row in rows)
     weights = [1 / np.sqrt(counts[row["tile"]]) for row in rows]
@@ -463,17 +424,12 @@ def _refinement_inputs(data: Path, validation: Path, base: Path) -> RefinementIn
     )
     val = Crops(validation, augment=False)
     if not len(val):
-        msg = "Validation crops are empty"
-        raise ValueError(msg)
+        raise ValueError("Validation crops are empty")
     validation_files = {}
     for path, _, _ in val.items:
-        key = _image_key(path)
-        if (
-            key not in annotation_index
-            or annotation_index[key]["hand"] not in HELD_OUT_HANDS
-        ):
-            msg = f"Validation crop is not in a held-out hand: {path}"
-            raise ValueError(msg)
+        key = annotation_key_of(path)
+        if key not in annotation_index or not held_out(annotation_index[key]["hand"]):
+            raise ValueError(f"Validation crop is not in a held-out hand: {path}")
         validation_files[str(path)] = file_hash(path)
     val_loader = DataLoader(val, batch_size=256, num_workers=0)
     meta = _json(base / "meta.json")
@@ -482,77 +438,73 @@ def _refinement_inputs(data: Path, validation: Path, base: Path) -> RefinementIn
         or not np.isfinite(meta["temperature"])
         or meta["temperature"] <= 0
     ):
-        msg = "Base classifier metadata has incompatible classes or temperature"
-        raise ValueError(msg)
+        raise ValueError(
+            "Base classifier metadata has incompatible classes or temperature"
+        )
     return RefinementInputs(rows, loader, val, val_loader, meta, validation_files)
 
 
-@dataclass
-class RefinementCheckpoints:
-    """Publish each epoch with exact reference and held-out comparison evidence."""
-
-    model: nn.Module
-    val_loader: DataLoader
-    device: str
-    output: Path
-    meta: dict
-    rows: list[dict]
-    val: Crops
-    report: dict
-
-    def save(self, epoch: int, mean_loss: float, before: torch.Tensor) -> dict:
-        """Write weights, unchanged temperature metadata and paired validation."""
-        self.model.eval()
-        logits, targets, views = predict_logits(
-            self.model, self.val_loader, self.device
-        )
-        after = logits.argmax(1) == targets
-        losses, gains = (
-            (before & ~after).nonzero().flatten().tolist(),
-            (~before & after).nonzero().flatten().tolist(),
-        )
-        target = self.output / f"epoch_{epoch}"
-        target.mkdir()
-        torch.save(self.model.state_dict(), target / "weights.pt")
-        new_meta = dict(self.meta)
-        new_meta.update(
-            val_acc=float(after.float().mean()),
-            train_crops=len(self.rows),
-            val_crops=len(self.val),
-            per_view={
-                kind: {
-                    "acc": sum(bool(after[i]) for i, k in enumerate(views) if k == kind)
-                    / views.count(kind),
-                    "n": views.count(kind),
-                }
-                for kind in set(views)
-            },
-        )
-        new_meta.pop("top_confusions", None)
-        new_meta["refinement"] = {
-            "base_weights_sha256": self.report["base_weights_sha256"],
-            "dataset_manifest_sha256": self.report["data_manifest_sha256"],
-            "epoch": epoch,
-            "temperature_policy": (
-                "Unchanged original temperature to isolate logit changes"
-            ),
-        }
-        _write_json(target / "meta.json", new_meta)
-        row = {
-            "epoch": epoch,
-            "loss": mean_loss,
-            "validation_correct": int(after.sum()),
-            "lost_original_correct": [str(self.val.items[i][0]) for i in losses],
-            "gained": [str(self.val.items[i][0]) for i in gains],
-            "weights_sha256": file_hash(target / "weights.pt"),
-        }
-        self.report["epochs"].append(row)
-        _write_json(
-            target / "provenance.json",
-            {**self.report, "checkpoint_epoch": epoch, "checkpoint_complete": True},
-        )
-        _write_json(self.output / "provenance.json", self.report)
-        return row
+def _save_epoch(
+    model: nn.Module,
+    inputs: RefinementInputs,
+    output: Path,
+    report: dict,
+    *,
+    epoch: int,
+    mean_loss: float,
+    before: torch.Tensor,
+    device: str,
+) -> dict:
+    """Publish an epoch's weights, unchanged temperature and paired validation."""
+    model.eval()
+    val = inputs.val
+    logits, targets, views = predict_logits(model, inputs.val_loader, device)
+    after = logits.argmax(1) == targets
+    losses, gains = (
+        (before & ~after).nonzero().flatten().tolist(),
+        (~before & after).nonzero().flatten().tolist(),
+    )
+    target = output / f"epoch_{epoch}"
+    target.mkdir()
+    torch.save(model.state_dict(), target / "weights.pt")
+    new_meta = dict(inputs.meta)
+    new_meta.update(
+        val_acc=float(after.float().mean()),
+        train_crops=len(inputs.rows),
+        val_crops=len(val),
+        per_view={
+            kind: {
+                "acc": sum(bool(after[i]) for i, k in enumerate(views) if k == kind)
+                / views.count(kind),
+                "n": views.count(kind),
+            }
+            for kind in set(views)
+        },
+    )
+    new_meta.pop("top_confusions", None)
+    new_meta["refinement"] = {
+        "base_weights_sha256": report["base_weights_sha256"],
+        "dataset_manifest_sha256": report["data_manifest_sha256"],
+        "epoch": epoch,
+        "temperature_policy": "Unchanged original temperature to isolate logit changes",
+    }
+    atomic_write_json(target / "meta.json", new_meta, indent=2)
+    row = {
+        "epoch": epoch,
+        "loss": mean_loss,
+        "validation_correct": int(after.sum()),
+        "lost_original_correct": [str(val.items[i][0]) for i in losses],
+        "gained": [str(val.items[i][0]) for i in gains],
+        "weights_sha256": file_hash(target / "weights.pt"),
+    }
+    report["epochs"].append(row)
+    atomic_write_json(
+        target / "provenance.json",
+        {**report, "checkpoint_epoch": epoch, "checkpoint_complete": True},
+        indent=2,
+    )
+    atomic_write_json(output / "provenance.json", report, indent=2)
+    return row
 
 
 def train_refinement(
@@ -580,14 +532,6 @@ def train_refinement(
     torch.set_num_threads(8)
     cv2.setNumThreads(1)
     inputs = _refinement_inputs(data, validation, base)
-    rows, loader, val, val_loader, meta, validation_files = (
-        inputs.rows,
-        inputs.loader,
-        inputs.val,
-        inputs.val_loader,
-        inputs.meta,
-        inputs.validation_files,
-    )
     model = make_model(len(CLASSES))
     model.load_state_dict(
         torch.load(base / "weights.pt", map_location="cpu", weights_only=True)
@@ -599,14 +543,14 @@ def train_refinement(
     )
     teacher.to(device).eval()
     teacher.requires_grad_(requires_grad=False)
-    initial, labels, _ = predict_logits(model, val_loader, device)
+    initial, labels, _ = predict_logits(model, inputs.val_loader, device)
     before = initial.argmax(1) == labels
     report = {
         "complete": False,
         "base_weights_sha256": file_hash(base / "weights.pt"),
         "base_metadata_sha256": file_hash(base / "meta.json"),
         "data_manifest_sha256": file_hash(data / "manifest.jsonl"),
-        "validation": validation_files,
+        "validation": inputs.validation_files,
         "teacher": (
             "Immutable reference classifier; identical initialization to student"
         ),
@@ -622,30 +566,27 @@ def train_refinement(
             "batchnorm": "frozen_running_statistics",
             "margin_fraction": [0, 0.20],
             "center_shift_fraction": [-0.06, 0.06],
-            "temperature": meta["temperature"],
+            "temperature": inputs.meta["temperature"],
             "distillation_temperature": 2.0,
             "distillation_weight": 4.0,
             "distillation_scope": "unchanged human anchors only",
             "device": str(device),
         },
         "baseline_validation_correct": int(before.sum()),
-        "validation_count": len(val),
+        "validation_count": len(inputs.val),
         "epochs": [],
     }
     output.mkdir(parents=True, exist_ok=False)
     shutil.copy2(Path(__file__), output / "recipe.py")
     shutil.copy2(data / "provenance.json", output / "dataset-provenance.json")
-    _write_json(output / "provenance.json", report)
-    checkpoints = RefinementCheckpoints(
-        model, val_loader, device, output, meta, rows, val, report
-    )
+    atomic_write_json(output / "provenance.json", report, indent=2)
     started = time.perf_counter()
     try:
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
         for epoch in range(1, 4):
             freeze_batchnorm_statistics(model)
             total, n = 0.0, 0
-            for batch_images, batch_labels, batch_anchors in loader:
+            for batch_images, batch_labels, batch_anchors in inputs.loader:
                 images, labels, anchors = (
                     batch_images.to(device),
                     batch_labels.to(device),
@@ -658,18 +599,26 @@ def train_refinement(
                 optimizer.step()
                 total += loss.item() * len(labels)
                 n += len(labels)
-            row = checkpoints.save(epoch, total / n, before)
+            row = _save_epoch(
+                model,
+                inputs,
+                output,
+                report,
+                epoch=epoch,
+                mean_loss=total / n,
+                before=before,
+                device=device,
+            )
             LOGGER.info("%s", json.dumps(row))
         if (
             file_hash(base / "weights.pt") != report["base_weights_sha256"]
             or file_hash(base / "meta.json") != report["base_metadata_sha256"]
         ):
-            msg = "Reference teacher checkpoint changed during refinement"
-            raise ValueError(msg)
+            raise ValueError("Reference teacher checkpoint changed during refinement")
         report["complete"] = True
     finally:
         report["elapsed_seconds"] = time.perf_counter() - started
-        _write_json(output / "provenance.json", report)
+        atomic_write_json(output / "provenance.json", report, indent=2)
     return report
 
 
@@ -692,7 +641,9 @@ def main(argv: list[str] | None = None) -> None:
             args.anchors,
             args.human_manifest,
             args.out,
-            source=ContextSource(video=args.video, work=args.work, calib=args.calib),
+            video=args.video,
+            work=args.work,
+            calib=args.calib,
         )
         RESULT.info("%s", json.dumps(report["counts"], indent=2))
     else:

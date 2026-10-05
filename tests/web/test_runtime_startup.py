@@ -3,6 +3,8 @@
 
 """The studio verifies its device and models before any jobs can be started."""
 
+from __future__ import annotations
+
 import os
 from argparse import Namespace
 
@@ -15,7 +17,7 @@ from video2tenhou.tool import server
 
 
 @pytest.fixture(autouse=True)
-def isolated_model_loaders(monkeypatch: "pytest.MonkeyPatch") -> None:
+def isolated_model_loaders(monkeypatch: pytest.MonkeyPatch) -> None:
     """Replace model loading while retaining runtime startup behavior."""
     monkeypatch.setenv("VIDEO2TENHOU_DEVICE", "auto")
     monkeypatch.setattr(detector, "Detector", object)
@@ -23,9 +25,8 @@ def isolated_model_loaders(monkeypatch: "pytest.MonkeyPatch") -> None:
 
 
 def test_checked_device_is_inherited_by_jobs(
-    monkeypatch: "pytest.MonkeyPatch", capsys: "pytest.CaptureFixture[str]"
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Verify checked device is inherited by jobs."""
     monkeypatch.setenv("VIDEO2TENHOU_DEVICE", "auto")
     monkeypatch.setattr(device, "select_device", lambda: "cpu")
     calls = []
@@ -40,13 +41,10 @@ def test_checked_device_is_inherited_by_jobs(
 
 
 def test_unusable_explicit_device_stops_before_studio(
-    monkeypatch: "pytest.MonkeyPatch",
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify unusable explicit device stops before studio."""
-
     def fail() -> None:
-        msg = "GPU kernel check failed"
-        raise RuntimeError(msg)
+        raise RuntimeError("GPU kernel check failed")
 
     monkeypatch.setattr(device, "select_device", fail)
     monkeypatch.setattr(

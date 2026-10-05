@@ -3,6 +3,8 @@
 
 """Partial views cannot turn alternatives for one box into two visible tiles."""
 
+from __future__ import annotations
+
 import gzip
 import json
 
@@ -10,10 +12,10 @@ import numpy as np
 import pytest
 from ortools.sat.python import cp_model
 
+from tests.builders import kinds
 from tests.paths import DATA
 from video2tenhou.engine import rules
 from video2tenhou.engine.solver import (
-    TI,
     TILES,
     HandModel,
     HandRole,
@@ -23,15 +25,7 @@ from video2tenhou.engine.solver import (
 )
 
 
-def posterior(**tiles: "float") -> "np.ndarray":
-    """Create a solver-vocabulary posterior from named tile probabilities."""
-    p = np.zeros(len(TILES))
-    for tile, probability in tiles.items():
-        p[TI[tile]] = probability
-    return p
-
-
-def match_cost(slots: "list[np.ndarray]", tiles: "list[str]") -> "float":
+def match_cost(slots: list[np.ndarray], tiles: list[str]) -> float:
     """Solve the optimal partial-observation assignment cost for a hand."""
     counts = [tiles.count(t) for t in TILES]
     model = cp_model.CpModel()
@@ -43,29 +37,25 @@ def match_cost(slots: "list[np.ndarray]", tiles: "list[str]") -> "float":
 
 
 def test_hidden_copy_cannot_explain_second_alternative_of_same_box() -> None:
-    """Verify hidden copy cannot explain second alternative of same box."""
-    slots = [posterior(**{"5s": 0.63, "8s": 0.37}), posterior(**{"8s": 1})]
+    slots = [kinds({"5s": 0.63, "8s": 0.37}), kinds({"8s": 1})]
     ordinary = match_cost(slots, ["5s", "8s", "7p"])
     phantom = match_cost(slots, ["5s", "8s", "8s"])
     assert ordinary == phantom == pytest.approx(0.37)
 
 
 def test_two_visible_boxes_need_two_copies_and_keep_red_fives_distinct() -> None:
-    """Verify two visible boxes need two copies and keep red fives distinct."""
-    slots = [posterior(**{"0p": 1}), posterior(**{"0p": 1})]
+    slots = [kinds({"0p": 1}), kinds({"0p": 1})]
     assert match_cost(slots, ["0p", "5p"]) == 1
     assert match_cost(slots, ["0p", "0p"]) == 0
 
 
 def test_assignment_can_use_second_choice_without_discarding_box() -> None:
-    """Verify assignment can use second choice without discarding box."""
-    slots = [posterior(**{"5s": 0.63, "8s": 0.37}), posterior(**{"5s": 1})]
+    slots = [kinds({"5s": 0.63, "8s": 0.37}), kinds({"5s": 1})]
     assert match_cost(slots, ["5s", "8s"]) == pytest.approx(0.63)
     assert match_cost(slots, ["5s"]) == 1
 
 
 def test_recorded_partial_rows_do_not_certify_an_unseen_extra_eight() -> None:
-    """Verify recorded partial rows do not certify an unseen extra eight."""
     fixture = DATA / "week11_partial_hand_slots.json.gz"
     data = json.loads(gzip.decompress(fixture.read_bytes()))
     turns = {s: [] for s in rules.SEATS}
@@ -80,9 +70,9 @@ def test_recorded_partial_rows_do_not_certify_an_unseen_extra_eight() -> None:
     assert model.hand_ev
     assert all(ev.slots is not None for ev in model.hand_ev)
     model.facts.draws["S", 0] = "7p"
-    confirmed = model.solve(margins=False, workers=1)
+    confirmed = model.solve(workers=1)
     model.facts.draws["S", 0] = "8s"
-    previous_guess = model.solve(margins=False, workers=1)
+    previous_guess = model.solve(workers=1)
     assert confirmed.ok
     assert previous_guess.ok
     assert previous_guess.objective == pytest.approx(confirmed.objective)

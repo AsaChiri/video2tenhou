@@ -1,249 +1,201 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Correction freshness across hand rebuilds, exported games and server restarts."""
+"""A hand is pending until its decode and the exports reflect its current inputs.
+
+Pending means: no decode, a decode made from other facts (dismissals excluded),
+hand metadata or site result, or exports not built from the current decode file.
+"""
+
+from __future__ import annotations
 
 import json
 import os
-import threading
-from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
+from tests.web.analysis import publish, write_analysis
 from video2tenhou import layout
 from video2tenhou.tool import review_state
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from video2tenhou.tool.processes import ProcessOwner
 
 
 @pytest.fixture
 def review(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
-) -> "Iterator[tuple[review_state.ReviewState, list[float]]]":
-    """Create an isolated review workspace with controlled saved hand data."""
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[review_state.ReviewState]:
+    """Open a recording whose three hands (two games) are decoded and exported."""
     monkeypatch.setattr(review_state, "ROOT", tmp_path)
     monkeypatch.setattr(layout, "LABEL_DIR", tmp_path / "labels")
-    work = tmp_path / "work" / "recording"
-    work.mkdir(parents=True)
-    hands: list[dict] = [
-        {
-            "hand": i,
-            "game": i // 2,
-            "kyoku": i % 2,
-            "honba": 0,
-            "corner_wind": {"TL": "E"},
-        }
-        for i in range(3)
+    write_analysis(tmp_path, "recording", [101, 102], hands_per_game=2)
+    owner = ProcessOwner()
+    yield review_state.ReviewState(
+        tmp_path / "recording.mp4",
+        tmp_path / "work",
+        "pml",
+        tmp_path / "out",
+        owner,
+    )
+    owner.shutdown()
+
+
+def root(state: review_state.ReviewState) -> Path:
+    """Return the data directory that holds this recording's folders."""
+    return state.work.parent.parent
+
+
+def test_answers_and_deletions_are_pending_until_decoded_and_exported(
+    review: review_state.ReviewState,
+) -> None:
+    """Adding or deleting an answer needs a new decode and new exports."""
+    assert review.pending() == []
+    fact = review.add_fact({"hand": 1, "kind": "draw", "seat": "E", "tile": "2p"})
+    assert review.pending() == [1]
+    publish(root(review), "recording", [1])
+    assert review.pending() == []
+    assert review.delete_fact(fact["ts"]) == 1
+    assert review.pending() == [1]
+    publish(root(review), "recording", [1])
+    assert review.pending() == []
+
+
+def test_a_decode_without_matching_exports_is_pending(
+    review: review_state.ReviewState,
+) -> None:
+    """Exports must have been built from the current decode file."""
+    decode = review.decode_path(2)
+    decode.write_text(decode.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    assert review.pending() == [2]
+    (review.out / "export-inputs.json").unlink()
+    assert review.pending() == [0, 1, 2, 3]
+    publish(root(review), "recording", [])
+    assert review.pending() == []
+
+
+def test_a_decode_by_another_decoder_version_is_stale_and_never_shown(
+    review: review_state.ReviewState,
+) -> None:
+    """An older decode format is pending and is neither rendered nor queried."""
+    decode = review.decode_path(1)
+    data = json.loads(decode.read_text(encoding="utf-8"))
+    data.update(
+        decoder_version=data["decoder_version"] - 1,
+        items=[{"kind": "draw", "seat": "E", "j": 0, "text": "Old format"}],
+        score={"yaku": ["Riichi (1)"]},
+    )
+    decode.write_text(json.dumps(data), encoding="utf-8")
+    publish(root(review), "recording", [])
+    assert review.pending() == [1]
+    assert review.all_items() == []
+    assert review.hand_view(1)["decode"] is None
+    row = review.hand_summary()[1]
+    assert (row["pending"], row["status"], row["score"]) == (True, None, None)
+    publish(root(review), "recording", [1])
+    assert review.pending() == []
+
+
+def test_updating_one_hand_leaves_another_answer_pending(
+    review: review_state.ReviewState,
+) -> None:
+    """A rebuild of hand 0 does not acknowledge an answer for hand 1."""
+    for hand in (0, 1):
+        review.add_fact({"hand": hand, "kind": "draw", "seat": "E", "tile": "2p"})
+    publish(root(review), "recording", [0])
+    assert review.pending() == [1]
+
+
+def test_dismissing_a_question_never_requires_an_update(
+    review: review_state.ReviewState,
+) -> None:
+    """A dismissal is review state, not a reconstruction input."""
+    decode = review.decode_path(3)
+    data = json.loads(decode.read_text(encoding="utf-8"))
+    data["items"] = [{"kind": "conflict", "t": 120.4, "text": "Leave or fix."}]
+    decode.write_text(json.dumps(data), encoding="utf-8")
+    publish(root(review), "recording", [])
+    assert [item["id"] for item in review.all_items()] == ["conflict::120"]
+    review.add_fact({"hand": 3, "kind": "dismiss", "item": "conflict::120"})
+    assert review.all_items() == []
+    assert review.pending() == []
+
+
+def test_unambiguous_legacy_notes_dismiss_and_others_are_ignored(
+    review: review_state.ReviewState,
+) -> None:
+    """Saved notes hide only the one question with their text; the journal stays."""
+    decode = review.decode_path(0)
+    data = json.loads(decode.read_text(encoding="utf-8"))
+    data["items"] = [
+        {"kind": "order", "seat": "E", "t": 30, "text": "Which tile?"},
+        {"kind": "call", "seat": "S", "t": 40, "text": "Same"},
+        {"kind": "call", "seat": "W", "t": 50, "text": "Same"},
     ]
-    (work / "hands.json").write_text(json.dumps(hands))
-    state = review_state.ReviewState(
-        tmp_path / "recording.mp4", work.parent, "pml", tmp_path / "out"
-    )
-    clock = [200.0]
-    monkeypatch.setattr(review_state.time, "time", lambda: clock[0])
-    for hand in hands:
-        outputs(state, hand["hand"], 100)
-    yield state, clock
-    state.close()
+    decode.write_text(json.dumps(data), encoding="utf-8")
+    journal = review.labels / "facts.jsonl"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    notes = [
+        {"game": 0, "kyoku": 0, "honba": 0, "kind": "note", "text": text}
+        for text in ("Which tile?", "Same")
+    ]
+    journal.write_text("".join(json.dumps(n) + "\n" for n in notes))
+    before = journal.read_bytes()
+    assert [item["id"] for item in review.all_items()] == ["call:S:40", "call:W:50"]
+    assert journal.read_bytes() == before
 
 
-def write_at(path: "Path", timestamp: "float") -> None:
-    """Write an artifact with a controlled modification timestamp."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{}")
-    os.utime(path, ns=(int(timestamp * 1e9), int(timestamp * 1e9)))
-
-
-def outputs(state: "review_state.ReviewState", hand: "int", timestamp: "float") -> None:
-    """Create hand and game outputs at a controlled rebuild timestamp."""
-    write_at(state.decode_path(hand), timestamp)
-    write_at(state.out / f"g{state.hands[hand]['game']}.json", timestamp)
-
-
-def test_additions_require_both_decode_and_game_export(
-    review: "tuple[review_state.ReviewState, list[float]]",
+def test_new_kinds_are_validated_and_notes_are_not_accepted(
+    review: review_state.ReviewState,
 ) -> None:
-    """Verify additions require both decode and game export."""
-    state, _clock = review
-    assert state.pending_rebuilds() == []
-    state.add_fact({"hand": 0, "kind": "draw", "seat": "E", "tile": "2p"})
-    assert state.pending_rebuilds() == [0]
-    write_at(state.decode_path(0), 210)
-    assert state.pending_rebuilds() == [0]
-    write_at(state.out / "g0.json", 220)
-    assert state.pending_rebuilds() == []
+    """The studio saves answers and dismissals only."""
+    with pytest.raises(ValueError, match="Unsupported answer"):
+        review.add_fact({"hand": 0, "kind": "note", "text": "OK"})
+    with pytest.raises(ValueError, match="question to dismiss"):
+        review.add_fact({"hand": 0, "kind": "dismiss"})
 
 
-def test_deletion_survives_restart_even_when_no_facts_remain(
-    review: "tuple[review_state.ReviewState, list[float]]",
+def test_changed_inputs_hide_hands_until_analysis(
+    review: review_state.ReviewState,
 ) -> None:
-    """Verify deletion survives restart even when no facts remain."""
-    state, clock = review
-    fact = state.add_fact({"hand": 1, "kind": "draw", "tile": "1z"})
-    outputs(state, 1, 210)
-    clock[0] = 220
-    assert state.delete_fact(fact["ts"]) == 1
-    assert state.all_facts() == []
-    reopened = review_state.ReviewState(
-        state.video, state.work.parent, "pml", state.out.parent
-    )
-    try:
-        assert reopened.pending_rebuilds() == [1]
-        outputs(reopened, 1, 230)
-        assert reopened.pending_rebuilds() == []
-    finally:
-        reopened.close()
+    """Changed settings retire the analysis without touching saved answers."""
+    review.add_fact({"hand": 0, "kind": "draw", "seat": "E", "tile": "2p"})
+    (review.work / "inputs.changed").write_text("Analyze again.\n")
+    assert review.hands == []
+    assert review.pending() == []
+    assert len(review.all_facts()) == 1
 
 
-def test_rebuilding_one_hand_does_not_clear_other_hand_in_same_game(
-    review: "tuple[review_state.ReviewState, list[float]]",
-    monkeypatch: "pytest.MonkeyPatch",
+def test_summary_marks_pending_hands_and_reads_each_decode_once(
+    review: review_state.ReviewState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify rebuilding one hand does not clear other hand in same game."""
-    state, clock = review
-    for i in (0, 1):
-        state.add_fact({"hand": i, "kind": "draw", "tile": "2p"})
-    clock[0] = 210
+    """Hand rows carry the pending flag; unchanged files are not parsed again."""
+    review.add_fact({"hand": 2, "kind": "draw", "seat": "E", "tile": "2p"})
+    rows = review.hand_summary()
+    assert [row["pending"] for row in rows] == [False, False, True, False]
+    assert set(rows[0]) == {
+        "hand",
+        "game",
+        "kyoku",
+        "honba",
+        "t_start",
+        "t_end",
+        "status",
+        "pending",
+        "turns",
+        "score",
+    }
+    reads = []
+    original = Path.read_text
 
-    def child(*_unused_args: object, **_unused_kwargs: object) -> "SimpleNamespace":
-        outputs(state, 0, 220)
-        return SimpleNamespace(returncode=0)
+    def read_text(path: Path, encoding: str | None = None) -> str:
+        if path.parent == review.work / "decode":
+            reads.append(path.name)
+        return original(path, encoding)
 
-    monkeypatch.setattr(state.processes, "run", child)
-    state._run_decode("0")
-    assert state.pending_rebuilds() == [1]
-
-
-@pytest.mark.parametrize("remove", [False, True])
-def test_edit_during_rebuild_stays_pending_after_completion_and_restart(
-    *,
-    review: "tuple[review_state.ReviewState, list[float]]",
-    monkeypatch: "pytest.MonkeyPatch",
-    remove: bool,
-) -> None:
-    """Verify edit during rebuild stays pending after completion and restart."""
-    state, clock = review
-    fact = state.add_fact({"hand": 0, "kind": "draw", "tile": "2p"})
-    clock[0] = 210
-    state.jobs["decode_all"] = {"running": True, "started": 205}
-
-    def child(*_unused_args: object, **_unused_kwargs: object) -> "SimpleNamespace":
-        clock[0] = 215
-        if remove:
-            state.delete_fact(fact["ts"])
-        else:
-            state.add_fact({"hand": 0, "kind": "draw", "tile": "1z"})
-        outputs(state, 0, 220)
-        assert state.pending_rebuilds() == [
-            0
-        ]  # Output exists while the old job is still active.
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr(state.processes, "run", child)
-    state._run_decode("all")
-    state.jobs["decode_all"]["running"] = False
-    reopened = review_state.ReviewState(
-        state.video, state.work.parent, "pml", state.out.parent
-    )
-    try:
-        assert reopened.pending_rebuilds() == [0]
-        write_at(
-            reopened.out / "g0.json", 225
-        )  # Another hand's export does not clear this one.
-        assert reopened.pending_rebuilds() == [0]
-        outputs(
-            reopened, 0, 230
-        )  # A later external full rebuild supersedes the receipt.
-        assert reopened.pending_rebuilds() == []
-    finally:
-        reopened.close()
-
-
-def test_failed_rebuild_cannot_acknowledge_partially_written_outputs(
-    review: "tuple[review_state.ReviewState, list[float]]",
-    monkeypatch: "pytest.MonkeyPatch",
-) -> None:
-    """Verify failed rebuild cannot acknowledge partially written outputs."""
-    state, clock = review
-    state.add_fact({"hand": 0, "kind": "draw", "tile": "2p"})
-    clock[0] = 210
-
-    def child(*_unused_args: object, **_unused_kwargs: object) -> "SimpleNamespace":
-        outputs(state, 0, 220)
-        return SimpleNamespace(returncode=1, stderr="export interrupted")
-
-    monkeypatch.setattr(state.processes, "run", child)
-    with pytest.raises(RuntimeError, match="export interrupted"):
-        state._run_decode("0")
-    assert state.pending_rebuilds() == [0]
-    outputs(state, 0, 230)
-    assert state.pending_rebuilds() == []
-
-
-def test_existing_dated_facts_are_detected_without_ledger(
-    review: "tuple[review_state.ReviewState, list[float]]",
-) -> None:
-    """Verify existing dated facts are detected without ledger."""
-    state, _clock = review
-    (state.labels / "facts.jsonl").write_text(
-        json.dumps(
-            {"hand": 99, "game": 1, "kyoku": 0, "honba": 0, "ts": 200, "kind": "note"}
-        )
-        + "\n"
-    )
-    assert state.pending_rebuilds() == [
-        2
-    ]  # Current game/round identity wins over a stale global hand index.
-
-
-@pytest.mark.parametrize("single_hand", [True, False])
-def test_review_jobs_share_exclusion_failure_and_shutdown(
-    *,
-    review: "tuple[review_state.ReviewState, list[float]]",
-    monkeypatch: "pytest.MonkeyPatch",
-    single_hand: bool,
-) -> None:
-    """Verify review jobs share exclusion failure and shutdown."""
-    state, clock = review
-    started, release = threading.Event(), threading.Event()
-
-    def fail(*_unused_args: object) -> None:
-        started.set()
-        assert release.wait(5)
-        msg = "rebuild interrupted"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(state, "_run_decode", fail)
-    launch = (
-        state.start_redecode
-        if single_hand
-        else lambda _: state.start_job("calib", fail)
-    )
-    status = launch(0)
-    try:
-        assert started.wait(5)
-        assert status["key"] == (0 if single_hand else "calib")
-        assert (
-            launch(0) is status
-        )  # Retrying a running job never starts another worker.
-        with pytest.raises(ValueError, match="Another review job"):
-            state.start_redecode(1)
-        with pytest.raises(ValueError, match="Another review job"):
-            state.start_job("check", lambda: None)
-    finally:
-        release.set()
-        for worker in state._threads:
-            worker.join(timeout=5)
-    assert status["running"] is False
-    assert status["error"] == "rebuild interrupted"
-    assert status["done"] == clock[0]
-    assert set(status) == {"key", "running", "started", "done", "error", "result"}
-    state.close()
-    with pytest.raises(ValueError, match="app is closing"):
-        launch(0)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    review.hand_summary()
+    review.hand_summary()
+    os.utime(review.decode_path(0), ns=(1, 1))
+    review.hand_summary()
+    assert reads == ["00.json"]

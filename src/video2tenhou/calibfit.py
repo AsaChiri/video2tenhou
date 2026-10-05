@@ -22,6 +22,7 @@ import json
 import time
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,18 +31,15 @@ import numpy as np
 
 from . import video as videomod
 from .cache import source_identity
-from .files import atomic_write_json
+from .files import atomic_write_json, read_published_text
 from .layout import CALIB_DIR, CORNERS, Calibration, Rect, apply_fit, fit_path
 from .layout import apply as _apply
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 
+    from video2tenhou.perception.detector import Det
     from video2tenhou.perception.reader import RegionDetector
-
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
 
 UNIT_MAX_SATURATION = 80
 UNIT_MAX_BRIGHTNESS = 120
@@ -62,25 +60,18 @@ SPARSE_BORDER_TILE_COUNT = 10
 PLATE_FRAMES = 60  # frames of the median plate: enough to average tiles and arms away
 CHECK_FRAMES = 8  # frames of the border check
 CUT_FRACTION = 0.15  # a box with this much on both sides of a border is cut by it
-CUT_RATE_FAIL = (
-    0.08  # share of cut boxes above which a region fails (with at least two cut)
-)
+# share of cut boxes above which a region fails (with at least two cut)
+CUT_RATE_FAIL = 0.08
 CUT_RATE_HARD = 0.34  # a share this bad fails on one cut alone
-MIN_UNIT_IOU = (
-    0.6  # an overhead fit whose unit match is below this is a failure, not a number
-)
-GHOST_SAT, GHOST_VAL = (
-    70,
-    140,
-)  # a discard's ghost on the plate: white (low saturation, bright)
+# an overhead fit whose unit match is below this is a failure, not a number
+MIN_UNIT_IOU = 0.6
+# a discard's ghost on the plate: white (low saturation, bright)
+GHOST_SAT, GHOST_VAL = 70, 140
 # px² in the de-rotated overhead: a smaller bright component is not a pond's block
 GHOST_MIN_AREA = 400
 UNIT_TEMPLATE = CALIB_DIR / "pml_unit.png"
-GROW = {
-    "pond": 30,
-    "meld": 40,
-    "hand": 40,
-}  # px of margin the check looks at outside each region
+# px of margin the check looks at outside each region
+GROW = {"pond": 30, "meld": 40, "hand": 40}
 
 
 # -- the table plate ------------------------------------------------------------------
@@ -91,6 +82,32 @@ def plate_path(work: Path) -> Path:
     return work / "plate.png"
 
 
+def _plate_signature(video: Path, n: int) -> dict:
+    """Plate inputs: recording contents, sample count and frame size."""
+    return {
+        "sha256": source_identity(video),
+        "samples": n,
+        "frame": [videomod.FRAME_W, videomod.FRAME_H],
+    }
+
+
+def plate_current(video: Path, work: Path, n: int = PLATE_FRAMES) -> bool:
+    """Report whether a saved plate matches the recording, without building one.
+
+    The plate's completion record must name the recording's content digest, sample
+    count and frame size; other recorded keys are ignored.
+    """
+    try:
+        saved = json.loads(read_published_text(work / "plate.meta.json"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeError):
+        return False
+    return (
+        isinstance(saved, dict)
+        and plate_path(work).exists()
+        and all(saved.get(k) == v for k, v in _plate_signature(video, n).items())
+    )
+
+
 def table_plate(
     video: Path,
     work: Path,
@@ -98,51 +115,33 @@ def table_plate(
     *,
     force: bool = False,
 ) -> np.ndarray:
-    """Estimate the stationary table from the median of sampled video frames.
+    """Return the median of `n` frames spread over the video, building it if needed.
 
-    The median of `n` frames spread over the video: the table without the tiles, the
-    hands or the players.
-
-    Everything that moves averages away; the felt, the centre unit and the hard borders
-    of every panel the broadcast pastes into the composite stay, and the faint white
-    ghosts inside the overhead are where discards live over the whole video.
+    Everything that moves averages away: tiles, hands and players. The felt, the
+    centre unit and the hard borders of every panel the broadcast pastes into the
+    composite stay, and the faint white ghosts inside the overhead are where discards
+    lie over the whole video. A rebuild removes the old completion record first and
+    writes the new one after the image.
     """
     p = plate_path(work)
-    source = Path(video).resolve()
-    stat = source.stat()
-    signature = {
-        "version": 1,
-        "source": str(source),
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-        "samples": n,
-        "sha256": source_identity(source),
-        "frame": [videomod.FRAME_W, videomod.FRAME_H],
-    }
-    manifest = work / "plate.meta.json"
-    try:
-        matching = json.loads(manifest.read_text(encoding="utf-8")) == signature
-    except (FileNotFoundError, json.JSONDecodeError, UnicodeError):
-        matching = False
-    if p.exists() and matching and not force:
+    if not force and plate_current(video, work, n):
         img = cv2.imread(str(p))
         if img is not None:
             return img
-    info = videomod.probe(str(video))
-    a = 0.05 * info.duration
-    b = 0.95 * info.duration
-    frames = []
-    for t in np.linspace(a, b, n):
-        f = videomod.frame_at(str(video), float(t))
-        if f is not None:
-            frames.append(f)
-    if not frames:
-        msg = f"no frame could be read from {video}"
-        raise RuntimeError(msg)
+    duration = videomod.probe(str(video)).duration
+    frames = [
+        videomod.frame_at(str(video), float(t))
+        for t in np.linspace(0.05 * duration, 0.95 * duration, n)
+    ]
     img = np.median(np.stack(frames), 0).astype(np.uint8)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(p), img)
-    manifest.write_text(json.dumps(signature), encoding="utf-8")
+    manifest = work / "plate.meta.json"
+    manifest.unlink(missing_ok=True)
+    pending = work / ".plate.tmp.png"
+    work.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(pending), img):
+        raise OSError(f"Cannot write the table plate to {pending}")
+    pending.replace(p)
+    atomic_write_json(manifest, _plate_signature(video, n))
     return img
 
 
@@ -154,10 +153,7 @@ def unit_mask(
     center: tuple[float, float] = (960.0, 540.0),
     radius: float = 260.0,
 ) -> np.ndarray:
-    """Find the dark, unsaturated centre unit in the overhead frame.
-
-    The centre unit of the table: the dark, unsaturated block near the middle of the
-    overhead.
+    """Find the table's centre unit: the dark, unsaturated block near the middle.
 
     The overhead shows teal felt and white tiles; the unit is the only dark thing in it,
     which is why it is the anchor the fit uses.
@@ -177,11 +173,10 @@ def unit_mask(
         if st[i, 4] > best_area:
             best, best_area = i, int(st[i, 4])
     if not best:
-        msg = (
+        raise RuntimeError(
             "no centre unit found near the middle of the frame: is this the right "
             "layout?"
         )
-        raise RuntimeError(msg)
     return (lab == best).astype(np.uint8)
 
 
@@ -205,10 +200,7 @@ def derotation_of(
 
 
 def unit_template(cal: Calibration) -> np.ndarray:
-    """Return the reference centre-unit mask in overhead coordinates.
-
-    The unit as the layout knows it, in overhead coordinates: the shape a new video is
-    fitted to.
+    """Return the layout's centre-unit mask in overhead coordinates: the fit target.
 
     The stored mask was cut from the reference plate through the reference fit; without
     it the unit rectangle itself is the template, which is a coarser but still workable
@@ -222,6 +214,23 @@ def unit_template(cal: Calibration) -> np.ndarray:
     u = cal.unit
     t[u.y : u.y + u.h, u.x : u.x + u.w] = 1
     return t
+
+
+def write_unit_template(
+    video: Path, cal: Calibration, work: Path, out: Path = UNIT_TEMPLATE
+) -> Path:
+    """Cut a new layout's centre-unit template from a video whose fit is trusted.
+
+    Used when adapting a layout (docs/LAYOUTS.md); review the resulting fit and
+    border checks before shipping the template.
+    """
+    mask = unit_mask(table_plate(video, work))
+    template = cv2.warpAffine(
+        mask, cal.derotation()[:2], (cal.side, cal.side), flags=cv2.INTER_NEAREST
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out), template * 255)
+    return out
 
 
 def _refine_overhead(
@@ -246,10 +255,10 @@ def _refine_overhead(
 
 
 def fit_overhead(plate: np.ndarray, cal: Calibration) -> dict:
-    """Fit overhead centre, angle and scale by matching the centre unit.
+    """Fit the overhead's centre, angle and scale by matching the unit to the template.
 
-    (centre, angle, scale) of the overhead in this video, by matching the unit to the
-    template.
+    A sweep over angle and scale places each candidate by centroid; a hill climb then
+    refines all four numbers. Returns the fit with its unit IoU.
     """
     tmpl = unit_template(cal)
     mask = unit_mask(plate)
@@ -259,11 +268,7 @@ def fit_overhead(plate: np.ndarray, cal: Calibration) -> dict:
     mc = np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]])
 
     def centre_for(angle: float, scale: float) -> np.ndarray:
-        """Find the frame centre that aligns the template and observed centroids.
-
-        The frame point that must sit at the middle of the overhead for the centroids to
-        coincide.
-        """
+        """Frame point at the overhead's middle that makes the centroids coincide."""
         a = np.radians(angle)
         rotation = np.array([[np.cos(a), np.sin(a)], [-np.sin(a), np.cos(a)]])
         return mc - np.linalg.inv(scale * rotation) @ (
@@ -302,19 +307,16 @@ def fit_overhead(plate: np.ndarray, cal: Calibration) -> dict:
 
 
 def tile_rows(
-    dets: list, tol_frac: float = 0.5, max_rows: int = 4
-) -> list[tuple[list, float, float]]:
-    """Group face-up boxes into collinear rows and estimate row geometry.
-
-    Face-up boxes grouped into collinear rows: [(boxes, angle in degrees, median box
-    area)].
+    dets: list[Det], tol_frac: float = 0.5, max_rows: int = 4
+) -> list[tuple[list[Det], float, float]]:
+    """Group boxes into collinear rows: [(boxes, angle in degrees, median box area)].
 
     A corner camera shows its player's hand (face up, nearest, largest), the walls (face
     down) and other players' tiles (far, small). Rows come out of a repeated best-line
     search, so the caller can pick the one the physics names: the biggest tiles are the
     nearest, and the nearest row is the player's own hand.
     """
-    b = [d for d in dets if not d.back and d.conf >= BORDER_DETECTION_CONFIDENCE]
+    b = [d for d in dets if d.conf >= BORDER_DETECTION_CONFIDENCE]
     if len(b) < MIN_TILE_LINE_BOXES:
         return []
     c = np.array(
@@ -322,7 +324,7 @@ def tile_rows(
     )
     hgt = np.array([d.xyxy[3] - d.xyxy[1] for d in b])
     area = np.array([(d.xyxy[2] - d.xyxy[0]) * (d.xyxy[3] - d.xyxy[1]) for d in b])
-    out: list[tuple[list, float, float]] = []
+    out: list[tuple[list[Det], float, float]] = []
     used = np.zeros(len(b), bool)
     for _ in range(max_rows):
         idx = np.nonzero(~used)[0]
@@ -355,16 +357,9 @@ def tile_rows(
 
 
 def fit_hand(
-    video: Path,
-    cal: Calibration,
-    corner: str,
-    det: RegionDetector,
-    times: Iterable[float],
+    rec: Recording, cal: Calibration, corner: str, times: Iterable[float]
 ) -> dict | None:
-    """Fit one player's hand band and roll from observed tile rows.
-
-    One player's hand band and its roll, from the row of their own tiles in their corner
-    camera.
+    """Fit one player's hand band and roll from their own tile row in the corner camera.
 
     The player's hand is the face-up row nearest the camera, so its tiles are the
     largest in the picture; the wall is face down and everyone else's tiles are far. The
@@ -374,11 +369,9 @@ def fit_hand(
     rect = cal.cam[corner]
     boxes: list[tuple[float, float, float, float]] = []
     angles, heights = [], []
+    det = rec.detector
     for t in times:
-        frame = videomod.frame_at(str(video), float(t))
-        if frame is None:
-            continue
-        img, _ = cal.region(frame, f"cam:{corner}")
+        img, _ = cal.region(rec.frame(t), f"cam:{corner}")
         rows = tile_rows(det.predict(img))
         if not rows:
             continue
@@ -461,10 +454,7 @@ def fit_panel(
     plate: np.ndarray,
     rect: Rect,
 ) -> tuple[int, int, int, int] | None:
-    """Find the panel rectangle nearest the layout's expected position.
-
-    The rectangle of the composite panel nearest `rect`, from the hard borders it has on
-    the plate.
+    """Find the composite panel nearest `rect` from its hard borders on the plate.
 
     A pasted panel has four straight borders that are strong along their *whole* length
     (hence the percentile, not the mean: half an edge is some object on the table) and
@@ -555,11 +545,7 @@ class RegionCheck:
         return self.cut / max(1, self.cut + self.held)
 
     def line(self) -> str:
-        """Format a region verdict with counts and corrective guidance.
-
-        Human-readable verdict with counts and the corrective diagnostic, when
-        available.
-        """
+        """Format the verdict with counts and the corrective diagnostic, if any."""
         v = {"ok": "ok   ", "warn": "warn ", "fail": "FAIL "}[self.level]
         if self.region == "overhead":
             return f"  {v} {self.region:12s} {self.note}"
@@ -570,10 +556,10 @@ class RegionCheck:
         ) + (f"  ({self.note})" if self.note else "")
 
     def verdict(self) -> None:
-        """Set the region verdict from its observed tile and clipping counts.
+        """Set ok / warn / fail from the observed tile and clipping counts.
 
-        Ok / warn / fail from the counts. One cut tile in a busy region is a stray box;
-        a quarter of them cut is a region in the wrong place.
+        One cut tile in a busy region is a stray box; a quarter of them cut is a region
+        in the wrong place.
         """
         kind = self.region.partition(":")[0]
         if self.foreign:
@@ -613,10 +599,7 @@ class RegionCheck:
 def grown(
     cal: Calibration, name: str, margin: int
 ) -> tuple[np.ndarray, tuple[float, float, float, float], tuple[int, int]]:
-    """Return a region's expanded transform, inner bounds and image size.
-
-    The region grown by `margin`: its frame->image matrix, the true region's box in that
-    image, its size.
+    """Return the region grown by `margin`: frame->image matrix, true box, image size.
 
     The check looks at a margin outside the region so a tile the border cuts is seen
     whole.
@@ -627,17 +610,12 @@ def grown(
         big = Rect(
             rect.x - margin, rect.y - margin, rect.w + 2 * margin, rect.h + 2 * margin
         )
-        crop, size = cal.crop_rot_scale(
-            big, k, s
-        )  # overhead coordinates -> the grown image
+        # overhead coordinates -> the grown image
+        crop, size = cal.crop_rot_scale(big, k, s)
         transform = crop @ cal.derotation()
         q = _apply(crop, [[rect.x, rect.y], [rect.x + rect.w, rect.y + rect.h]])
     else:
-        rect, s = (
-            cal.hand[corner]
-            if kind == "hand"
-            else (cal.meld[corner] if kind == "meld" else (cal.cam[corner], 1.0))
-        )
+        rect, s = cal.panel(name)
         big = Rect(
             rect.x - margin, rect.y - margin, rect.w + 2 * margin, rect.h + 2 * margin
         )
@@ -652,19 +630,8 @@ def grown(
     return transform, inner, size
 
 
-def render(
-    frame: np.ndarray, transform: np.ndarray, size: tuple[int, int]
-) -> np.ndarray:
-    """Warp BGR pixels with a frame-to-region matrix and output dimensions."""
-    return cv2.warpAffine(frame, transform[:2], size, flags=cv2.INTER_CUBIC)
-
-
 def _cut(box: Sequence[float], inner: Sequence[float]) -> bool | None:
-    """Classify a box as cut, inside or outside the region border.
-
-    True when the border cuts the box, False when it is wholly inside, None when wholly
-    outside.
-    """
+    """Classify a box: True when the border cuts it, False inside, None outside."""
     x0, y0, x1, y1 = box
     a = max(0.0, min(x1, inner[2]) - max(x0, inner[0])) * max(
         0.0, min(y1, inner[3]) - max(y0, inner[1])
@@ -679,12 +646,10 @@ def _cut(box: Sequence[float], inner: Sequence[float]) -> bool | None:
 def pond_blocks(
     plate: np.ndarray, cal: Calibration
 ) -> tuple[np.ndarray, dict[int, str]]:
-    """Assign persistent overhead components to their owning ponds.
+    """Return where each pond's discards lie: (label image, component -> corner).
 
-    Where each pond's discards lie over the whole video: the bright ghosts of the plate,
-    in the de-rotated overhead, as connected components (the centre unit left out), each
-    owned by the pond rectangle that holds most of it. Returns (label image, component
-    -> corner).
+    The bright ghosts of the plate, in the de-rotated overhead, are connected components
+    (the centre unit left out), each owned by the pond rectangle that holds most of it.
     """
     oh = cv2.warpAffine(
         plate, cal.derotation()[:2], (cal.side, cal.side), flags=cv2.INTER_LINEAR
@@ -711,10 +676,7 @@ def pond_blocks(
 
 
 def overhead_check(cal: Calibration) -> RegionCheck:
-    """Reject an overhead fit whose centre-unit overlap is too low.
-
-    The overhead fit itself: a unit match under MIN_UNIT_IOU is a failure (4.2a).
-    """
+    """Fail an overhead fit whose unit match is under MIN_UNIT_IOU (4.2a)."""
     iou = ((cal.fit or {}).get("overhead") or {}).get("iou")
     rc = RegionCheck("overhead")
     if iou is not None and iou < MIN_UNIT_IOU:
@@ -730,61 +692,99 @@ def overhead_check(cal: Calibration) -> RegionCheck:
     return rc
 
 
+class Recording:
+    """A recording and the detector measuring it, with frames decoded once per run.
+
+    Fitting and checking revisit the same few dozen timestamps many times; each is
+    decoded once and kept, read-only, for the lifetime of the instance (about 6 MB
+    per 1080p frame). Table samples are kept per overhead geometry.
+    """
+
+    def __init__(self, video: Path, det: RegionDetector | None = None) -> None:
+        """Start empty frame and table-sample memos; ``det`` is None without models."""
+        self.video = Path(video)
+        self.det = det
+        self.table_samples: dict[tuple, list[dict]] = {}
+        self._frames: dict[float, np.ndarray] = {}
+
+    @cached_property
+    def duration(self) -> float:
+        """Recording duration in seconds."""
+        return videomod.probe(str(self.video)).duration
+
+    @property
+    def detector(self) -> RegionDetector:
+        """The detector; steps that read tiles fail without one."""
+        if self.det is None:
+            raise ValueError("Measuring tiles requires the detector")
+        return self.det
+
+    def frame(self, t: float) -> np.ndarray:
+        """Return the normalized frame at ``t`` seconds; decoder errors propagate."""
+        t = float(t)
+        if t not in self._frames:
+            frame = videomod.frame_at(str(self.video), t)
+            frame.flags.writeable = False
+            self._frames[t] = frame
+        return self._frames[t]
+
+
 def check_all(
-    video: Path, cal: Calibration, det: RegionDetector, work: Path
-) -> list[RegionCheck]:
-    """Check fitted geometry on table tiles and neighbouring pond blocks."""
-    hands = prepare_table_samples(video, cal, det)
-    blocks = pond_blocks(table_plate(video, work), cal)
-    return ([overhead_check(cal)] if cal.fit else []) + check_regions(
-        video, cal, det, hands, options=BorderOptions(blocks=blocks)
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class BorderOptions:
-    """Optional region selection and independently measured pond ownership."""
-
-    names: list[str] | None = None
-    blocks: tuple[np.ndarray, dict[int, str]] | None = None
-
-
-def check_regions(
     video: Path,
     cal: Calibration,
     det: RegionDetector,
+    work: Path,
+    *,
+    recording: Recording | None = None,
+) -> list[RegionCheck]:
+    """Check fitted geometry on table tiles and neighbouring pond blocks.
+
+    ``recording`` reuses the frames and samples of a preceding fit of the same video
+    with the same detector.
+    """
+    rec = recording or Recording(video, det)
+    hands = prepare_table_samples(rec, cal)
+    blocks = pond_blocks(table_plate(video, work), cal)
+    return ([overhead_check(cal)] if cal.fit else []) + check_regions(
+        rec, cal, hands, blocks=blocks
+    )
+
+
+def check_regions(
+    rec: Recording,
+    cal: Calibration,
     hands: list[dict] | None = None,
     *,
-    options: BorderOptions | None = None,
+    names: list[str] | None = None,
+    blocks: tuple[np.ndarray, dict[int, str]] | None = None,
 ) -> list[RegionCheck]:
-    """Count clipped tiles and tiles belonging to neighbouring ponds.
+    """Count tiles each region's border cuts and, with ``blocks``, foreign pond tiles.
 
-    Run the detector on each region grown by a margin and count the tiles its border
-    cuts; with the plate's blocks, also the tiles a pond holds that belong to another
-    pond.
+    The detector reads each region grown by a margin; a pond tile whose centre lies in
+    another pond's plate block is foreign.
     """
-    options = options or BorderOptions()
-    names, blocks = options.names, options.blocks
-    times = check_times(video, hands, CHECK_FRAMES)
+    det = rec.detector
+    times = check_times(rec, hands, CHECK_FRAMES)
     names = names or (
         [f"pond:{c}" for c in CORNERS]
         + [f"meld:{c}" for c in CORNERS]
         + [f"hand:{c}" for c in CORNERS]
     )
     out = {n: RegionCheck(n, frames=len(times)) for n in names}
+    views = {}
+    for n in names:
+        kind = n.partition(":")[0]
+        transform, inner, size = grown(cal, n, GROW[kind])
+        to_overhead = (
+            cal.derotation() @ np.linalg.inv(transform)
+            if kind == "pond" and blocks is not None
+            else None
+        )
+        views[n] = (transform, inner, size, to_overhead)
     for t in times:
-        frame = videomod.frame_at(str(video), float(t))
-        if frame is None:
-            continue
-        for n in names:
-            kind = n.partition(":")[0]
-            transform, inner, size = grown(cal, n, GROW[kind])
-            img = render(frame, transform, size)
-            to_overhead = (
-                cal.derotation() @ np.linalg.inv(transform)
-                if kind == "pond" and blocks is not None
-                else None
-            )
+        frame = rec.frame(t)
+        for n, (transform, inner, size, to_overhead) in views.items():
+            img = cv2.warpAffine(frame, transform[:2], size, flags=cv2.INTER_CUBIC)
             for d in det.predict(img):
                 if d.conf < BORDER_DETECTION_CONFIDENCE:
                     continue
@@ -810,11 +810,7 @@ def _owner(
     to_overhead: np.ndarray,
     box: Sequence[float],
 ) -> str | None:
-    """Return the pond owning a box centre, or None outside every block.
-
-    The pond whose block holds the centre of a box (region pixels), None outside every
-    block.
-    """
+    """Return the pond whose block holds a box's centre, or None outside every block."""
     labels, owner = blocks
     x, y = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
     ox, oy = _apply(to_overhead, [[x, y]])[0]
@@ -823,7 +819,7 @@ def _owner(
     return owner.get(int(labels[int(oy), int(ox)]))
 
 
-def check_times(video: Path, hands: list[dict] | None, k: int) -> list[float]:
+def check_times(rec: Recording, hands: list[dict] | None, k: int) -> list[float]:
     """Sample hand interiors, using coarse inspection when no windows are given."""
     if hands:
         picks = np.linspace(0, len(hands) - 1, min(k, len(hands)))
@@ -834,42 +830,38 @@ def check_times(video: Path, hands: list[dict] | None, k: int) -> list[float]:
             )
             for i in picks
         ]
-    info = videomod.probe(str(video))
-    return [float(t) for t in np.linspace(0.15 * info.duration, 0.9 * info.duration, k)]
+    return [float(t) for t in np.linspace(0.15 * rec.duration, 0.9 * rec.duration, k)]
 
 
 # -- orchestration ---------------------------------------------------------------------
 
 
-def prepare_table_samples(
-    video: Path, cal: Calibration, det: RegionDetector, k: int = 24
-) -> list[dict]:
+def prepare_table_samples(rec: Recording, cal: Calibration, k: int = 24) -> list[dict]:
     """Select tile-bearing table frames for geometry checks, independently of overlays.
 
     These are point samples, not inferred game boundaries. Inspect the whole
     overhead instead of requiring already-correct hand, pond or meld crops.
     Broadcast text and site records have no role in measuring crop borders.
     """
+    key = (cal.center, cal.angle, cal.scale, cal.side, k)
+    if key in rec.table_samples:
+        return rec.table_samples[key]
+    det = rec.detector
     samples = []
-    for t in check_times(video, None, k):
-        frame = videomod.frame_at(str(video), t)
-        if frame is None:
-            continue
-        overhead, _ = cal.region(frame, "overhead")
+    for t in check_times(rec, None, k):
+        overhead, _ = cal.region(rec.frame(t), "overhead")
         tiles = [
-            d
-            for d in det.predict(overhead)
-            if d.conf >= BORDER_DETECTION_CONFIDENCE and not d.back
+            d for d in det.predict(overhead) if d.conf >= BORDER_DETECTION_CONFIDENCE
         ]
         if len(tiles) >= MIN_TILE_LINE_BOXES:
             samples.append({"t_start": t, "t_end": t})
     if not samples:
-        msg = (
+        raise RuntimeError(
             "No table tiles found in the sampled frames. Open Settings -> "
             "Calibration to adjust the table position, then prepare the recording "
             "again."
         )
-        raise RuntimeError(msg)
+    rec.table_samples[key] = samples
     return samples
 
 
@@ -881,16 +873,15 @@ LEVEL_RANK = {"ok": 0, "warn": 1, "fail": 2}
 
 
 def _better(a: RegionCheck, b: RegionCheck) -> bool:
-    """Compare crop verdicts, then visible tile counts and clipped tiles.
+    """Is check `a` a better crop than `b`: verdict, then more tiles held, fewer cut.
 
-    Is check `a` a better crop than `b`? The verdict first, then more tiles held, then
-    fewer cut: a rectangle that sees nothing cuts nothing, and must not win for that.
+    A rectangle that sees nothing cuts nothing, and must not win for that.
     """
     return (LEVEL_RANK[a.level], -a.held, a.cut) < (LEVEL_RANK[b.level], -b.held, b.cut)
 
 
 def _expand_cut_meld(
-    video: Path, cal: Calibration, corner: str, det: RegionDetector, hands: list[dict]
+    rec: Recording, cal: Calibration, corner: str, hands: list[dict]
 ) -> list[int] | None:
     """Propose a bounded expansion from whole boxes cut by an automatic inset fit.
 
@@ -899,15 +890,16 @@ def _expand_cut_meld(
     outside it cannot pull the crop outward. The caller must validate the new
     crop with the ordinary border check before accepting it.
     """
+    det = rec.detector
     name = f"meld:{corner}"
     rect, _ = cal.meld[corner]
     bounds = np.array(rect.xyxy, dtype=float)
     transform, inner, size = grown(cal, name, GROW["meld"])
     inverse = np.linalg.inv(transform)
     changed = False
-    for t in check_times(video, hands, CHECK_FRAMES):
-        frame = videomod.frame_at(str(video), t)
-        for detection in det.predict(render(frame, transform, size)):
+    for t in check_times(rec, hands, CHECK_FRAMES):
+        img = cv2.warpAffine(rec.frame(t), transform[:2], size, flags=cv2.INTER_CUBIC)
+        for detection in det.predict(img):
             if (
                 detection.conf < BORDER_DETECTION_CONFIDENCE
                 or _cut(detection.xyxy, inner) is not True
@@ -936,117 +928,81 @@ def _expand_cut_meld(
     return [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
 
 
-@dataclass(frozen=True, kw_only=True)
-class FitOptions:
-    """Control cache refresh and retain explicitly selected geometry parts."""
+def _fit_hands(rec: Recording, cal: Calibration, hands: list[dict], fit: dict) -> None:
+    """Fit hand bands from repeated tile rows in place; bands people drew are kept."""
+    times = check_times(rec, hands, 10)
+    fitted = Calibration(apply_fit(cal.data, fit))
+    for c in CORNERS:
+        if _is_human(fit, "hand", c):
+            continue
+        r = fit_hand(rec, fitted, c, times)
+        if r:
+            fit.setdefault("hand", {})[c] = {"rect": r["rect"], "roll": r["roll"]}
 
-    force: bool = False
-    keep: Iterable[str] = ()
+
+def _meld_check(
+    rec: Recording, cal: Calibration, hands: list[dict], fit: dict, name: str
+) -> RegionCheck:
+    candidate = Calibration(apply_fit(cal.data, fit))
+    return check_regions(rec, candidate, hands, names=[name])[0]
 
 
-@dataclass
-class GeometryFitter:
-    """Measure camera geometry while retaining human edits and accepted fits."""
-
-    video: Path
-    cal: Calibration
-    det: RegionDetector | None
-    hands: list[dict]
-    fit: dict
-
-    def measure_hands(self) -> None:
-        """Fit unreviewed hand bands from repeated tile rows."""
-        det = self.det
-        if det is None:
-            return
-        times = check_times(self.video, self.hands, 10)
-        cal2 = Calibration(apply_fit(self.cal.data, self.fit))
-        for c in CORNERS:
-            if _is_human(
-                self.fit, "hand", c
-            ):  # a band a person drew is not overwritten by a measurement
-                continue
-            r = fit_hand(self.video, cal2, c, det, times)
-            if r:
-                self.fit.setdefault("hand", {})[c] = {
-                    "rect": r["rect"],
-                    "roll": r["roll"],
+def _fit_melds(
+    rec: Recording, cal: Calibration, hands: list[dict], fit: dict, plate: np.ndarray
+) -> dict:
+    """Return the fit with proposed meld panels accepted where borders improve."""
+    for c in CORNERS:
+        if _is_human(fit, "meld", c):
+            continue
+        r = fit_panel(plate, cal.meld[c][0])
+        if not r:
+            continue
+        cand = {
+            **fit,
+            "meld": {**fit.get("meld", {}), c: {"rect": [int(v) for v in r]}},
+        }
+        if rec.det is None:
+            fit = cand
+            continue
+        name = f"meld:{c}"
+        now = _meld_check(rec, cal, hands, fit, name)
+        new = _meld_check(rec, cal, hands, cand, name)
+        if _better(new, now):
+            fit, now = cand, new
+        if now.level == "fail" and now.cut:
+            measured = Calibration(apply_fit(cal.data, fit))
+            expanded = _expand_cut_meld(rec, measured, c, hands)
+            if expanded:
+                proposal = {
+                    **fit,
+                    "meld": {**fit.get("meld", {}), c: {"rect": expanded}},
                 }
-
-    def measure_melds(self, plate: np.ndarray) -> None:
-        """Accept proposed panels only when their border evidence improves."""
-        det = self.det
-        for c in CORNERS:
-            if _is_human(self.fit, "meld", c):
-                continue
-            r = fit_panel(plate, self.cal.meld[c][0])
-            if not r:
-                continue
-            cand = {
-                **self.fit,
-                "meld": {**self.fit.get("meld", {}), c: {"rect": [int(v) for v in r]}},
-            }
-            if det is None:
-                self.fit = cand
-                continue
-            name = f"meld:{c}"
-            now = check_regions(
-                self.video,
-                Calibration(apply_fit(self.cal.data, self.fit)),
-                det,
-                self.hands,
-                options=BorderOptions(names=[name]),
-            )[0]
-            new_ = check_regions(
-                self.video,
-                Calibration(apply_fit(self.cal.data, cand)),
-                det,
-                self.hands,
-                options=BorderOptions(names=[name]),
-            )[0]
-            if _better(new_, now):
-                self.fit = cand
-                now = new_
-            if now.level == "fail" and now.cut:
-                measured = Calibration(apply_fit(self.cal.data, self.fit))
-                expanded = _expand_cut_meld(self.video, measured, c, det, self.hands)
-                if expanded:
-                    proposal = {
-                        **self.fit,
-                        "meld": {**self.fit.get("meld", {}), c: {"rect": expanded}},
-                    }
-                    check = check_regions(
-                        self.video,
-                        Calibration(apply_fit(self.cal.data, proposal)),
-                        det,
-                        self.hands,
-                        options=BorderOptions(names=[name]),
-                    )[0]
-                    if _better(check, now):
-                        self.fit = proposal
+                if _better(_meld_check(rec, cal, hands, proposal, name), now):
+                    fit = proposal
+    return fit
 
 
 def run_fit(
-    video: Path,
+    rec: Recording,
     cal: Calibration,
     work: Path,
-    det: RegionDetector | None = None,
     *,
-    options: FitOptions | None = None,
+    force: bool = False,
+    keep: Collection[str] = (),
 ) -> dict:
     """Measure this video's geometry and write `labels/<video>/calib.json`.
 
-    `options.keep` names parts a human already set in the tool. A suggested panel
-    rectangle replaces the one in hand only when the border check
+    `keep` names parts a human already set in the tool; ``force`` rebuilds the plate.
+    Without a detector only the overhead and panel suggestions are measured. A
+    suggested panel rectangle replaces the one in hand only when the border check
     prefers it: the plate's borders are a guess, the check is a measurement, and a guess
     that reads worse is not an improvement (DESIGN.md 4.2a).
     """
-    options = options or FitOptions()
     work.mkdir(parents=True, exist_ok=True)
-    plate = table_plate(video, work, force=options.force)
+    plate = table_plate(rec.video, work, force=force)
     old = cal.fit or {}
     fit: dict = {
-        "video": Path(video).stem,
+        "video": rec.video.stem,
         "layout": cal.name,
         "source": "calibfit",
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1054,35 +1010,29 @@ def run_fit(
     fit["overhead"] = (
         old["overhead"]
         if old.get("overhead")
-        and ("overhead" in options.keep or old["overhead"].get("source") == "human")
+        and ("overhead" in keep or old["overhead"].get("source") == "human")
         else fit_overhead(plate, cal)
     )
     for part in ("cam", "hand", "meld"):
         if old.get(part):
             fit[part] = deepcopy(old[part])
     hands = (
-        prepare_table_samples(video, Calibration(apply_fit(cal.data, fit)), det)
-        if det is not None
+        prepare_table_samples(rec, Calibration(apply_fit(cal.data, fit)))
+        if rec.det is not None
         else []
     )
-    fitter = GeometryFitter(video, cal, det, hands, fit)
-    if "hand" not in options.keep:
-        fitter.measure_hands()
-    if "meld" not in options.keep:
-        fitter.measure_melds(plate)
-    fit = fitter.fit
-    p = fit_path(video)
-    atomic_write_json(p, fit, indent=1, retry_windows=True)
+    if rec.det is not None and "hand" not in keep:
+        _fit_hands(rec, cal, hands, fit)
+    if "meld" not in keep:
+        fit = _fit_melds(rec, cal, hands, fit, plate)
+    atomic_write_json(fit_path(rec.video), fit, indent=1, retry_windows=True)
     return fit
 
 
 def fit_sheet(
     video: Path, cal: Calibration, work: Path, checks: list[RegionCheck] | None = None
 ) -> np.ndarray:
-    """Draw fitted geometry alongside its resulting overhead view.
-
-    The plate with the fitted geometry drawn on it, next to the overhead it produces.
-    """
+    """Draw the plate with the fitted geometry next to the overhead it produces."""
     plate = table_plate(video, work)
     over = plate.copy()
     verdict = {c.region: c.ok for c in (checks or [])}
@@ -1126,17 +1076,3 @@ def fit_sheet(
     )
     right = cv2.resize(oh, (h, h), interpolation=cv2.INTER_AREA)
     return np.hstack([left, right])
-
-
-def write_unit_template(
-    video: Path, cal: Calibration, work: Path, out: Path = UNIT_TEMPLATE
-) -> Path:
-    """Cut the unit template from a video whose fit is trusted (the reference VOD)."""
-    plate = table_plate(video, work)
-    m = unit_mask(plate)
-    t = cv2.warpAffine(
-        m, cal.derotation()[:2], (cal.side, cal.side), flags=cv2.INTER_NEAREST
-    )
-    out.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out), t * 255)
-    return out

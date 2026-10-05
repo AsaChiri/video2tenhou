@@ -13,10 +13,15 @@ test("project library supports creation, opening, editing, renaming and confirme
     start: 0,
     end: null,
     created: 1780000000,
+    kind: "local",
+    status: "new",
+    checking: false,
+    stale_exports: false,
+    results_revision: [],
     artifacts: [],
     has_fit: false,
     can_calibrate: false,
-    open_items: 0,
+    open_items: null,
     job: { running: false },
   };
   let projects = [project];
@@ -24,6 +29,8 @@ test("project library supports creation, opening, editing, renaming and confirme
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/workspace")
       return route.fulfill({ json: { projects, setup: { ready: true } } });
+    if (path === "/api/job")
+      return route.fulfill({ json: { job: null, revision: null } });
     if (path.endsWith("/rename")) {
       project.display_name = route.request().postDataJSON().display_name;
       return route.fulfill({ json: project });

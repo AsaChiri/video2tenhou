@@ -9,7 +9,6 @@ parent exits. The registry only contains processes launched by this workspace.
 
 from __future__ import annotations
 
-import locale
 import os
 import signal
 import subprocess
@@ -17,7 +16,7 @@ import sys
 import threading
 import time
 from contextlib import ExitStack, closing, contextmanager, suppress
-from typing import IO, TYPE_CHECKING, Literal, TypedDict, Unpack, cast, overload
+from typing import IO, TYPE_CHECKING, TypedDict, Unpack, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -39,13 +38,11 @@ class ProcessCancelledError(RuntimeError):
 class LaunchOptions(TypedDict, total=False):
     """Standard subprocess options used by owned application commands."""
 
-    stdin: int | IO[str] | IO[bytes] | None
-    stdout: int | IO[str] | IO[bytes] | None
-    stderr: int | IO[str] | IO[bytes] | None
+    stdin: int | IO[str] | None
+    stdout: int | IO[str] | None
+    stderr: int | IO[str] | None
     cwd: str | os.PathLike[str] | None
     env: Mapping[str, str] | None
-    encoding: str | None
-    errors: str | None
     shell: bool
     preexec_fn: Callable[[], None] | None
     start_new_session: bool
@@ -68,46 +65,21 @@ class ProcessOwner:
         with self._lock:
             return self._closing
 
-    @overload
     @contextmanager
     def spawn(
-        self,
-        args: Sequence[str],
-        *,
-        text: Literal[True],
-        **kwargs: Unpack[LaunchOptions],
-    ) -> Iterator[subprocess.Popen[str]]: ...
+        self, args: Sequence[str], **kwargs: Unpack[LaunchOptions]
+    ) -> Iterator[subprocess.Popen[str]]:
+        """Start a UTF-8 text subprocess; leaving the context stops its descendants.
 
-    @overload
-    @contextmanager
-    def spawn(
-        self,
-        args: Sequence[str],
-        *,
-        text: Literal[False] = False,
-        **kwargs: Unpack[LaunchOptions],
-    ) -> Iterator[subprocess.Popen[bytes]]: ...
-
-    @overload
-    @contextmanager
-    def spawn(
-        self, args: Sequence[str], *, text: bool, **kwargs: Unpack[LaunchOptions]
-    ) -> Iterator[subprocess.Popen[str] | subprocess.Popen[bytes]]: ...
-
-    @contextmanager
-    def spawn(
-        self,
-        args: Sequence[str],
-        *,
-        text: bool = False,
-        **kwargs: Unpack[LaunchOptions],
-    ) -> Iterator[subprocess.Popen[str] | subprocess.Popen[bytes]]:
-        """Stream a subprocess; leaving the context stops remaining descendants."""
+        Raises ProcessCancelledError when the application closes before or while
+        the command runs.
+        """
         self._validate_options(kwargs)
         with self._lock, ExitStack() as setup:
             if self._closing:
-                msg = "The app is closing; this operation was interrupted."
-                raise ProcessCancelledError(msg)
+                raise ProcessCancelledError(
+                    "The app is closing; this operation was interrupted."
+                )
             job = None
             if os.name == "nt":
                 # types-pywin32 declares None here; pywin32 returns an owned handle.
@@ -128,7 +100,16 @@ class ProcessOwner:
                 )
             else:
                 kwargs["start_new_session"] = True
-            process = subprocess.Popen(args, text=text, **kwargs)  # noqa: S603
+            # Python children must write UTF-8 regardless of the console code page
+            # (cp936 cannot encode Japanese player names).
+            kwargs["env"] = {
+                **(kwargs.get("env") or os.environ),
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            }
+            process = subprocess.Popen(  # noqa: S603
+                args, text=True, encoding="utf-8", errors="replace", **kwargs
+            )
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
                     setup.enter_context(closing(stream))
@@ -147,8 +128,9 @@ class ProcessOwner:
                     )
                 ) as handle:
                     if job is None:
-                        msg = "Windows process launch requires an owned job handle"
-                        raise RuntimeError(msg)
+                        raise RuntimeError(
+                            "Windows process launch requires an owned job handle"
+                        )
                     win32job.AssignProcessToJobObject(int(job), int(handle))
                 psutil.Process(process.pid).resume()
             self._children[process] = job
@@ -156,8 +138,9 @@ class ProcessOwner:
         try:
             yield process
             if self.closing:
-                msg = "The app closed before the operation finished."
-                raise ProcessCancelledError(msg)
+                raise ProcessCancelledError(
+                    "The app closed before the operation finished."
+                )
         finally:
             try:
                 self._stop(process)
@@ -176,16 +159,12 @@ class ProcessOwner:
             or options.get("process_group") is not None
             or options.get("creationflags")
         ):
-            msg = (
+            raise ValueError(
                 "ProcessOwner controls process groups and accepts direct commands only."
             )
-            raise ValueError(msg)
 
     def _stop(
-        self,
-        process: subprocess.Popen[str] | subprocess.Popen[bytes],
-        *,
-        deadline: float | None = None,
+        self, process: subprocess.Popen[str], *, deadline: float | None = None
     ) -> None:
         with self._lock:
             if process not in self._children:
@@ -201,82 +180,10 @@ class ProcessOwner:
             )
             del self._children[process]
 
-    @overload
-    def run(
-        self,
-        args: Sequence[str],
-        *,
-        text: Literal[True],
-        capture_output: bool = False,
-        timeout: float | None = None,
-        check: bool = False,
-        **kwargs: Unpack[LaunchOptions],
-    ) -> subprocess.CompletedProcess[str]: ...
-
-    @overload
-    def run(
-        self,
-        args: Sequence[str],
-        *,
-        text: Literal[False] = False,
-        capture_output: bool = False,
-        timeout: float | None = None,
-        check: bool = False,
-        **kwargs: Unpack[LaunchOptions],
-    ) -> subprocess.CompletedProcess[bytes]: ...
-
-    def run(
-        self,
-        args: Sequence[str],
-        *,
-        capture_output: bool = False,
-        text: bool = False,
-        timeout: float | None = None,
-        check: bool = False,
-        **kwargs: Unpack[LaunchOptions],
-    ) -> (
-        subprocess.CompletedProcess[str]
-        | subprocess.CompletedProcess[bytes]
-        | subprocess.CompletedProcess[str | bytes]
-    ):
-        """Capture command output while retaining application shutdown ownership."""
-        if capture_output:
-            if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
-                msg = "capture_output cannot be combined with stdout/stderr"
-                raise ValueError(msg)
-            kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        with self.spawn(args, text=text, **kwargs) as process:
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
-                self._stop(process)
-                stdout, stderr = process.communicate(timeout=5)
-                # TimeoutExpired output is bytes even when normal output is text.
-                encoding = kwargs.get("encoding") or locale.getpreferredencoding(
-                    do_setlocale=False
-                )
-                exc.output = (
-                    stdout.encode(encoding) if isinstance(stdout, str) else stdout
-                )
-                exc.stderr = (
-                    stderr.encode(encoding) if isinstance(stderr, str) else stderr
-                )
-                raise
-            if self.closing:
-                msg = "The app closed before the operation finished."
-                raise ProcessCancelledError(msg)
-            result = subprocess.CompletedProcess(
-                args, process.returncode, stdout, stderr
-            )
-            if check:
-                result.check_returncode()
-            return result
-
     def shutdown(self, timeout: float = 5.0) -> None:
         """Stop every registered command and reject further work."""
         if timeout < 0:
-            msg = "timeout must be nonnegative"
-            raise ValueError(msg)
+            raise ValueError("timeout must be nonnegative")
         deadline = time.monotonic() + timeout
         with self._lock, ExitStack() as pending:
             self._closing = True

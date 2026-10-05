@@ -1,11 +1,11 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Metrics per stage (docs/DESIGN.md section 7).
+"""Held-out metrics per stage (docs/DESIGN.md section 7).
 
-uv run python -m video2tenhou.eval detector        # precision / recall per view on the
-held-out hands uv run python -m video2tenhou.eval perception <video>   # detector +
-classifier end to end on held-out labels
+uv run python -m video2tenhou.eval detector              # face boxes per view
+uv run python -m video2tenhou.eval perception <video>    # detector + classifier
+uv run python -m video2tenhou.eval observations <video>  # voted observations
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,17 +26,15 @@ from .layout import Calibration, quad_to_box
 from .layout import box_iou as iou
 from .paths import DATA_DIR as ROOT
 from .perception import detector, reader
+from .perception.crops import region_upright
 from .perception.evidence_policy import prepare_reading, resolve_policy
 from .train import data
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from video2tenhou.perception.evidence_policy import EvidencePolicy, Stage
     from video2tenhou.perception.reader import RegionDetector
-
-
-if TYPE_CHECKING:
-    from video2tenhou.perception.evidence_policy import EvidencePolicy
 
 CONFIRMED_SIDEWAYS_FRACTION = 0.5
 
@@ -61,53 +59,36 @@ def match(
     return out
 
 
-def read_yolo_annotations(
+def read_face_boxes(
     path: Path, width: int, height: int
-) -> list[tuple[int, tuple[float, float, float, float]]]:
-    """Read class labels and pixel boxes, requiring the label file.
-
-    Read classes and pixel boxes; missing labels are errors, existing empty files are
-    negatives.
-    """
-    annotations = []
+) -> list[tuple[float, float, float, float]]:
+    """Read face boxes in pixels; a missing file is an error, an empty one negative."""
+    boxes = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         label, cx, cy, bw, bh = (float(value) for value in line.split())
-        if (
-            not np.isfinite([label, cx, cy, bw, bh]).all()
-            or label != int(label)
-            or label < 0
-            or bw <= 0
-            or bh <= 0
-        ):
-            msg = f"Invalid evaluation annotation in {path}"
-            raise ValueError(msg)
-        annotations.append(
+        if not np.isfinite([cx, cy, bw, bh]).all() or label != 0 or bw <= 0 or bh <= 0:
+            raise ValueError(f"Invalid face annotation in {path}")
+        boxes.append(
             (
-                int(label),
-                (
-                    (cx - bw / 2) * width,
-                    (cy - bh / 2) * height,
-                    (cx + bw / 2) * width,
-                    (cy + bh / 2) * height,
-                ),
+                (cx - bw / 2) * width,
+                (cy - bh / 2) * height,
+                (cx + bw / 2) * width,
+                (cy + bh / 2) * height,
             )
         )
-    return annotations
+    return boxes
 
 
 def evaluate_detector_images(
     det: RegionDetector, dataset: Path, *, predictions_path: Path | None = None
 ) -> dict:
-    """Measure held-out precision and recall, retaining optional predictions.
+    """Measure held-out face-box precision and recall by view, including negatives.
 
-    Measure class-aware held-out precision/recall by view and optionally retain
-    predictions.
-
-    ``det`` follows Detector's BGR-in, region-box-out interface. Optional JSONL supports
-    model/crop comparisons; predictions are not ground truth. Negatives are included and
-    boxes are matched one-to-one within each class.
+    ``det`` follows Detector's BGR-in, region-box-out interface. Boxes are matched
+    one-to-one at IoU 0.5. The optional JSONL keeps every prediction for paired
+    model or crop comparisons; predictions are not ground truth.
     """
     counts = defaultdict(lambda: defaultdict(float))
     manifest = dataset / "manifest.jsonl"
@@ -129,41 +110,20 @@ def evaluate_detector_images(
                 continue
             image = cv2.imread(str(image_path))
             if image is None:
-                msg = f"Cannot read evaluation image: {image_path}"
-                raise ValueError(msg)
+                raise ValueError(f"Cannot read evaluation image: {image_path}")
             height, width = image.shape[:2]
-            gt = read_yolo_annotations(
+            gt = read_face_boxes(
                 dataset / "labels" / "val" / (image_path.stem + ".txt"), width, height
             )
             predictions = det.predict(image)
-            matched = []
-            for label in sorted(
-                {label for label, _ in gt} | {int(box.back) for box in predictions}
-            ):
-                prediction_ids = [
-                    index
-                    for index, box in enumerate(predictions)
-                    if int(box.back) == label
-                ]
-                truth_ids = [
-                    index for index, (class_id, _) in enumerate(gt) if class_id == label
-                ]
-                pairs = match(
-                    [predictions[index].xyxy for index in prediction_ids],
-                    [gt[index][1] for index in truth_ids],
-                )
-                matched.extend(
-                    (prediction_ids[left], truth_ids[right]) for left, right in pairs
-                )
+            matched = match([box.xyxy for box in predictions], gt)
             view = views.get(image_path.name, image_path.stem.split("_")[0])
             row = counts[view]
             row["images"] += 1
             row["gt"] += len(gt)
             row["predicted"] += len(predictions)
             row["true_positive"] += len(matched)
-            row["iou_sum"] += sum(
-                iou(predictions[left].xyxy, gt[right][1]) for left, right in matched
-            )
+            row["iou_sum"] += sum(iou(predictions[i].xyxy, gt[j]) for i, j in matched)
             if stream is not None:
                 stream.write(
                     json.dumps(
@@ -172,15 +132,9 @@ def evaluate_detector_images(
                             "view": view,
                             "width": width,
                             "height": height,
-                            "ground_truth": [
-                                {"class_id": label, "xyxy": box} for label, box in gt
-                            ],
+                            "ground_truth": gt,
                             "predictions": [
-                                {
-                                    "class_id": int(box.back),
-                                    "xyxy": box.xyxy,
-                                    "conf": box.conf,
-                                }
+                                {"xyxy": box.xyxy, "conf": box.conf}
                                 for box in predictions
                             ],
                             "matches": matched,
@@ -206,25 +160,104 @@ def evaluate_detector_images(
     }
 
 
-def eval_detector(
-    weights: Path,
-    dataset: Path,
-    conf: float | None = None,
-    *,
-    backend: str | None = None,
-) -> dict:
-    """Report class-aware per-view metrics on held-out images.
+@dataclass
+class ReadingScore:
+    """Human matches for one reading.
 
-    Unspecified backend/confidence use the checkpoint metadata's runtime defaults;
-    explicit values select a development operating point without changing files.
+    ``kept`` indexes the scored reading boxes and ``matches`` pairs a kept
+    position with a ground-truth index; the other lists hold ground-truth
+    indices. ``identified`` boxes name the human tile; ``usable`` ones also come
+    from an accepted reading with the human role, annotated orientation and,
+    for pond tiles, slot. ``slots`` are usable pond tile slots. ``slot_checks``
+    holds (row and column agree, role agrees) for each matched slot annotation.
     """
-    return evaluate_detector_images(
-        detector.Detector(
-            weights,
-            backend=backend,
-            settings=detector.InferenceOptions(confidence=conf),
-        ),
-        dataset,
+
+    kept: list[int]
+    matches: list[tuple[int, int]]
+    labelled: int = 0
+    identified: list[int] = field(default_factory=list)
+    usable: list[int] = field(default_factory=list)
+    slots: list[int] = field(default_factory=list)
+    slot_checks: list[tuple[bool, bool]] = field(default_factory=list)
+    confusions: list[str] = field(default_factory=list)
+
+
+def score_reading(
+    kind: str, reading: dict, ground_truth: list[dict], classes: list[str]
+) -> ReadingScore:
+    """Match a reading's boxes to human boxes and judge each match.
+
+    Hand labels cover the standing row only, so revealed melds beside it and
+    sideways boxes are left out before matching.
+    """
+    kept = [
+        i
+        for i, box in enumerate(reading["boxes"])
+        if kind != "hand" or (box.get("role", "tile") == "tile" and not box["sideways"])
+    ]
+    boxes = [reading["boxes"][i] for i in kept]
+    score = ReadingScore(
+        kept,
+        match([box["xyxy"] for box in boxes], [box["xyxy"] for box in ground_truth]),
+    )
+    rejected = bool(reading.get("rejected", False))
+    for i, j in score.matches:
+        box, annotation = boxes[i], ground_truth[j]
+        role = annotation.get("role", "tile")
+        role_ok = box.get("role", "tile") == role
+        slot_ok = (box.get("row"), box.get("col")) == (
+            annotation.get("row"),
+            annotation.get("col"),
+        )
+        if "row" in annotation:
+            score.slot_checks.append((slot_ok, role_ok))
+        orientation_ok = "sideways" not in annotation or box["sideways"] == bool(
+            annotation["sideways"]
+        )
+        usable = (
+            not rejected
+            and role_ok
+            and role != "other"
+            and orientation_ok
+            and (kind != "pond" or role != "tile" or ("row" in annotation and slot_ok))
+        )
+        if usable and kind == "pond" and role == "tile" and "row" in annotation:
+            score.slots.append(j)
+        if annotation["tile"] == "?":
+            continue
+        score.labelled += 1
+        top = classes[int(np.argmax(box["p"]))]
+        if top != annotation["tile"]:
+            score.confusions.append(f"{kind}:{annotation['tile']}->{top}")
+        else:
+            score.identified.append(j)
+            if usable:
+                score.usable.append(j)
+    return score
+
+
+def _usable_labelled(ground_truth: list[dict]) -> int:
+    """Count human boxes with a known tile that can be reader evidence."""
+    return sum(
+        box["tile"] != "?" and box.get("role", "tile") != "other"
+        for box in ground_truth
+    )
+
+
+def _human_slots(ground_truth: list[dict]) -> int:
+    """Count human pond tiles annotated with a slot."""
+    return sum(
+        box.get("role", "tile") == "tile" and "row" in box for box in ground_truth
+    )
+
+
+def _predicted_slots(boxes: list[dict]) -> int:
+    """Count read boxes placed in a pond tile slot."""
+    return sum(
+        box.get("role", "tile") == "tile"
+        and box.get("row") is not None
+        and box.get("col") is not None
+        for box in boxes
     )
 
 
@@ -233,16 +266,16 @@ def evaluate_retained_reading(
     ground_truth: list[dict],
     classes: list[str],
     *,
-    stage: str,
+    stage: Stage,
     policy: EvidencePolicy | dict | None = None,
 ) -> dict:
     """Measure human matches after actual retention and geometry reassignment.
 
     Ground-truth boxes use region-coordinate ``xyxy`` and human ``tile``/role
     annotations. Returned indices refer to that unchanged list, supporting
-    paired per-example retention gates. Hand labels cover only the standing row;
-    all boxes participate in reassignment before that evaluation scope is applied.
-    This is a single-reading gate, not a temporal-vote or whole-hand accuracy claim.
+    paired per-example retention gates. All boxes take part in reassignment
+    before the standing-hand scope applies. This is a single-reading gate, not
+    a temporal-vote or whole-hand accuracy claim.
     """
     kind = reading["region"].split(":", 1)[0]
     prepared = prepare_reading(
@@ -250,73 +283,24 @@ def evaluate_retained_reading(
         reading,
         stage=stage,
         policy=resolve_policy(policy),
-        none_index=classes.index("none"),
     )
-    boxes = prepared["boxes"]
-    if kind == "hand":
-        boxes = [
-            box
-            for box in boxes
-            if box.get("role", "tile") == "tile" and not box["sideways"]
-        ]
-    matches = match(
-        [box["xyxy"] for box in boxes], [box["xyxy"] for box in ground_truth]
-    )
-    correct, structured = [], []
-    for i, j in matches:
-        box, annotation = boxes[i], ground_truth[j]
-        role = annotation.get("role", "tile")
-        role_ok = box.get("role", "tile") == role and role != "other"
-        orientation_ok = "sideways" not in annotation or box["sideways"] == bool(
-            annotation["sideways"]
-        )
-        slot_ok = (
-            kind != "pond"
-            or role != "tile"
-            or (
-                "row" in annotation
-                and (box.get("row"), box.get("col"))
-                == (annotation["row"], annotation["col"])
-            )
-        )
-        usable = (
-            not prepared.get("rejected", False)
-            and role_ok
-            and orientation_ok
-            and slot_ok
-        )
-        if usable and kind == "pond" and role == "tile" and "row" in annotation:
-            structured.append(j)
-        if (
-            usable
-            and annotation["tile"] != "?"
-            and classes[int(np.argmax(box["p"]))] == annotation["tile"]
-        ):
-            correct.append(j)
-    denominator = sum(
-        box["tile"] != "?" and box.get("role", "tile") != "other"
-        for box in ground_truth
-    )
+    score = score_reading(kind, prepared, ground_truth, classes)
+    rejected = bool(prepared.get("rejected", False))
+    labelled = _usable_labelled(ground_truth)
+    pond = kind == "pond"
     return {
         "reading": prepared,
-        "correct_gt_indices": sorted(correct),
-        "correct": len(correct),
-        "gt_labelled": denominator,
-        "correct_of_gt": len(correct) / max(1, denominator),
-        "predicted": len(boxes),
-        "matched": len(matches),
-        "rejected": bool(prepared.get("rejected", False)),
-        "structured_matched_slots": len(structured),
-        "structured_gt_slots": sum(
-            box.get("role", "tile") == "tile" and "row" in box for box in ground_truth
-        )
-        if kind == "pond"
-        else 0,
-        "structured_pred_slots": sum(
-            box.get("role", "tile") == "tile" and "row" in box and "col" in box
-            for box in boxes
-        )
-        if kind == "pond" and not prepared.get("rejected", False)
+        "correct_gt_indices": sorted(score.usable),
+        "correct": len(score.usable),
+        "gt_labelled": labelled,
+        "correct_of_gt": len(score.usable) / max(1, labelled),
+        "predicted": len(score.kept),
+        "matched": len(score.matches),
+        "rejected": rejected,
+        "structured_matched_slots": len(score.slots),
+        "structured_gt_slots": _human_slots(ground_truth) if pond else 0,
+        "structured_pred_slots": _predicted_slots(prepared["boxes"])
+        if pond and not rejected
         else 0,
     }
 
@@ -334,16 +318,15 @@ class PerceptionMetrics:
             for stage in ("sparse", "dense")
         }
     )
-    conf_pairs: dict = field(default_factory=lambda: defaultdict(int))
+    conf_pairs: Counter = field(default_factory=Counter)
     audit: list[dict] = field(default_factory=list)
 
     def consume(
-        self, d: dict, rd: reader.Reading, gt: list[tuple], hand: int | None
+        self, d: dict, rd: reader.Reading, ground_truth: list[dict], hand: int | None
     ) -> None:
         """Count misses and rejected readings against the human ground truth."""
-        kind, corner = d["kind"], d["corner"]
+        kind = d["kind"]
         raw_reading = rd.to_dict()
-        ground_truth = [dict(xyxy=list(box), **annotation) for box, annotation in gt]
         retained = {
             stage: evaluate_retained_reading(
                 raw_reading, ground_truth, self.classes, stage=stage, policy=self.policy
@@ -364,99 +347,46 @@ class PerceptionMetrics:
                 "structured_pred_slots",
             ):
                 aggregate[key] += result[key]
-        if (
-            kind == "hand"
-        ):  # labels cover the standing row, not revealed melds beside it
-            rd.boxes = [b for b in rd.boxes if b.role == "tile" and not b.sideways]
-        pred = [b.xyxy for b in rd.boxes]
-        m = match(pred, [g for g, _ in gt])
+        # Score the reader's unrounded output; serialized readings round geometry.
+        boxes = [asdict(box) for box in rd.boxes]
+        score = score_reading(
+            kind, {"rejected": rd.rejected, "boxes": boxes}, ground_truth, self.classes
+        )
         s = self.stats[kind]
         s["images"] += 1
-        s["gt_labelled"] += sum(box["tile"] != "?" for _, box in gt)
-        s["usable_gt_labelled"] += sum(
-            box["tile"] != "?" and box.get("role", "tile") != "other" for _, box in gt
-        )
+        s["gt"] += len(ground_truth)
+        s["pred"] += len(score.kept)
+        s["matched"] += len(score.matches)
         s["rejected"] += rd.rejected
-        s["gt"] += len(gt)
-        s["pred"] += len(pred)
-        s["matched"] += len(m)
+        s["gt_labelled"] += sum(box["tile"] != "?" for box in ground_truth)
+        s["usable_gt_labelled"] += _usable_labelled(ground_truth)
+        s["labelled"] += score.labelled
+        s["correct"] += len(score.identified)
+        s["usable_correct"] += len(score.usable)
+        self.conf_pairs.update(score.confusions)
+        if kind == "pond":
+            s["structured_gt_slots"] += _human_slots(ground_truth)
+            s["structured_pred_slots"] += 0 if rd.rejected else _predicted_slots(boxes)
+            s["structured_matched_slots"] += len(score.slots)
+            s["rc_total"] += len(score.slot_checks)
+            s["rc_ok"] += sum(rowcol for rowcol, _ in score.slot_checks)
+            s["role_ok"] += sum(role for _, role in score.slot_checks)
         self.audit.append(
             {
                 "t": d["t"],
-                "region": f"{kind}:{corner}",
+                "region": raw_reading["region"],
                 "hand": hand,
                 "ground_truth": ground_truth,
                 "raw_reading": raw_reading,
                 "retained": retained,
-                "reading": rd.to_dict(),
-                "top_tiles": [self.classes[int(np.argmax(box.p))] for box in rd.boxes],
-                "matches": m,
+                "reading": raw_reading
+                | {"boxes": [raw_reading["boxes"][i] for i in score.kept]},
+                "top_tiles": [
+                    self.classes[int(np.argmax(boxes[i]["p"]))] for i in score.kept
+                ],
+                "matches": score.matches,
             }
         )
-        self._matches(kind, rd, gt, m)
-        if kind == "pond":
-            self._pond(rd, gt, m)
-
-    def _matches(
-        self, kind: str, rd: reader.Reading, gt: list[tuple], m: list[tuple[int, int]]
-    ) -> None:
-        """Distinguish identity accuracy from usable structured evidence."""
-        s = self.stats[kind]
-        for i, j in m:
-            annotation = gt[j][1]
-            box = rd.boxes[i]
-            tile = annotation["tile"]
-            role_ok = box.role == annotation.get("role", "tile") and box.role != "other"
-            orientation_ok = "sideways" not in annotation or box.sideways == bool(
-                annotation["sideways"]
-            )
-            slot_ok = (
-                kind != "pond"
-                or annotation.get("role", "tile") != "tile"
-                or (
-                    "row" in annotation
-                    and (box.row, box.col) == (annotation["row"], annotation["col"])
-                )
-            )
-            usable = not rd.rejected and role_ok and orientation_ok and slot_ok
-            if tile == "?":
-                continue
-            s["labelled"] += 1
-            top = self.classes[int(np.argmax(rd.boxes[i].p))]
-            if top == tile:
-                s["correct"] += 1
-                s["usable_correct"] += usable
-            else:
-                self.conf_pairs[f"{kind}:{tile}->{top}"] += 1
-
-    def _pond(
-        self, rd: reader.Reading, gt: list[tuple], m: list[tuple[int, int]]
-    ) -> None:
-        """Count pond slot and role accuracy independently of identity."""
-        s = self.stats["pond"]
-        s["structured_gt_slots"] += sum(
-            g.get("role", "tile") == "tile" and "row" in g for _, g in gt
-        )
-        if not rd.rejected:
-            s["structured_pred_slots"] += sum(
-                b.role == "tile" and b.row is not None and b.col is not None
-                for b in rd.boxes
-            )
-        for i, j in m:
-            g = gt[j][1]
-            if "row" in g:
-                s["rc_total"] += 1
-                s["rc_ok"] += (rd.boxes[i].row, rd.boxes[i].col) == (
-                    g["row"],
-                    g["col"],
-                )
-                s["role_ok"] += rd.boxes[i].role == g["role"]
-                s["structured_matched_slots"] += (
-                    not rd.rejected
-                    and g.get("role", "tile") == "tile"
-                    and rd.boxes[i].role == "tile"
-                    and (rd.boxes[i].row, rd.boxes[i].col) == (g["row"], g["col"])
-                )
 
     def report(self) -> dict:
         """Normalize counters while retaining their denominators and policy."""
@@ -491,7 +421,7 @@ class PerceptionMetrics:
                     s["structured_matched_slots"] / max(1, s["structured_pred_slots"]),
                     4,
                 )
-        out["confusions"] = sorted(self.conf_pairs.items(), key=lambda x: -x[1])[:20]
+        out["confusions"] = self.conf_pairs.most_common(20)
         out["evidence_policy"] = self.policy.to_dict()
         out["retained"] = {}
         for stage, by_kind in self.retained_stats.items():
@@ -512,23 +442,15 @@ class PerceptionMetrics:
         return out
 
 
-@dataclass(frozen=True, kw_only=True)
-class PerceptionOptions:
-    """Candidate models, retention policy and audit output for perception evaluation."""
-
-    weights: Path | None = None
-    backend: str | None = None
-    conf: float | None = None
-    predictions_path: Path | None = None
-    classifier_dir: Path | None = None
-    evidence_policy: EvidencePolicy | dict | None = None
-
-
 def eval_perception(
     video_path: str,
     work: Path = ROOT / "work",
     *,
-    options: PerceptionOptions | None = None,
+    weights: Path = detector.DEFAULT_WEIGHTS,
+    conf: float | None = None,
+    predictions_path: Path | None = None,
+    classifier_dir: Path | None = None,
+    evidence_policy: EvidencePolicy | dict | None = None,
 ) -> dict:
     """Evaluate region structure and tile identity on human-labeled held-out hands.
 
@@ -546,30 +468,13 @@ def eval_perception(
     Its ``raw_reading`` retains extra boxes before the human standing-hand scope
     filter; use it when recomputing policy-dependent structure from saved evidence.
     """
-    options = options or PerceptionOptions()
-    weights, backend, conf, predictions_path, classifier_dir, evidence_policy = (
-        options.weights,
-        options.backend,
-        options.conf,
-        options.predictions_path,
-        options.classifier_dir,
-        options.evidence_policy,
-    )
-    from .perception.classifier import Classifier  # noqa: PLC0415
+    from .perception.classifier import DEFAULT_DIR, Classifier  # noqa: PLC0415
 
     cal = Calibration.load("pml", video_path)
-    det = (
-        detector.Detector(
-            weights,
-            backend=backend,
-            settings=detector.InferenceOptions(confidence=conf),
-        )
-        if weights is not None
-        else detector.Detector(
-            backend=backend, settings=detector.InferenceOptions(confidence=conf)
-        )
+    det = detector.Detector(
+        weights, settings=detector.InferenceOptions(confidence=conf)
     )
-    clf = Classifier(classifier_dir) if classifier_dir is not None else Classifier()
+    clf = Classifier(classifier_dir or DEFAULT_DIR)
     policy = resolve_policy(
         evidence_policy if evidence_policy is not None else det.evidence_policy
     )
@@ -579,19 +484,23 @@ def eval_perception(
     labels = [
         d
         for d in data.load_labels(video_path)
-        if data.hand_of(d["t"], hands) in data.HELD_OUT_HANDS
+        if data.split_of(d["t"], hands) == "val"
         and (d["boxes"] or (d["kind"] == "meld" and d.get("melds") == []))
     ]
     for d in labels:
         kind, corner = d["kind"], d["corner"]
         frame = cv2.imread(str(frames_dir / f"{float(d['t']):.3f}.png"))
         if frame is None:
-            msg = f"Missing cached evaluation frame at {d['t']}: {frames_dir}"
-            raise ValueError(msg)
-        img, transform = data.region_upright(frame, cal, kind, corner)
+            raise ValueError(
+                f"Missing cached evaluation frame at {d['t']}: {frames_dir}"
+            )
+        img, transform = region_upright(frame, cal, kind, corner)
         rd = reader.read_region(img, f"{kind}:{corner}", det, clf, t=d["t"])
-        gt = [(quad_to_box(transform, b["quad"]), b) for b in d["boxes"]]
-        metrics.consume(d, rd, gt, data.hand_of(d["t"], hands))
+        ground_truth = [
+            dict(xyxy=list(quad_to_box(transform, box["quad"])), **box)
+            for box in d["boxes"]
+        ]
+        metrics.consume(d, rd, ground_truth, data.hand_of(d["t"], hands))
     if predictions_path is not None:
         predictions_path.parent.mkdir(parents=True, exist_ok=True)
         with predictions_path.open("x", encoding="utf-8") as stream:
@@ -649,12 +558,10 @@ def main(argv: list[str] | None = None) -> None:
                 eval_perception(
                     a.video,
                     a.work,
-                    options=PerceptionOptions(
-                        weights=a.weights,
-                        conf=a.confidence,
-                        predictions_path=a.predictions,
-                        classifier_dir=a.classifier,
-                    ),
+                    weights=a.weights,
+                    conf=a.confidence,
+                    predictions_path=a.predictions,
+                    classifier_dir=a.classifier,
                 ),
                 indent=1,
             ),
@@ -735,8 +642,8 @@ def _score_hand_observation(d: dict, o: dict, st: dict, misses: list[str]) -> No
 def eval_observations(video_path: str, work: Path = ROOT / "work") -> dict:
     """Compare pond and hand observations with human tile labels.
 
-    Pond observations vs pond labels (row strings, gaps, sideways) and hand observations
-    vs hand labels (multiset), at every labelled time that falls inside a calm interval.
+    Ponds compare row strings, gaps and sideways tiles; hands compare multisets. Every
+    labelled time that falls inside a calm interval is compared.
     """
     wdir = work / Path(video_path).stem
     hands = data.hand_table(video_path, work)

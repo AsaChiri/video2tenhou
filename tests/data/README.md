@@ -23,9 +23,12 @@ regression is North's fifth and sixth turns: draw/discard 2p, then draw/discard
 The integration test runs real pond tracking, call anchoring, turn merging,
 hand reconstruction, score verification, Tenhou assembly and replay. Video
 recognition is replaced by these recorded readings and the exact acquisition
-plan that requested them, so CI needs neither model weights nor a GPU. Fixing
-the acquisition plan avoids wall-clock solver contention selecting unrecorded
-windows; separate tests cover acquisition thresholds and certified bounds.
+plan that requested them, so CI needs neither model weights nor a GPU. The plan
+is fixed because certification finds North's fourth and fifth draws
+ambiguous, and their stretches merge with the open-kan replacement's into one
+window that was never recorded; certification cut short by CPU contention can
+also select fewer draws. Separate tests cover acquisition thresholds and
+certified bounds.
 Tile assignments and confidence are still solved normally. Every requested
 window must exactly match recorded evidence, without slicing longer windows.
 The test also preserves the previously reviewed site score

@@ -1,27 +1,52 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared source provenance for pixel-derived caches."""
+"""Persisted content digests of source recordings, keyed by file identity."""
 
 from __future__ import annotations
 
+import json
+from contextlib import suppress
 from pathlib import Path
 
-from .files import sha256_file
+from .files import atomic_write_json, sha256_file
+from .paths import DATA_DIR
 
-_SOURCE_CACHE: dict[tuple, str] = {}
+STORE = DATA_DIR / "work" / "source-digests.json"
 
 
-def source_identity(path: str | Path, *, refresh: bool = False) -> str:
-    """Hash source contents, reusing the digest within one unchanged analysis.
+def _file_key(path: Path) -> list[int]:
+    st = path.stat()
+    return [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev]
 
-    Stage entry points refresh the digest even when size and timestamps match.
-    Dense evidence windows reuse it to avoid hashing an entire broadcast for
-    every crop. Videos must remain unchanged while an analysis is running.
+
+def _records() -> dict:
+    try:
+        records = json.loads(STORE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeError):
+        return {}
+    return records if isinstance(records, dict) else {}
+
+
+def source_identity(path: str | Path) -> str:
+    """Return the SHA-256 of a file's contents, hashing only when its identity changed.
+
+    The digest is recorded under the resolved path with size, modification and
+    change times, file index and device. A matching record is returned without
+    reading the file. Contents rewritten in place with all of those restored are
+    outside this contract. A record lost to a concurrent writer, or one that cannot
+    be saved, only means hashing again. The first call after a change can take
+    minutes for a broadcast, so call this outside locks.
     """
     path = Path(path).resolve()
-    st = path.stat()
-    key = (str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-    if refresh or key not in _SOURCE_CACHE:
-        _SOURCE_CACHE[key] = sha256_file(path)
-    return _SOURCE_CACHE[key]
+    key = _file_key(path)
+    record = _records().get(str(path))
+    if isinstance(record, dict) and record.get("file") == key:
+        return record["sha256"]
+    digest = sha256_file(path)
+    if _file_key(path) == key:  # never record a digest of a file that was changing
+        records = _records()
+        records[str(path)] = {"file": key, "sha256": digest}
+        with suppress(OSError):
+            atomic_write_json(STORE, records, retry_windows=True)
+    return digest

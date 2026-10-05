@@ -1,39 +1,43 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import type { Decode, FactBody } from "../types";
+import { ref } from "vue";
+import type { Decode, FactBody, HandEntry, ReviewItem } from "../types";
 import type { PropType } from "vue";
 import { useReview } from "./context";
 import { cornerOf, seatName, time } from "./format";
+import { handEnd } from "./evidence";
+import { errorText } from "../shared/useAction";
 import EvidenceDetails from "./EvidenceDetails.vue";
 import TilePalette from "./TilePalette.vue";
 import TileListEditor from "./TileListEditor.vue";
 import MeldEditor from "./MeldEditor.vue";
 const props = defineProps({
-  item: { type: Object, required: true },
-  entry: { type: Object, required: true },
+  item: { type: Object as PropType<ReviewItem>, required: true },
+  entry: { type: Object as PropType<HandEntry>, required: true },
   decode: { type: Object as PropType<Decode>, required: true },
 });
 const review = useReview();
 const editedHands = ref<Record<string, string[]>>({});
-const candidates = computed(() =>
-  [
-    ...(props.item.text || "").matchAll(/([ESWN]) turn (\d+) (\S+) at (\d+)s/g),
-  ].map(([, seat, , tile, t]) => ({ seat, tile, t: Number(t) })),
-);
 async function save(fact: FactBody) {
   try {
-    await review.save({ hand: props.item.hand, ...fact });
+    await review.save({ ...fact, hand: props.item.hand });
   } catch (error) {
-    review.error.value = error instanceof Error ? error.message : String(error);
+    review.error.value = errorText(error);
   }
 }
 </script>
 <template>
-  <p>The hand cannot be reconstructed as read: the rules are violated.</p>
+  <p>{{ item.text }}</p>
+  <ul v-if="item.violations?.length">
+    <li v-for="(violation, index) in item.violations" :key="index">
+      {{ violation.seat ? `${seatName(entry, violation.seat)} ` : ""
+      }}{{ violation.text
+      }}{{ violation.t != null ? ` (${time(violation.t)})` : "" }}
+    </li>
+  </ul>
   <div v-for="(over, index) in item.over || []" :key="index" class="card">
     <p>
-      The tile set contains {{ over.limit ?? 4 }} copies of {{ over.tile }}, but
-      the record uses {{ over.count }}:
+      The tile set has {{ over.limit ?? 4 }} of {{ over.tile }}; this hand uses
+      {{ over.count }}:
     </p>
     <div v-for="(source, i) in over.sources" :key="i" class="card">
       <template v-if="source.kind === 'haipai'">
@@ -104,10 +108,10 @@ async function save(fact: FactBody) {
           {{ seatName(entry, source.seat) }}'s discard at
           {{ time(source.t) }} was read as {{ source.tile }}.
         </p>
-        <template v-if="source.pos?.[0] < 0"
+        <template v-if="(source.pos?.[0] ?? 0) < 0"
           ><p>
-            Called away immediately; this tile never lay in the pond. Correct
-            the called tile in its meld.
+            It was called at once and never lay in the pond: correct the called
+            tile in its meld.
           </p>
           <EvidenceDetails
             v-if="source.call"
@@ -143,7 +147,7 @@ async function save(fact: FactBody) {
         </p>
         <EvidenceDetails
           region="overhead"
-          :at="decode.t_last ?? entry.t_end"
+          :at="handEnd(decode, entry)"
           label="Indicator near the end of the hand" /><TilePalette
           :guess="source.tile"
           @pick="
@@ -181,37 +185,16 @@ async function save(fact: FactBody) {
       /></template>
     </div>
   </div>
-  <div v-for="(candidate, index) in candidates" :key="index">
-    <p>
-      {{ seatName(entry, candidate.seat) }} discards at {{ time(candidate.t) }}
-    </p>
-    <EvidenceDetails
-      :region="`pond:${cornerOf(entry, candidate.seat)}`"
-      :at="candidate.t + 2"
-      label="Pond after the discard"
-    /><TilePalette
-      :guess="candidate.tile"
-      @pick="
-        save({
-          kind: 'discard',
-          seat: candidate.seat,
-          t: candidate.t,
-          tile: $event,
-        })
-      "
-    />
-  </div>
   <template v-if="item.fact_seat"
     ><p>
-      Check the saved
-      {{ item.fact_kind === "haipai" ? "starting" : "final" }} hand for
-      {{ seatName(entry, item.fact_seat) }} against the discards and calls.
-      Incorrect saved facts can be deleted below.
+      Saved {{ item.fact_kind === "haipai" ? "starting" : "final" }} hand of
+      {{ seatName(entry, item.fact_seat) }}: compare it with the discards and
+      calls below, then correct it or delete it in Advanced review.
     </p>
     <EvidenceDetails
       :region="`hand:${cornerOf(entry, item.fact_seat)}`"
-      :start="(decode.t_last ?? entry.t_end) - 3"
-      :end="(decode.t_last ?? entry.t_end) + 30"
+      :start="handEnd(decode, entry) - 3"
+      :end="handEnd(decode, entry) + 30"
       label="Final hand reveal" /><MeldEditor
       v-for="(call, index) in (decode.calls || []).filter(
         (call) => call.seat === item.fact_seat,
@@ -242,8 +225,4 @@ async function save(fact: FactBody) {
         "
       /></details
   ></template>
-  <details>
-    <summary>Program's diagnosis</summary>
-    <p>{{ item.text }}</p>
-  </details>
 </template>

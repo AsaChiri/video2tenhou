@@ -1,15 +1,15 @@
 # Copyright 2026 video2tenhou contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Profile the real convert command with bounded wall-time instrumentation.
+"""Profile one complete ``convert`` run by stage, hand, solver search and dense read.
 
 Usage: uv run python tools/profile_conversion.py --profile-output work/profile
 video.mp4 --game 123 --work work/cold --out out/cold
 
-No caches are removed. The report records whether the recording's work/output
-directories were empty. Timings are inclusive and overlapping: never add nested
-spans or parallel counterfactuals to estimate total wall time. GPU operations are
-not forcibly synchronized; API timings include their normal synchronization only.
+Pipeline functions are wrapped with unittest.mock for this run only, so the
+package carries no profiling hooks. Caches are never removed; the summary records
+whether the recording's work and output directories started empty. Spans are
+inclusive and can overlap: nested or concurrent times must not be added.
 """
 
 from __future__ import annotations
@@ -19,655 +19,433 @@ import hashlib
 import json
 import os
 import platform
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+from collections import Counter, defaultdict
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 from functools import wraps
 from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import patch as mock_patch
+from unittest.mock import patch
 
-import psutil
+import cv2
+import torch
+from ortools.sat.python.cp_model import CpSolver
 
+from video2tenhou import calm, cli, export, observe, read, record, timeline, video
 from video2tenhou.commands import executable
-from video2tenhou.files import sha256_file
+from video2tenhou.engine import decode, dense, solver
+from video2tenhou.files import atomic_write_text
+from video2tenhou.layout import Calibration
+from video2tenhou.perception.classifier import Classifier
+from video2tenhou.perception.detector import Detector
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterator
+    from collections.abc import Callable, Iterator
 
     from ortools.sat.python.cp_model import (
         CpModel,
-        CpSolver,
         CpSolverSolutionCallback,
         CpSolverStatus,
     )
 
+STAGES = (
+    (cli, "_gate"),
+    (record, "fetch_game"),
+    (timeline, "run_header"),
+    (calm, "run_calm"),
+    (read, "run_read"),
+    (observe, "run_observe"),
+    (decode, "run_decode"),
+    (export, "write_outputs"),
+)
+OPERATIONS = (
+    (Detector, "predict"),
+    (Detector, "predict_batch"),
+    (Classifier, "posteriors"),
+    (video, "frame_at"),
+    (timeline, "read_pond_counts"),
+    (solver.HandModel, "build"),
+    (solver.HandModel, "solve"),
+    (solver.HandModel, "certify"),
+    (dense, "dense_reads"),
+    (dense, "dense_pond_reads"),
+)
+HAND = "engine.decode.decode_hand"
+SOLVE = "engine.solver.HandModel.solve"
+CERTIFY = "engine.solver.HandModel.certify"
+SEARCH = "CpSolver.solve"
+DENSE = {"engine.dense.dense_reads", "engine.dense.dense_pond_reads"}
+PACKAGES = (
+    "video2tenhou",
+    "torch",
+    "torchvision",
+    "libreyolo",
+    "ortools",
+    "numpy",
+    "opencv-python",
+)
+NEAR_BUDGET = 0.9
 
-def runtime_threads() -> dict[str, int]:
-    """Read loaded libraries' effective thread counts without importing models.
 
-    Libraries can change process-wide settings during model initialization;
-    startup settings alone do not describe later conversion stages.
+def label(owner: object, attribute: str) -> str:
+    """Name a module function or class method without the package prefix."""
+    name = getattr(owner, "__name__", str(owner))
+    return f"{name.removeprefix('video2tenhou.')}.{attribute}"
+
+
+@dataclass
+class Call:
+    """One completed call on the profiler's monotonic clock.
+
+    ``cpu`` is process CPU time, so it includes concurrent worker threads.
     """
-    counts = {}
-    cv = sys.modules.get("cv2")
-    torch = sys.modules.get("torch")
-    if cv is not None:
-        counts["opencv"] = cv.getNumThreads()
-    if torch is not None:
-        counts.update(
-            torch=torch.get_num_threads(), torch_interop=torch.get_num_interop_threads()
-        )
-    return counts
+
+    name: str
+    stage: str | None
+    hand: int | None
+    start: float
+    wall: float = 0.0
+    cpu: float = 0.0
+    failed: bool = True
+    status: str | None = None
+    budget: float | None = None
 
 
+@dataclass
 class Recorder:
-    """Thread-safe inclusive timing totals and flushed progress events.
+    """Collect calls, labelling worker calls with the active stage and hand.
 
-    High-frequency calls update aggregates only. Stage, hand and solver events
-    are written immediately so a failed/interrupted run retains useful evidence.
-    A conversion decodes hands serially; its active hand also labels worker calls.
+    A conversion runs its stages and hands serially on the calling thread.
     """
 
-    def __init__(self, output: Path) -> None:
-        """Open the event stream and initialize timing aggregates."""
-        self.output = Path(output)
-        self.output.mkdir(parents=True, exist_ok=True)
-        self.stream = (self.output / "events.jsonl").open("x", encoding="utf-8")
-        self.lock = threading.RLock()
-        self.started = time.perf_counter()
-        self.totals = {}
-        self.active_hand = None
-        self.active_stage = None
-
-    def event(self, kind: str, **data: object) -> None:
-        """Write one atomic JSONL event with elapsed time and current thread ID."""
-        with self.lock:
-            self.stream.write(
-                json.dumps(
-                    dict(
-                        event=kind,
-                        elapsed=time.perf_counter() - self.started,
-                        thread=threading.get_ident(),
-                        stage=self.active_stage,
-                        **data,
-                    ),
-                    default=str,
-                )
-                + "\n"
-            )
-            self.stream.flush()
-
-    def add(
-        self,
-        name: str,
-        elapsed: float,
-        *,
-        hand: int | None = None,
-        failed: bool = False,
-    ) -> None:
-        """Accumulate a completed call; failed calls retain elapsed time."""
-        with self.lock:
-            key = (name, hand, self.active_stage)
-            row = self.totals.setdefault(
-                key,
-                {
-                    "name": name,
-                    "hand": hand,
-                    "stage": self.active_stage,
-                    "calls": 0,
-                    "seconds": 0.0,
-                    "maximum_seconds": 0.0,
-                    "failures": 0,
-                },
-            )
-            row["calls"] += 1
-            row["seconds"] += elapsed
-            row["maximum_seconds"] = max(row["maximum_seconds"], elapsed)
-            row["failures"] += int(failed)
+    calls: list[Call] = field(default_factory=list)
+    models: dict[str, str] = field(default_factory=dict)
+    stage: str | None = None
+    hand: int | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     @contextmanager
-    def span(
-        self,
-        name: str,
-        *,
-        progress: bool = False,
-        detail: object = None,
-        record_threads: bool = False,
-    ) -> Iterator[None]:
-        """Time a synchronous call while preserving its errors and result."""
-        hand = self.active_hand
-        start = time.perf_counter()
-        failed = False
-        if progress:
-            settings = {"runtime_threads": runtime_threads()} if record_threads else {}
-            self.event("start", name=name, hand=hand, detail=detail, **settings)
+    def span(self, name: str) -> Iterator[Call]:
+        """Time a call, keeping failed calls and propagating their errors."""
+        call = Call(name, self.stage, self.hand, time.perf_counter())
+        cpu = time.process_time()
         try:
-            yield
-        except BaseException:
-            failed = True
-            raise
+            yield call
+            call.failed = False
         finally:
-            elapsed = time.perf_counter() - start
-            self.add(name, elapsed, hand=hand, failed=failed)
-            if progress:
-                settings = (
-                    {"runtime_threads": runtime_threads()} if record_threads else {}
-                )
-                self.event(
-                    "end",
-                    name=name,
-                    hand=hand,
-                    seconds=elapsed,
-                    failed=failed,
-                    **settings,
-                )
+            call.wall = time.perf_counter() - call.start
+            call.cpu = time.process_time() - cpu
+            with self.lock:
+                self.calls.append(call)
 
-    def wrap[**Parameters, Result](
+    def wrap[**P, R](
         self,
-        function: Callable[Parameters, Result],
+        function: Callable[P, R],
         name: str,
         *,
-        progress: bool = False,
-        hand_call: bool = False,
-        stage_call: bool = False,
-    ) -> Callable[Parameters, Result]:
-        """Wrap functions, labeling serial hand calls and their workers."""
+        stage: bool = False,
+        hand: bool = False,
+    ) -> Callable[P, R]:
+        """Time a function; stages and hand decodes also label the calls they make."""
 
         @wraps(function)
-        def wrapped(*args: Parameters.args, **kwargs: Parameters.kwargs) -> Result:
-            previous = self.active_hand
-            previous_stage = self.active_stage
-            if stage_call:
-                self.active_stage = name
-            if hand_call:
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            if not (stage or hand):  # Worker threads must not touch the labels.
+                with self.span(name):
+                    return function(*args, **kwargs)
+            previous = self.stage, self.hand
+            if stage:
+                self.stage = name
+            if hand:
                 entry = args[0] if args else kwargs["entry"]
                 if not isinstance(entry, dict):
-                    message = "A profiled hand call requires a hand entry object"
-                    raise TypeError(message)
-                self.active_hand = entry["hand"]
+                    raise TypeError("A profiled hand decode requires its hand entry")
+                self.hand = entry["hand"]
             try:
-                with self.span(name, progress=progress, record_threads=stage_call):
+                with self.span(name):
                     return function(*args, **kwargs)
             finally:
-                if hand_call:
-                    self.active_hand = previous
-                if stage_call:
-                    self.active_stage = previous_stage
+                self.stage, self.hand = previous
 
         return wrapped
 
-    def generator[**Parameters, Item](
-        self,
-        function: Callable[Parameters, Generator[Item]],
-    ) -> Callable[Parameters, Generator[Item]]:
-        """Time generator creation/next/close, excluding time spent by its consumer."""
+    def identify[T](self, model: type[T]) -> Callable[..., None]:
+        """Time model construction and keep the loaded model's recognition identity."""
+        construct = model.__init__
 
-        @wraps(function)
-        def wrapped(
-            *args: Parameters.args, **kwargs: Parameters.kwargs
-        ) -> Generator[Item]:
-            iterator = None
-            self.event(
-                "sample_start", hand=self.active_hand, arguments=args, keywords=kwargs
-            )
-            try:
-                with self.span("video.sample.create"):
-                    iterator = function(*args, **kwargs)
-                while True:
-                    start = time.perf_counter()
-                    hand = self.active_hand
-                    failed = False
-                    exhausted = False
-                    try:
-                        value = next(iterator)
-                    except StopIteration:
-                        exhausted = True
-                    except BaseException:
-                        failed = True
-                        raise
-                    finally:
-                        self.add(
-                            "video.sample.next_wait",
-                            time.perf_counter() - start,
-                            hand=hand,
-                            failed=failed,
-                        )
-                    if exhausted:
-                        break
-                    yield value
-            finally:
-                if iterator is not None:
-                    with self.span("video.sample.close"):
-                        iterator.close()
+        @wraps(construct)
+        def wrapped(instance: T, *args: object, **kwargs: object) -> None:
+            with self.span(f"{model.__name__}.__init__"):
+                construct(instance, *args, **kwargs)
+            self.models[model.__name__] = getattr(instance, "id", "")
 
         return wrapped
 
-    def close(self) -> None:
-        """Close event output after all workers and resource monitoring have stopped."""
-        self.stream.close()
+    def solve(self) -> Callable[..., CpSolverStatus]:
+        """Time every CP-SAT search with its status and configured time limit."""
+        original = CpSolver.solve
 
-
-class Resources:
-    """Sample this process tree and GPUs every five seconds without CUDA barriers.
-
-    Child CPU totals are a lower bound: short-lived children can exit between
-    samples. GPU metrics describe the device, including unrelated processes.
-    """
-
-    def __init__(self, recorder: Recorder) -> None:
-        """Initialize resource sampling and its stoppable worker thread."""
-        self.recorder = recorder
-        self.stop = threading.Event()
-        self.thread = threading.Thread(
-            target=self._run, daemon=True, name="profile-resources"
-        )
-        self.cpu = {}
-        self.peak_rss = 0
-        self.count = 0
-        self.gpu_available = True
-
-    def _run(self) -> None:
-        parent = psutil.Process()
-        while not self.stop.is_set():
-            row = {}
-            rss = 0
-            try:
-                processes = [parent, *parent.children(recursive=True)]
-            except psutil.Error:
-                processes = [parent]
-            for process in processes:
-                try:
-                    with process.oneshot():
-                        cpu = process.cpu_times()
-                        self.cpu[(process.pid, process.create_time())] = (
-                            cpu.user + cpu.system
-                        )
-                        rss += process.memory_info().rss
-                except psutil.Error:
-                    continue
-            self.peak_rss = max(self.peak_rss, rss)
-            row.update(
-                tree_rss_bytes=rss,
-                observed_tree_cpu_seconds=sum(self.cpu.values()),
-                processes=len(processes),
-            )
-            if self.gpu_available:
-                try:
-                    result = subprocess.run(  # noqa: S603
-                        [
-                            executable("nvidia-smi"),
-                            "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw",
-                            "--format=csv,noheader,nounits",
-                        ],
-                        capture_output=True,
-                        check=True,
-                        text=True,
-                        timeout=3,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                    row["gpu_csv"] = result.stdout.strip().splitlines()
-                except (OSError, subprocess.SubprocessError) as error:
-                    self.gpu_available = False
-                    row["gpu_unavailable"] = (
-                        error.stderr.strip()
-                        if isinstance(error, subprocess.CalledProcessError)
-                        else str(error)
-                    )
-            self.recorder.event("resources", hand=self.recorder.active_hand, **row)
-            self.count += 1
-            self.stop.wait(5)
-
-    def start(self) -> None:
-        """Begin background sampling; call finish before closing the recorder."""
-        self.thread.start()
-
-    def finish(self) -> dict:
-        """Stop sampling with a bounded wait and return observed resource peaks."""
-        self.stop.set()
-        self.thread.join(4)
-        return {
-            "samples": self.count,
-            "peak_sampled_tree_rss_bytes": self.peak_rss,
-            "observed_tree_cpu_seconds_lower_bound": sum(self.cpu.values()),
-        }
-
-
-@contextmanager
-def instrument(recorder: Recorder) -> Iterator[None]:
-    """Temporarily instrument actual pipeline methods and their imported aliases."""
-    from ortools.sat.python.cp_model import CpSolver  # noqa: PLC0415
-
-    from video2tenhou import (  # noqa: PLC0415
-        calm,
-        cli,
-        observe,
-        read,
-        record,
-        timeline,
-        video,
-    )
-    from video2tenhou.engine import decode, dense, solver  # noqa: PLC0415
-    from video2tenhou.perception.classifier import Classifier  # noqa: PLC0415
-    from video2tenhou.perception.detector import Detector  # noqa: PLC0415
-
-    patches = ExitStack()
-
-    def patch(owner: object, attribute: str, wrapper: object) -> None:
-        patches.enter_context(mock_patch.object(owner, attribute, wrapper))
-
-    stages = [
-        (cli, "_gate"),
-        (record, "fetch_game"),
-        (timeline, "run_header"),
-        (calm, "run_calm"),
-        (read, "run_read"),
-        (observe, "run_observe"),
-        (decode, "run_decode"),
-        (cli, "write_outputs"),
-    ]
-    details = [
-        (Detector, "__init__"),
-        (Detector, "predict"),
-        (Detector, "predict_batch"),
-        (Classifier, "__init__"),
-        (Classifier, "classify"),
-        (Classifier, "posteriors"),
-        (video, "frame_at"),
-        (timeline, "read_pond_counts"),
-        (solver.HandModel, "build"),
-        (solver.HandModel, "solve"),
-        (solver.HandModel, "_resolve"),
-        (decode.HandDecoder, "_solve"),
-    ]
-    with patches:
-        for owner, name in stages + details:
-            label = owner.__name__.replace("video2tenhou.", "") + "." + name
-            patch(
-                owner,
-                name,
-                recorder.wrap(
-                    getattr(owner, name),
-                    label,
-                    stage_call=(owner, name) in stages,
-                    progress=(owner, name) in stages
-                    or (owner is solver.HandModel and name == "solve"),
-                ),
-            )
-        cp_solve = CpSolver.solve
-
-        @wraps(cp_solve)
-        def measured_solve(
+        @wraps(original)
+        def solve(
             instance: CpSolver,
             model: CpModel,
             solution_callback: CpSolverSolutionCallback | None = None,
         ) -> CpSolverStatus:
-            start = time.perf_counter()
-            with recorder.span("CpSolver.solve"):
-                result = cp_solve(instance, model, solution_callback)
-            recorder.event(
-                "cp_search",
-                hand=recorder.active_hand,
-                status=instance.status_name(result),
-                seconds=time.perf_counter() - start,
-                time_budget=instance.parameters.max_time_in_seconds,
-                workers=instance.parameters.num_workers,
-                objective=instance.objective_value,
-                bound=instance.best_objective_bound,
-            )
-            return result
+            with self.span(SEARCH) as call:
+                status = original(instance, model, solution_callback)
+                call.status = instance.status_name(status)
+                call.budget = instance.parameters.max_time_in_seconds
+            return status
 
-        patch(CpSolver, "solve", measured_solve)
-        patch(video, "sample", recorder.generator(video.sample))
-        wrapped_dense = recorder.wrap(
-            read.dense_reads, "read.dense_reads", progress=True
-        )
-        patch(read, "dense_reads", wrapped_dense)
-        patch(dense, "dense_reads", wrapped_dense)
-        patch(
-            decode,
-            "decode_hand",
-            recorder.wrap(
-                decode.decode_hand, "decode.decode_hand", progress=True, hand_call=True
-            ),
-        )
+        return solve
+
+
+@contextmanager
+def instrument(recorder: Recorder) -> Iterator[None]:
+    """Patch the pipeline's stage, hand, model and search entry points temporarily."""
+    with ExitStack() as patches:
+        for owner, attribute in STAGES:
+            wrapper = recorder.wrap(
+                getattr(owner, attribute), label(owner, attribute), stage=True
+            )
+            patches.enter_context(patch.object(owner, attribute, wrapper))
+        for owner, attribute in OPERATIONS:
+            wrapper = recorder.wrap(getattr(owner, attribute), label(owner, attribute))
+            patches.enter_context(patch.object(owner, attribute, wrapper))
+        hand = recorder.wrap(decode.decode_hand, HAND, hand=True)
+        patches.enter_context(patch.object(decode, "decode_hand", hand))
+        patches.enter_context(patch.object(CpSolver, "solve", recorder.solve()))
+        for model in (Detector, Classifier):
+            patches.enter_context(
+                patch.object(model, "__init__", recorder.identify(model))
+            )
         yield
 
 
-def file_identity(path: str | Path) -> dict:
-    """Return complete SHA-256 and stat identity; absent optional files are explicit."""
-    path = Path(path).resolve()
-    if not path.is_file():
-        return {"path": str(path), "exists": False}
-    stat = path.stat()
+def summarize(calls: list[Call]) -> dict:
+    """Aggregate stage, per-hand and nested-operation timings.
+
+    CPU time is reported for stages and hands only, which run one at a time.
+    """
+    stages = {label(owner, attribute) for owner, attribute in STAGES}
+    totals: dict[tuple[str | None, str], dict] = defaultdict(
+        lambda: {"calls": 0, "wall": 0.0, "cpu": 0.0, "failed": 0}
+    )
+    by_hand: dict[int, list[Call]] = defaultdict(list)
+    for call in calls:
+        row = totals[(None if call.name in stages else call.stage, call.name)]
+        row["calls"] += 1
+        row["wall"] += call.wall
+        row["cpu"] += call.cpu
+        row["failed"] += call.failed
+        if call.hand is not None:
+            by_hand[call.hand].append(call)
+    hands = []
+    for hand, hand_calls in sorted(by_hand.items()):
+        searches = [call for call in hand_calls if call.name == SEARCH]
+        decodes = [call for call in hand_calls if call.name == HAND]
+        hands.append(
+            {
+                "hand": hand,
+                "wall": sum(call.wall for call in decodes),
+                "cpu": sum(call.cpu for call in decodes),
+                "failed": any(call.failed for call in decodes),
+                "dense_reads": sum(
+                    call.wall for call in hand_calls if call.name in DENSE
+                ),
+                "solve": sum(call.wall for call in hand_calls if call.name == SOLVE),
+                "certify": sum(
+                    call.wall for call in hand_calls if call.name == CERTIFY
+                ),
+                "searches": len(searches),
+                "near_budget": sum(
+                    1
+                    for call in searches
+                    if call.budget and call.wall >= NEAR_BUDGET * call.budget
+                ),
+                "statuses": dict(Counter(call.status for call in searches)),
+            }
+        )
     return {
-        "path": str(path),
-        "exists": True,
-        "bytes": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-        "sha256": sha256_file(path),
+        "stages": [
+            {"name": name, **row} for (_, name), row in totals.items() if name in stages
+        ],
+        "hands": hands,
+        "operations": [
+            {"stage": stage, "name": name, "calls": row["calls"], "wall": row["wall"]}
+            for (stage, name), row in sorted(
+                totals.items(), key=lambda item: -item[1]["wall"]
+            )
+            if name not in stages
+        ],
     }
 
 
-def tool_versions() -> dict[str, dict[str, str | int | None]]:
-    """Record PATH-resolved tools without importing models or failing conversion.
-
-    Each probe has a three-second deadline. Output goes to a temporary file,
-    avoiding an unbounded in-memory capture; only its first 4096 bytes are read
-    and one 300-character line is retained. Both output streams are inspected.
-    """
-    tools: dict[str, dict[str, str | int | None]] = {}
-    for name, command, flag in (
-        ("ffmpeg", "ffmpeg", "-version"),
-        ("ffprobe", "ffprobe", "-version"),
-        ("uv", "uv", "--version"),
-    ):
-        row: dict[str, str | int | None] = {
-            "path": None,
-            "version": None,
-            "status": "missing",
-        }
-        tools[name] = row
-        try:
-            executable = shutil.which(command)
-            if executable is None:
-                continue
-            row["path"] = str(Path(executable).resolve())
-            with tempfile.TemporaryFile() as output:
-                result = subprocess.run(  # noqa: S603
-                    [row["path"], flag],
-                    stdout=output,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    timeout=3,
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                output.seek(0)
-                lines = output.read(4096).decode("utf-8", errors="replace").splitlines()
-            row["returncode"] = result.returncode
-            line = next((line.strip() for line in lines if line.strip()), "")[:300]
-            if result.returncode:
-                row.update(status="error", error=line or "Nonzero exit status")
-            elif not line:
-                row.update(status="error", error="Empty version output")
-            else:
-                row.update(status="ok", version=line)
-        except subprocess.TimeoutExpired:
-            row.update(status="timeout", error="Version probe exceeded 3 seconds")
-        except OSError as error:
-            row.update(status="error", error=str(error)[:300])
-    return tools
+def render(summary: dict) -> str:
+    """Write the stage table, per-hand solver/dense breakdown and nested work."""
+    wall, cpu = summary.get("wall_seconds"), summary.get("process_cpu_seconds")
+    lines = ["# Conversion profile", ""]
+    if summary["failure"]:
+        lines += [f"Run ended with an error: `{summary['failure']}`.", ""]
+    if wall:
+        cores = summary["metadata"]["logical_cpus"]
+        lines += [
+            (
+                f"Conversion wall time {wall:.1f} s; process CPU {cpu:.1f} s "
+                f"({cpu / wall:.2f} logical cores of {cores})."
+            ),
+            "",
+        ]
+    files = summary["metadata"]["initial_files"]
+    lines += [
+        f"Files before conversion: work {files['work']}, output {files['out']}.",
+        "",
+        "| Stage | Calls | Wall s | CPU s | Share | Ceiling if free |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for row in summary["stages"]:
+        share = row["wall"] / wall if wall else 0.0
+        ceiling = f"{1 / (1 - share):.2f}x" if share < 1 else "-"
+        lines.append(
+            f"| {row['name']} | {row['calls']} | {row['wall']:.1f} | "
+            f"{row['cpu']:.1f} | {share:.1%} | {ceiling} |"
+        )
+    lines += [
+        "",
+        "## Hands",
+        "",
+        (
+            "Solve and certify are inclusive times of the reconstruction searches "
+            "and the confidence checks. Near budget means at least 90% of a "
+            "search's time limit."
+        ),
+        "",
+        (
+            "| Hand | Wall s | CPU s | Dense reads s | Solve s | Certify s | "
+            "Searches | Near budget | Statuses |"
+        ),
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    lines += [
+        f"| {row['hand']}{' (failed)' if row['failed'] else ''} | {row['wall']:.1f} "
+        f"| {row['cpu']:.1f} | {row['dense_reads']:.1f} | {row['solve']:.1f} "
+        f"| {row['certify']:.1f} | {row['searches']} "
+        f"| {row['near_budget']} | {row['statuses']} |"
+        for row in summary["hands"]
+    ]
+    lines += [
+        "",
+        "## Nested operations",
+        "",
+        "Inclusive totals; nested and concurrent calls overlap.",
+        "",
+        "| Stage | Operation | Calls | Wall s |",
+        "|---|---|---:|---:|",
+    ]
+    lines += [
+        f"| {row['stage']} | {row['name']} | {row['calls']} | {row['wall']:.1f} |"
+        for row in summary["operations"]
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def run_metadata(args: argparse.Namespace) -> dict:
-    """Record inputs, geometry, versions and initial cache state before timing."""
-    from video2tenhou import video  # noqa: PLC0415
-    from video2tenhou.layout import Calibration, fit_path  # noqa: PLC0415
-    from video2tenhou.paths import DATA_DIR, LABEL_DIR, MODEL_DIR  # noqa: PLC0415
-
-    cal = Calibration.load(args.calib, args.video)
+    """Record code, library versions, input and geometry identity without hashing."""
+    git = executable("git")
+    revision, status = (
+        subprocess.run(  # noqa: S603  fixed read-only git queries
+            [git, *command],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        for command in (("rev-parse", "HEAD"), ("status", "--porcelain"))
+    )
     versions = {}
-    for package in (
-        "video2tenhou",
-        "torch",
-        "torchvision",
-        "libreyolo",
-        "ortools",
-        "numpy",
-        "opencv-python-headless",
-        "opencv-python",
-        "psutil",
-    ):
+    for package in PACKAGES:
         try:
             versions[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
             versions[package] = None
-    cache = {}
-    for name in ("work", "out"):
-        directory = Path(getattr(args, name)).resolve() / Path(args.video).stem
-        files = list(directory.rglob("*")) if directory.exists() else []
-        cache[name] = {
-            "path": str(directory),
-            "empty": not any(p.is_file() for p in files),
-            "files": sum(p.is_file() for p in files),
-        }
-    inputs = [
-        Path(__file__),
-        Path(args.video),
-        MODEL_DIR / "detector/weights.pt",
-        MODEL_DIR / "classifier/weights.pt",
-        MODEL_DIR / "classifier/meta.json",
-        MODEL_DIR / "detector/meta.json",
-        fit_path(args.video),
-    ]
-    label_dir = LABEL_DIR / Path(args.video).stem
-    inputs.extend(sorted(label_dir.glob("*.jsonl")))
-    git = {}
-    for label, command in (
-        ("revision", ["rev-parse", "HEAD"]),
-        ("status", ["status", "--porcelain"]),
-        ("diff", ["diff", "HEAD", "--", "src", "tools/profile_conversion.py"]),
-    ):
-        result = subprocess.run(  # noqa: S603
-            [
-                executable("git"),
-                "-c",
-                "safe.directory=" + str(Path.cwd()).replace("\\", "/"),
-                *command,
-            ],
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-        git[label] = (
-            hashlib.sha256(result.stdout).hexdigest()
-            if label == "diff"
-            else result.stdout.decode(errors="replace").strip()
-        )
+    source = Path(args.video).resolve()
+    stat = source.stat()
+    geometry = Calibration.load(args.calib, args.video).data
+    initial_files = {
+        name: sum(path.is_file() for path in (Path(directory) / source.stem).rglob("*"))
+        for name, directory in (("work", args.work), ("out", args.out))
+    }
     return {
-        "arguments": vars(args),
-        "data_directory": str(DATA_DIR),
+        "arguments": {key: value for key, value in vars(args).items() if key != "fn"},
+        "revision": revision,
+        "modified_files": bool(status),
+        "versions": versions,
         "platform": platform.platform(),
         "python": sys.version,
         "logical_cpus": os.cpu_count(),
-        "versions": versions,
-        "tools": tool_versions(),
-        "git": git,
-        "cache": cache,
-        "input_files": [file_identity(p) for p in inputs],
-        "video": vars(video.probe(args.video)),
-        "calibration": cal.data,
-        "calibration_sha256": hashlib.sha256(
-            json.dumps(cal.data, sort_keys=True).encode()
+        "video": {
+            **vars(video.probe(source)),
+            "bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        },
+        "geometry_sha256": hashlib.sha256(
+            json.dumps(geometry, sort_keys=True).encode()
         ).hexdigest(),
+        "initial_files": initial_files,
     }
 
 
 def main(argv: list[str] | None = None) -> int | None:
-    """Profile CLI conversion and always persist its final timing summary."""
+    """Profile ``convert`` and always write summary.json and report.md."""
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
     parser.add_argument("--profile-output", required=True, type=Path)
     options, convert_args = parser.parse_known_args(argv)
     if convert_args[:1] == ["convert"]:
         convert_args = convert_args[1:]
-    recorder = Recorder(options.profile_output)
-    resources = Resources(recorder)
-    entry_start = time.perf_counter()
-    conversion_started = None
-    conversion_cpu = None
-    failure = None
-    resource_summary = {}
-    from video2tenhou import cli  # noqa: PLC0415
-
+    output = options.profile_output
+    output.mkdir(parents=True, exist_ok=False)
+    recorder = Recorder()
+    summary: dict = {"failure": None}
     original = cli.cmd_convert
 
     @wraps(original)
     def profiled(args: argparse.Namespace) -> None:
-        nonlocal conversion_started, conversion_cpu
-        with recorder.span("profile.preparation", progress=True):
-            info = run_metadata(args)
-            (recorder.output / "metadata.json").write_text(
-                json.dumps(info, indent=2, default=str), encoding="utf-8"
-            )
-        setup_start = time.perf_counter()
+        summary["metadata"] = run_metadata(args)
         with instrument(recorder):
-            recorder.add(
-                "profile.instrumentation_setup", time.perf_counter() - setup_start
-            )
-            info["runtime_threads"] = runtime_threads()
-            (recorder.output / "metadata.json").write_text(
-                json.dumps(info, indent=2, default=str), encoding="utf-8"
-            )
-            resources.start()
-            conversion_started = time.perf_counter()
-            conversion_cpu = time.process_time()
-            with recorder.span("cli.cmd_convert", progress=True):
-                return original(args)
+            started, cpu = time.perf_counter(), time.process_time()
+            try:
+                original(args)
+            except BaseException as error:
+                # The CLI reports the error as its outcome line; keep it here too.
+                summary["failure"] = f"{type(error).__name__}: {error}"
+                raise
+            finally:
+                summary["wall_seconds"] = time.perf_counter() - started
+                summary["process_cpu_seconds"] = time.process_time() - cpu
+                summary["threads"] = {
+                    "torch": torch.get_num_threads(),
+                    "torch_interop": torch.get_num_interop_threads(),
+                    "opencv": cv2.getNumThreads(),
+                }
 
     try:
-        with mock_patch.object(cli, "cmd_convert", profiled):
+        with patch.object(cli, "cmd_convert", profiled):
             return cli.main(["convert", *convert_args])
     except BaseException as error:
-        failure = {"type": type(error).__name__, "message": str(error)}
+        summary["failure"] = summary["failure"] or f"{type(error).__name__}: {error}"
         raise
     finally:
-        wall = (
-            None
-            if conversion_started is None
-            else time.perf_counter() - conversion_started
+        summary.update(summarize(recorder.calls), models=recorder.models)
+        atomic_write_text(
+            output / "summary.json", json.dumps(summary, indent=2, default=str)
         )
-        cpu = None if conversion_cpu is None else time.process_time() - conversion_cpu
-        if resources.thread.ident is not None:
-            resource_summary = resources.finish()
-        summary = {
-            "conversion_wall_seconds": wall,
-            "conversion_process_cpu_seconds": cpu,
-            "entry_wall_seconds": time.perf_counter() - entry_start,
-            "failure": failure,
-            "resources": resource_summary,
-            "timings": list(recorder.totals.values()),
-            "interpretation": (
-                "Inclusive overlapping timings are not additive. sample.next_wait "
-                "includes startup/exhaustion and excludes consumer work; GPU calls "
-                "are not forcibly synchronized. GPU utilization is device-wide, not"
-                " this process alone. Process CPU seconds/wall seconds gives "
-                "occupied logical cores (divide by logical CPU count for "
-                "whole-machine fraction). Sampled child CPU misses short-lived "
-                "children. Preparation hashes/imports are outside conversion wall "
-                "time."
-            ),
-        }
-        (recorder.output / "summary.json").write_text(
-            json.dumps(summary, indent=2), encoding="utf-8"
-        )
-        recorder.event("finished", failure=failure, conversion_wall_seconds=wall)
-        recorder.close()
+        if "metadata" in summary:
+            atomic_write_text(output / "report.md", render(summary))
 
 
 if __name__ == "__main__":

@@ -44,7 +44,9 @@ Browser tests exercise the built application with controlled API responses.
 
 - `src/studio/`: workspace selection, intake, analysis, settings and exports.
 - `src/review/`: review decisions, answer editors, evidence, calibration and labels.
-- `src/shared/`: HTTP client and lifecycle-managed polling.
+- `src/shared/`: HTTP client, action error handling and the studio's single
+  job-status poll (`useJob`: `GET /api/job`, every second while a job runs and
+  every five seconds otherwise).
 - `tests/`: Vitest and Vue Test Utils tests against mounted components and domain
   functions. No extraction or evaluation of scripts from built HTML.
 
@@ -52,7 +54,10 @@ The Python tests in `tests/web/` cover HTTP contracts, project isolation,
 persistence, subprocess ownership and packaged frontend resources.
 
 The backend has one listener and router (`tool/server.py`). `tool/http.py`
-provides HTTP transport, `tool/review_routes.py` dispatches project-scoped review
-API calls, `tool/review_state.py` owns per-recording evidence and corrections,
-and `tool/workflow.py` owns recording preparation and analysis. All are modules
-of the same backend, launched by `video2tenhou web`.
+provides HTTP transport, `tool/review_routes.py` declares the project-scoped
+review endpoints as individual Starlette routes, `tool/review_state.py` owns
+per-recording evidence, answers and hand freshness, and `tool/workflow.py` owns
+projects and the single job slot for preparation, analysis, hand updates and
+calibration checks. All are modules of the same backend, launched by
+`video2tenhou web`. Job failures reach the browser as the command's own message;
+the processing log is fetched only while it is open.

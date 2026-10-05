@@ -4,10 +4,14 @@
 
 """Calm intervals, cache identity and minimum reading coverage."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 import pytest
@@ -15,22 +19,10 @@ import pytest
 from video2tenhou import calm
 from video2tenhou.layout import Calibration
 
-if TYPE_CHECKING:
-    from typing import BinaryIO
-
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 def test_scoring_uses_the_same_offscreen_hand_crop_as_the_preview(
-    monkeypatch: "pytest.MonkeyPatch",
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify scoring uses the same offscreen hand crop as the preview."""
     data = Calibration.load("pml").data
     data["hand"]["TL"].update(rect=[-2, 182, 609, 304], scale=1)
     data["meld"]["BR"].update(rect=[1919, 1079, 1, 1], scale=1)
@@ -54,7 +46,6 @@ def test_scoring_uses_the_same_offscreen_hand_crop_as_the_preview(
 
 
 def test_intervals_merge_short_calm_runs() -> None:
-    """Verify intervals merge short calm runs."""
     n = 20
     ts = np.arange(n) * 0.5
     region_count = len(calm.REGIONS)
@@ -68,12 +59,10 @@ def test_intervals_merge_short_calm_runs() -> None:
     ivs = [iv for iv in calm.intervals(ts, mot, skn) if iv.region == "hand:TL"]
     flags = [(iv.calm, iv.n) for iv in ivs]
     # calm runs of 2, 1 and 2 samples between the disturbances are too short (< 3), so
-    # from sample 5 on
-    # the region is one disturbed interval
+    # from sample 5 on the region is one disturbed interval
     assert flags == [(True, 5), (False, 15)]
-    mot[5:8, r] = (
-        0.0  # without the first disturbance the calm run reaches sample 9 (10 samples)
-    )
+    # without the first disturbance the calm run reaches sample 9 (10 samples)
+    mot[5:8, r] = 0.0
     ivs = [iv for iv in calm.intervals(ts, mot, skn) if iv.region == "hand:TL"]
     assert [(iv.calm, iv.n) for iv in ivs] == [(True, 10), (False, 10)]
     # every other region is one calm interval covering everything
@@ -84,19 +73,16 @@ def test_intervals_merge_short_calm_runs() -> None:
 
 
 def test_read_floor_fills_blind_spans() -> None:
-    """Verify read floor fills blind spans."""
     n = 200  # 100 s at 2 fps
     ts = np.arange(n) * 0.5
     region_count = len(calm.REGIONS)
     mot = np.zeros((n, region_count), np.float32)
     skn = np.zeros((n, region_count), np.float32)
     r = calm.REGIONS.index("meld:BR")
-    skn[20:120, r] = (
-        0.3  # an arm over the inset from 10 s to 60 s, region still: partial run
-    )
-    mot[120:190, r] = (
-        20.0  # then 35 s of continuous motion: only a still enough sample is read
-    )
+    # an arm over the inset from 10 s to 60 s, region still: partial run
+    skn[20:120, r] = 0.3
+    # then 35 s of continuous motion: only a still enough sample is read
+    mot[120:190, r] = 20.0
     mot[150, r] = 5.0
     ivs = [
         iv
@@ -122,17 +108,16 @@ def test_read_floor_fills_blind_spans() -> None:
 
 
 def test_run_calm_recomputes_scores_when_the_geometry_changes(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify run calm recomputes scores when the geometry changes."""
     calls = []
 
     def fake_scores(
-        path: "Path",
-        cal: "Calibration",
+        path: Path,
+        cal: Calibration,
         *,
         fps: float = 2.0,
-        log: "Callable[[str], None]" = print,
+        log: Callable[[str], None] = print,
     ) -> tuple:
         calls.append(1)
         n, region_count = 6, len(calm.REGIONS)
@@ -158,39 +143,30 @@ def test_run_calm_recomputes_scores_when_the_geometry_changes(
     d3 = json.loads(json.dumps(cal.data))
     d3["pond"]["TL"]["rect"][2] += 10
     cal3 = Calibration(d3)
-    calm.run_calm(
-        source, cal3, tmp_path
-    )  # a pond rect moved: the scores are of other pixels
+    # a pond rect moved: the scores are of other pixels
+    calm.run_calm(source, cal3, tmp_path)
     assert len(calls) == 2
     assert calm.geometry_key(cal3) != calm.geometry_key(cal)
     assert calm.geometry_key(cal2) == calm.geometry_key(cal)
 
 
-def test_calm_cache_requires_source_contents_and_provenance_even_with_same_stat(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+def test_calm_cache_requires_source_contents_and_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify calm cache requires source contents and provenance even with same stat."""
+    """Rescore a replaced recording or unproven scores; reuse matching ones."""
     source = tmp_path / "recording.mp4"
     source.write_bytes(b"video-a")
     original_stat = source.stat()
     work = tmp_path / "work"
-    calls, refreshes = [], []
-    identity = calm.source_identity
+    calls = []
 
-    def source_digest(path: "Path", *, refresh: bool = False) -> "str":
-        refreshes.append(refresh)
-        return identity(path, refresh=refresh)
-
-    def score_pixels(
-        path: "Path", cal: "Calibration", **_unused_kwargs: object
-    ) -> tuple:
+    def score_pixels(path: Path, cal: Calibration, **_unused_kwargs: object) -> tuple:
         data = source.read_bytes()
         calls.append(data)
         shape = (6, len(calm.REGIONS))
         motion = np.full(shape, 0 if data == b"video-a" else 20, np.float32)
         return np.arange(6) * 0.5, motion, np.zeros(shape, np.float32)
 
-    monkeypatch.setattr(calm, "source_identity", source_digest)
     monkeypatch.setattr(calm, "scores", score_pixels)
     cal = Calibration.load("pml")
     first = calm.run_calm(source, cal, work)
@@ -205,8 +181,10 @@ def test_calm_cache_requires_source_contents_and_provenance_even_with_same_stat(
     calm.run_calm(source, cal, work)
     assert calls == [b"video-a", b"video-a"]  # unproven legacy cache is not adopted
 
-    source.write_bytes(b"video-b")
-    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    replacement = tmp_path / "recording.new"
+    replacement.write_bytes(b"video-b")
+    os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    replacement.replace(source)
     assert source.stat().st_size == original_stat.st_size
     assert source.stat().st_mtime_ns == original_stat.st_mtime_ns
     changed = calm.run_calm(source, cal, work)
@@ -215,14 +193,11 @@ def test_calm_cache_requires_source_contents_and_provenance_even_with_same_stat(
     calm.run_calm(source, cal, work, force=True)
     assert calls[-2:] == [b"video-b", b"video-b"]
     assert len(calls) == 4
-    assert len(refreshes) == 5
-    assert all(refreshes)
 
 
 def test_calm_interrupted_publication_preserves_cache_and_corrupt_cache_resumes(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify calm interrupted publication preserves cache and corrupt cache resumes."""
     source = tmp_path / "video.mp4"
     source.write_bytes(b"fixed source")
     work = tmp_path / "work"
@@ -240,10 +215,9 @@ def test_calm_interrupted_publication_preserves_cache_and_corrupt_cache_resumes(
     complete = cache.read_bytes()
     save = np.savez_compressed
 
-    def interrupted_save(stream: "BinaryIO", **_unused_arrays: object) -> None:
+    def interrupted_save(stream: BinaryIO, **_unused_arrays: object) -> None:
         stream.write(b"incomplete ZIP")
-        msg = "simulated interrupted write"
-        raise OSError(msg)
+        raise OSError("simulated interrupted write")
 
     with monkeypatch.context() as patch:
         patch.setattr(np, "savez_compressed", interrupted_save)

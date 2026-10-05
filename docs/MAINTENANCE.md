@@ -21,24 +21,28 @@ than silently changing their meaning.
 | Modules | Responsibility / boundary |
 |---|---|
 | `paths` | Immutable package assets vs writable `VIDEO2TENHOU_HOME`. |
-| `files` | Streaming file digests and atomic UTF-8/JSON publication using standard-library primitives. |
-| `video` | Download, probe, normalized BGR frames; external decoder errors propagate. |
+| `files` | File and text digests, and atomic UTF-8/JSON publication using standard-library primitives. |
+| `cache` | One persisted content digest per recording, keyed by file identity. |
+| `commands`, `video` | Absolute executable paths; download, probe, normalized BGR frames; external decoder errors propagate. |
 | `layout`, `calibfit` | Frame/region transforms and per-video fitting; failing borders block analysis. |
 | `record`, `timeline` | Normalize authoritative results and align pond-clearing windows to hands. |
 | `calm`, `read`, `observe` | Find still intervals, retain tile posteriors, combine repeated evidence. |
-| `perception.detector`, `classifier`, `reader` | Local model inference, geometry and tile-row structure. |
-| `engine.ponds`, `melds`, `indicators`, `calls`, `turns` | Persistent visible objects and chronological events. |
+| `perception.detector`, `yolo9_direct`, `classifier`, `reader` | Local model inference, the pinned direct YOLO9 input path, geometry and tile-row structure. |
+| `engine.ponds`, `melds`, `indicators`, `calls`, `turns`, `pond_evidence` | Persistent visible objects and chronological events. |
 | `engine.hand`, `dense` | Hand/seat alignment and targeted closer readings. |
 | `engine.rules`, `solver`, `scoring` | Tile conservation, legal hand transitions and result checks. |
-| `engine.decode`, `review` | Stage orchestration, human constraints and unresolved evidence. |
+| `engine.events`, `reconstruct`, `score_reconcile` | Decoder stages: discards, calls, dead wall, turn order and riichi; the constraint program, rereads, repair and kan indicators; the site's result. |
+| `engine.questions`, `review` | Every question, note and ignored answer; human facts as constraints and the confidence rows. |
+| `engine.decode` | Stage orchestration, the decode artifact and workspace decode runs. |
 | `engine.confidence` | Shared threshold policy for solver certificates and review questions. |
-| `engine.assemble`, `tenhou6` | Encode exports and replay every hand before accepting it. |
+| `engine.assemble`, `validation`, `tenhou6` | Encode exports and replay every hand before accepting it. |
+| `export` | Stage 6: atomic logs, confidence, review queue and report (one-based hand numbers, collapsed Diagnostics), and `export-inputs.json` naming the decode files each export used. |
 | `cli`, `tool` | Script interface and local browser project workflow. |
 | `logging_setup` | Command-scoped logging: progress on stderr, JSON results on stdout, and restoration of an embedding application's handlers. Library imports do not configure logging. |
 | `tool.server`, `http`, `review_routes` | Starlette ASGI routes, loopback and origin policy, bounded streaming and Uvicorn lifecycle. Blocking workspace/model operations run in worker threads. |
+| `tool.workflow`, `review_state` | Project manifests and the workspace's single job slot; per-recording evidence, answers and hand freshness. |
 | `tool.processes` | Coordinate subprocess shutdown using pywin32 Job Objects and psutil on Windows, and standard-library process groups on POSIX. |
-| `tool.rebuild`, `tool.check_calibration` | Named child-process commands for reconstruction and border checks, replacing inline interpreter scripts. |
-| `train`, `eval`, `benchmark` | Annotation datasets, training, held-out metrics and throughput comparisons. |
+| `train`, `eval` | Annotation datasets, training and held-out metrics. |
 
 Seats in engine evidence are wind letters for the current hand; site records
 and Tenhou arrays use the hanchan's starting-seat order. Conversion belongs in
@@ -48,19 +52,24 @@ them for tile-inventory accounting. A missing observation is not proof of absenc
 
 ## Dependency environments
 
-The launchers use uv directly: `uv venv --allow-existing` provides Python 3.12,
-then `uv pip install --torch-backend auto --upgrade-package torch
---upgrade-package torchvision --editable .` resolves a matched runtime for the
-machine. There is no fixed CUDA index or exact PyTorch version in the starter
-setup. uv owns hardware/driver detection, package resolution, downloads and
-caching. Keep uv current as new GPU generations are released.
+The launchers use uv directly. Setup runs `uv venv --allow-existing --python 3.12
+.venv-runtime`, then `uv pip install --torch-backend auto --editable .` into that
+environment, which resolves a matched runtime for the machine. There is no fixed
+CUDA index or exact PyTorch version in the starter setup. uv owns hardware/driver
+detection, package resolution, downloads and caching. Keep uv current as new GPU
+generations are released.
 
-The starter uses `.venv-runtime`, separate from the development `.venv`.
-`UV_PROJECT_ENVIRONMENT` and `uv run --no-sync` launch that selected environment
-without applying the development lockfile. Every launch checks for a compatible
-current Torch/torchvision pair; installed packages and cached downloads are reused
-where possible. `UV_OFFLINE=1` uses uv's cache without network access (a successful
-initial setup is required). Interrupted installations can be retried by relaunching.
+The starter uses `.venv-runtime`, separate from the development `.venv`. A
+completed setup copies `pyproject.toml` to `.venv-runtime/video2tenhou-pyproject.toml`.
+While that copy matches, launches skip setup and start the studio with
+`uv run --no-sync` under `UV_PROJECT_ENVIRONMENT=.venv-runtime`, without network
+access or the development lockfile. Setup runs again when the environment or its
+record is missing, including after an interrupted installation, or when
+`pyproject.toml` changed; it installs missing requirements and keeps a PyTorch
+that already satisfies them. `Start.cmd --update`, `sh start.sh --update` or
+`VIDEO2TENHOU_UPDATE=1` also upgrade PyTorch and torchvision. A different PyTorch
+build changes recognition identities, so the next analysis of each recording
+reads its video again. `UV_OFFLINE=1` limits a setup or update to uv's cache.
 
 Before opening the studio, the application checks convolution, matrix multiplication
 and torchvision NMS. The detector and classifier share the same checked device.
@@ -74,16 +83,17 @@ reports that a GPU is available.
 | torchvision | `>=0.21,<0.30` | Its dependency selects the matching Torch version. |
 | NumPy | `>=2.5.3,<3` | Starts at the tested numerical baseline; excludes a new major ABI. |
 | OpenCV | `>=5.0.0.93,<6` | Starts at the tested image-processing baseline; excludes a new major API. |
-| LibreYOLO | `>=1.5,<1.6` | Allows patch updates within the validated YOLO9 prediction series; validate inference and graph behavior before widening. |
+| LibreYOLO | `>=1.5,<1.6` | The series whose private graph dispatch and postprocessing the direct input path calls; `tests/perception/test_yolo9_direct.py` must pass before widening. |
 
 These ranges express installation compatibility, not a claim that every version
 has identical output or speed. Numerical runtime changes invalidate recognition
 caches. Validate evidence, exports and workload performance when changing stacks.
 The lockfile remains a development/CI snapshot, not the starter's runtime policy.
 
-Set `VIDEO2TENHOU_DEVICE=cpu` before launching to install and use a CPU build.
-Advanced users can set `UV_TORCH_BACKEND` to a backend supported by their installed
-uv; normal launches default to `auto`. Neither option edits the project or lockfile.
+Set `VIDEO2TENHOU_DEVICE=cpu` to run on CPU; when setup runs (first launch or
+`--update`) it also selects a CPU PyTorch build. `UV_TORCH_BACKEND` overrides the
+setup backend for a backend supported by the installed uv; setup defaults to
+`auto`. Neither option edits the project or lockfile.
 A manual environment can use the same adaptive resolver:
 
 ```powershell
@@ -117,45 +127,80 @@ live under `out/<video>/`. Stage caches are accelerators, not independently
 versioned interchange formats. When changing evidence semantics, invalidate
 affected downstream caches or rerun with `--redo`/`--force`; preserve labels.
 
-Observation completion records bind the actual reading files, their manifest,
-relevant calm intervals, voting settings and output digest. An interruption
-between reading and voting therefore cannot make stale observations reusable
-on resume. Review rebuilds verify sparse and voted evidence before writing a
+A recording's content is hashed once. `cache.source_identity` keeps one SHA-256
+per resolved path in `work/source-digests.json`, keyed by size, modification and
+change times, file index and device, and hashes again only when one of those
+changes; contents rewritten in place with all of them restored are outside this
+contract. Stages and the studio take digests from it and never hash videos
+themselves. The first call after a change can take minutes, so call it outside
+locks.
+
+Each stage's completion manifest records digests of the text it published, and
+downstream stages bind to that manifest instead of re-reading and hashing
+upstream files. `reads/<hand>/done.json` records the source, recognition,
+geometry and sampling identities and one digest per region file. The observation
+record `obs/provenance/<hand>.json` binds the digest of that reading manifest,
+the relevant calm intervals, the class list, the sparse retention policy and the
+voting settings, and records the digest of the votes it wrote. A decode binds the
+digest of the observation record, the dense retention policy, the hand's
+metadata, its site result and its facts (dismissals excluded). A rewrite removes
+the old manifest first and writes the new one last, so an interruption cannot
+leave a manifest describing files it did not produce. Manifests are trusted: a
+hand edit to a cached file that leaves its manifest in place is not detected.
+After editing caches by hand, delete the manifest or rerun with `--force` or
+`--redo`. Review rebuilds verify sparse and voted evidence before writing a
 hand; after changing recognition models, use **Analyze recording** to refresh
 that evidence before rebuilding with saved answers.
-Decoded results also bind the observation and provenance files by content hash,
-along with hand metadata, the authoritative result and that hand's saved facts.
-An interruption after voting cannot make an older reconstructed hand reusable;
-only complete replacement files become visible.
 
 Studio manifests under `work/projects/` bind source paths, ordered game IDs,
 layout selection and an export signature. Exports are only offered when the
 source content, those inputs and the effective calibration match their provenance.
 Changing project settings preserves labels but requires analysis; changing
-layout requires preparation. A `calibration.changed` or
-`inputs.changed` marker blocks direct review rebuilds until full analysis
-refreshes the upstream evidence. Replacing or removing a recording also requires
-preparation again, preserving saved answers. Polling reuses a source digest keyed
-by file identity, size and timestamps; conversion stages verify content afresh.
-Evidence clips include source and geometry identities in their filenames, and
-calibration edits clear remembered border checks.
+layout requires preparation. A `calibration.changed` or `inputs.changed` marker
+blocks review rebuilds until a completed `convert` refreshes the upstream
+evidence and removes it; the markers are the only record of that state.
+Replacing or removing a recording also requires preparation again, preserving
+saved answers. The studio computes recording digests in background threads; a
+project whose digest is not yet known reports **Checking recording** and offers
+no exports. Evidence clips include source and geometry identities in their
+filenames and are encoded to a temporary file before publication. Border checks
+are kept in `work/<video>/border-checks.json` with the geometry they measured
+and are shown only while that geometry is current.
 
 `tool.server` mounts `tool.review_routes` under each project URL. Review endpoints
 use individual Starlette routes, typed hand indices and method validation;
 there is no review path dispatcher. Synchronous evidence handlers run in the
-framework's worker pool. Review writes check job exclusion before reading the
-bounded body, then recheck under the workspace lock before applying a change.
-The server streams upload bodies and accepts only local, same-origin writes
-with its application header. `tool.workflow`
-serializes processing jobs and persists interrupted/failed states. Project
-manifests are atomically replaced; brief Windows reader contention has a bounded
-retry. A failed save retains the prior complete manifest and exposes a retryable,
-non-running job rather than claiming durable completion.
-`tool.review_routes` handles calibrated evidence and answers; its revision endpoint
-lets open review tabs notice externally rebuilt files without discarding
-unsaved edits. Model/encoder commands run through `ProcessOwner` so a server
-shutdown reaps owned descendants instead of leaving an invisible job running.
-Changing calibration must trigger fresh readings for the affected regions.
+framework's worker pool; frame seeks, model loading, clip encoding and digests
+never run while the workspace or review lock is held. Review writes check job
+exclusion before reading the bounded body, then recheck under the workspace lock
+before applying a change. The server streams upload bodies and accepts only
+local, same-origin writes with its application header. Responses are `no-store`
+except content-hashed bundles and tile art, which are cacheable. Evidence
+requests never build the plate, run checks or change answers.
+
+`tool.workflow` owns one job slot for the whole workspace: preparation, analysis,
+hand updates and calibration fits and checks run `video2tenhou` CLI children
+(preparation downloads or trims first when needed) through the shared
+`ProcessOwner`, which forces UTF-8 child output and reaps owned descendants when
+the server shuts down. CLI commands other than
+`web` end with at most one JSON line on stdout: `{"result": ...}`, or
+`{"error": ...}` with any partial result and `"unexpected": true` for a failure
+the message cannot explain. The studio shows only that message.
+`GET /api/job[?project=<key>]` reports the job and the open project's review
+revision; the developer log, both output streams of the latest job, is served
+only on request from `GET /api/projects/<key>/log`. Preparation and analysis persist interrupted and
+failed states. Project manifests are atomically replaced; brief Windows reader
+contention has a bounded retry. A failed save retains the prior complete manifest
+and exposes a retryable, non-running job rather than claiming durable completion.
+
+A hand is pending when it has no decode by the current decoder version, when its
+saved decode context differs from the current hand metadata, site result and
+facts (dismissals excluded), or when `out/<video>/export-inputs.json` does not
+name its current decode file. A `dismiss` fact is review state: it hides one
+question by its stable id and never enters reconstruction or its binding. Saved
+`note` facts from earlier versions dismiss a question only when exactly one
+question has the same text; the journal is never rewritten. Changing calibration
+must trigger fresh readings for the affected regions.
 
 ## Tests
 
@@ -172,36 +217,54 @@ npm --prefix frontend run check
 ```
 
 Use `uv run ruff format .` and `npm --prefix frontend run format` to apply
-formatting. Python linting enables Ruff `ALL`; the only approved exceptions
-are `D203`, `D213`, and `COM812` (conflicting docstring/formatter conventions),
-and `S101`, `PLR2004`, and `SLF001` in tests (pytest assertions, literal numeric
-expectations, and direct checks of internal behavior, approved by the maintainer).
-`ARG001` and `ARG002` are approved in tests because test doubles retain unused
-named parameters to preserve keyword-call and protocol compatibility with the
-components they replace. Remove unnecessary fixtures and unused parameters
-from ordinary helpers instead of copying this pattern into application code.
-`S311` is also approved in `train/data.py` for non-security crop sampling.
-Classifier augmentation uses an owned NumPy generator and needs no RNG exception.
-`S603` is approved in `video.py`, `cli.py`, and `tool/processes.py` for
-application-owned subprocess argument lists with shell execution disabled.
-FFmpeg/FFprobe resolve to absolute executable paths; Python commands use the
-current interpreter. Keep user values as separate arguments and retain the
-process owner's launch-option validation.
-`S603` is also approved in `tools/check_dist.py`, `tools/profile_conversion.py`,
-and the video, reading, dense-prefetch and launcher tests for fixed tool commands
-and repository-owned fixtures. Launcher tests invoke the platform shell with
-the repository launcher and fixed test arguments.
-`S603` and `PLC0415` exceptions use rule-specific inline `noqa` annotations,
-so newly introduced calls and imports remain checked. `PLC0415` is approved
-for lazy runtime/model imports in `benchmark.py`, `cli.py`, `engine/decode.py`,
-`eval.py`, `perception/detector.py`, `tool/review_state.py`, and `tool/workflow.py`;
-runtime diagnosis in `perception/device.py`; training validation before model
-loading in `train/train_libreyolo.py`; and profiling after environment setup in
-`tools/profile_conversion.py`. Ordinary test and packaging imports stay at module
-scope. Ruff also checks for unused `noqa` annotations.
-LibreYOLO inference uses public `predict` and `release_graphs` APIs, with no
-private-library-access exception. Graph lifecycle tests cover shape changes,
-failures and serialized model access.
+formatting. Python linting enables Ruff `ALL`. The maintainer approved these
+configured exceptions: `D203`, `D213` and `COM812` (conflicting docstring and
+formatter conventions); `D401` (noun-phrase docstring summaries); `EM101`,
+`EM102` and `TRY003` (exception messages written inline); and up to eight
+arguments per function (`[tool.ruff.lint.pylint] max-args = 8`). Tests also
+ignore `S101`, `PLR2004`, `SLF001`, `ARG001`, `ARG002`, `D`, `ANN` and `TC`:
+pytest assertions, literal expectations, direct checks of internal behavior,
+test doubles that keep unused named parameters to match the interfaces they
+replace, and test names that document themselves. Tests use postponed
+annotations (`from __future__ import annotations`) with type imports at module
+scope. Remove unnecessary fixtures and unused parameters from ordinary helpers
+instead of copying the test exceptions into application code. `S311` is also
+approved in `train/data.py` for non-security crop sampling. Classifier
+augmentation uses an owned NumPy generator and needs no RNG exception.
+
+Any other exception is a rule-specific inline `noqa` annotation, with a short
+reason where the rule does not make it obvious, so newly introduced calls and
+imports remain checked. Ruff also checks for unused `noqa` annotations. The
+approved annotations are:
+
+- `S603` in `video.py`, `cli.py` and `tool/processes.py` for application-owned
+  subprocess argument lists with shell execution disabled. FFmpeg and FFprobe,
+  including evidence-clip encoding, resolve to absolute executable paths through
+  `commands.executable`; Python commands use the current interpreter. Keep user
+  values as separate arguments and retain the process owner's launch-option
+  validation.
+- `S603` in `tools/check_dist.py`, `tools/profile_conversion.py` (read-only git
+  queries), `tools/check_source_release.py` (git file listing and the shipped
+  smoke tests), and the video, reading, dense-prefetch, engine import-isolation
+  and launcher tests for fixed tool commands and repository-owned fixtures.
+  Launcher tests invoke the platform shell with the repository launcher and
+  fixed test arguments.
+- `PLC0415` for lazy runtime and model imports in `cli.py`, `engine/decode.py`,
+  `eval.py`, `perception/detector.py`, `tool/review_state.py` and
+  `tool/workflow.py`; runtime diagnosis in `perception/device.py`; training
+  validation before model loading in `train/train_libreyolo.py`; HTTPX only when
+  querying the score site in `record.py`, so the engine imports result types
+  without the HTTP client; and yt-dlp only when parsing user time bounds in
+  `video.py`. Ordinary test and packaging imports stay at module scope.
+- `SLF001` on the two calls in `perception/yolo9_direct.py` to LibreYOLO 1.5's
+  private `_forward_graphed` and `_postprocess`. LibreYOLO stays pinned to the
+  validated 1.5 series. `tests/perception/test_yolo9_direct.py` fails if their
+  signatures change and compares the direct inputs and detections with public
+  `predict` (a fresh model on CPU; the installed checkpoint and reference
+  recording when present). Each padded input shape owns its own model, so no
+  capture is released while predicting; tests cover per-shape ownership,
+  replaced weights and serialized model access.
+
 The checks cover application code,
 training code, tools, tests, and frontend configuration. Do not add exclusions,
 rule suppressions, type-check skips, or failure baselines without maintainer
@@ -234,14 +297,19 @@ record becomes a validated export, and illegal reconstructions become explicit
 conflicts. The week_11 fixture protects the observed draw-order failure. Use
 coverage gaps to identify missing behavior, not to add assertions repeating code.
 See the [test guide](../tests/README.md) for subsystem directories and focused runs.
+Recorded-hand reconstructions are marked `slow`; `uv run pytest -m "not slow"` is
+a quick local loop. CI runs everything.
 
 The wheel smoke check imports the extracted distribution outside the repository
 and verifies templates, calibration and UI assets. CI runs without local labels,
 videos or weights. Optional local-data tests must skip explicitly. GPU benchmarks
 are separate from CI: capture hardware, model hashes, warmup, workload and output
 parity. Do not compare cached reruns with cold first runs as a speedup claim.
-The source-release check runs the tests shipped inside the sdist in an empty
-workspace, so accidental dependence on private labels or local caches is visible.
+The source-release check requires the sdist to contain exactly the tracked files
+(except the repository-only `.github/`, `.editorconfig`, `.gitattributes` and
+`CLAUDE.md`), the built UI and `PKG-INFO`. It then runs a few shipped tests from
+the extracted archive with an empty data directory, so accidental dependence on
+private labels or local caches is visible; the full suite runs from the checkout.
 
 ## Frontend
 
@@ -292,18 +360,18 @@ Use equivalent absolute paths on other systems; quote paths containing spaces.
 Detector training starts from the specific
 [LibreYOLO9-S checkpoint](https://huggingface.co/LibreYOLO/LibreYOLO9s).
 The face dataset preserves whole-hand validation groups and maps reviewed
-visible-tile boxes to one localization class. Training writes a separate run;
+visible-tile boxes to one localization class; human detector labels of any
+other class are rejected. Regions with reviewed face-down (`X`) tiles stay out
+of the detector dataset; their classifier crops are kept. Training writes a separate run;
 it does not replace deployed models. Follow [detector qualification and
 deployment](DETECTOR_BACKENDS.md) to evaluate the complete detector/classifier
 pair, export its inference state and retain matching metadata and provenance.
 Classifier training initializes ResNet18 from ImageNet; inference instead loads
 the complete local checkpoint. Retain classifier `meta.json` with its weights.
-New classifier training uses a dataset-owned NumPy `Generator` seeded with zero;
+Classifier training uses a dataset-owned NumPy `Generator` seeded with zero;
 metadata records the seed, bit generator and `numpy-generator-pcg64-v1`
-augmentation recipe. This changes the training sample sequence from older
-Python/global-NumPy augmentation. Validation performs no random augmentation,
-and existing checkpoints remain unchanged. Context refinement uses Python and
-PyTorch randomness, so it no longer seeds the unused global NumPy generator.
+augmentation recipe. Validation performs no random augmentation. Context
+refinement uses Python and PyTorch randomness.
 Evaluate every view, especially hand cameras, before replacing release models.
 
 ## Release boundaries
