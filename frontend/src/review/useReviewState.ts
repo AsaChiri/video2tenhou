@@ -215,7 +215,11 @@ export function useReviewState(projectId: string, status: JobState) {
     }
   }
   status.onFinished((finished) => {
-    if (finished.project !== projectId || finished.kind !== "rebuild") return;
+    if (finished.project !== projectId || finished.kind !== "rebuild") {
+      // Any workspace job can hold the slot needed by this project's answers.
+      maybeStart();
+      return;
+    }
     if (finished.error) error.value = finished.error;
     if (!guided.value && (dirty.value || players.value)) updates.value = true;
     else void refresh(true).then(maybeStart);
