@@ -6,12 +6,12 @@ import type { Fact, ReviewItem, WorkspaceJob } from "../src/types";
 import { useJobStatus } from "../src/shared/useJob";
 import { useReviewState } from "../src/review/useReviewState";
 vi.mock("../src/shared/api", () => ({ api: vi.fn() }));
-function setup() {
+function setup(projectId = "id") {
   let state: ReturnType<typeof useReviewState> | undefined;
   const wrapper = mount(
     defineComponent({
       setup() {
-        state = useReviewState("id", useJobStatus(ref("id")));
+        state = useReviewState(projectId, useJobStatus(ref(projectId)));
         return () => null;
       },
     }),
@@ -23,7 +23,7 @@ function setup() {
  * A server whose rebuild jobs finish at the next status poll. Answers make
  * their hand pending until a successful update; dismissals never do.
  */
-function mockServer() {
+function mockServer(projectId = "id") {
   const pending = new Set<number>(),
     saved: Fact[] = [];
   let items: ReviewItem[] = [],
@@ -39,12 +39,13 @@ function mockServer() {
       else if (job?.running) {
         job = { ...job, running: false, finished: ++clock };
         if (fail) job.error = "Hand 1 has no tile readings. Analyze recording.";
-        else for (const hand of job.hands || []) pending.delete(hand);
-        revision++;
+        else if (job.project === projectId)
+          for (const hand of job.hands || []) pending.delete(hand);
+        if (job.project === projectId) revision++;
       }
       return status();
     }
-    path = path.replace("/review/id/api/", "");
+    path = path.replace(`/review/${projectId}/api/`, "");
     if (path === "hands")
       return [0, 1, 2].map((hand) => ({ hand, pending: pending.has(hand) }));
     if (path === "items") return items;
@@ -61,7 +62,7 @@ function mockServer() {
       if (pending.size)
         job = {
           kind: "rebuild",
-          project: "id",
+          project: projectId,
           stage: "Updating hands",
           hands: [...pending].sort(),
           running: true,
@@ -81,10 +82,10 @@ function mockServer() {
     fail: (value = true) => (fail = value),
     items: (value: ReviewItem[]) => (items = value),
     touch: () => revision++,
-    running: (hands: number[]) =>
+    running: (hands: number[], project = projectId) =>
       (job = {
         kind: "rebuild",
-        project: "id",
+        project,
         stage: "Updating hands",
         hands,
         running: true,
@@ -231,6 +232,69 @@ it("batches answers from different hands saved while an update runs", async () =
   await vi.advanceTimersByTimeAsync(1000);
   expect(state.pending.value).toEqual([]);
   expect(server.posts()).toHaveLength(2);
+});
+it.each([false, true])(
+  "starts queued answers after another project's update finishes (failed: %s)",
+  async (failed) => {
+    vi.useFakeTimers();
+    const server = mockServer("B");
+    server.running([0], "A");
+    server.fail(failed);
+    const { state } = setup("B");
+    state.guided.value = true;
+    await vi.advanceTimersByTimeAsync(0);
+    await state.refresh();
+    expect(state.busy.value).toBe(true);
+    expect(state.updating.value).toBe(false);
+    await state.save({ hand: 0, kind: "draw", tile: "2p" });
+    expect(state.pending.value).toEqual([0]);
+    expect(server.posts()).toHaveLength(0);
+    const loads = state.loads.value;
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(server.posts()).toEqual([
+      ["/review/B/api/rebuild", { hands: "pending" }],
+    ]);
+    expect(state.job.value?.project).toBe("B");
+    expect(state.updating.value).toBe(true);
+    expect(state.error.value).toBe("");
+    expect(state.loads.value).toBe(loads);
+    expect(state.facts.value[0]).toHaveLength(1);
+
+    server.fail(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(state.pending.value).toEqual([]);
+    expect(state.loads.value).toBe(loads + 1);
+    expect(server.posts()).toHaveLength(1);
+  },
+);
+it("keeps unguided answers queued when another project's update finishes", async () => {
+  vi.useFakeTimers();
+  const server = mockServer("B");
+  server.running([0], "A");
+  const { state } = setup("B");
+  await vi.advanceTimersByTimeAsync(0);
+  await state.refresh();
+  await state.save({ hand: 0, kind: "draw", tile: "2p" });
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(state.busy.value).toBe(false);
+  expect(state.pending.value).toEqual([0]);
+  expect(server.posts()).toHaveLength(0);
+});
+it("does not retry queued answers after the same project's update fails", async () => {
+  vi.useFakeTimers();
+  const server = mockServer();
+  const { state } = setup();
+  state.guided.value = true;
+  await vi.advanceTimersByTimeAsync(0);
+  await state.save({ hand: 0, kind: "draw", tile: "2p" });
+  await flushPromises();
+  await state.save({ hand: 1, kind: "draw", tile: "3p" });
+  server.fail();
+  await vi.advanceTimersByTimeAsync(6000);
+  expect(state.error.value).toContain("no tile readings");
+  expect(state.pending.value).toEqual([0, 1]);
+  expect(server.posts()).toHaveLength(1);
 });
 it("dismisses a question without updating its hand", async () => {
   vi.useFakeTimers();
