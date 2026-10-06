@@ -78,12 +78,14 @@ beforeEach(() => {
 async function studio(
   projects: Project[],
   status: { job: WorkspaceJob | null } = { job: null },
+  log: string[] = [],
 ) {
   vi.mocked(api).mockImplementation(async (path) => {
     if (path === "/api/workspace")
       return { projects: [...projects], setup: { ready: true } };
     if (path.startsWith("/api/job")) return { ...status, revision: null };
     if (path.endsWith("/results")) return results(path);
+    if (path.endsWith("/log")) return { log: [...log] };
     throw Error(path);
   });
   const wrapper = mount(StudioApp, {
@@ -518,4 +520,44 @@ it("fetches the developer log only while open, as text, and follows new lines", 
   await wrapper.setProps({ job: { started: 2, running: true }, lines: 1 });
   await flushPromises();
   expect(output.scrollTop).toBe(1000);
+});
+
+it("refreshes an open log after 80 lines without waiting for the job to finish", async () => {
+  vi.useFakeTimers();
+  history.replaceState(null, "", "#A");
+  const status = { job: job({ log_lines: 80 }) };
+  const log = Array.from({ length: 80 }, (_, i) => `line ${i + 1}`);
+  const wrapper = await studio([project("A", { artifacts: [] })], status, log);
+  const details = wrapper.getComponent(ProcessingLog).get("details");
+  const logRequests = () =>
+    vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("/log"));
+  expect(logRequests()).toHaveLength(0);
+  details.element.open = true;
+  await details.trigger("toggle");
+  await flushPromises();
+  expect(wrapper.get("pre.log").text().split("\n")).toEqual(log);
+
+  for (const count of [81, 82]) {
+    log.shift();
+    log.push(`line ${count}`);
+    status.job = job({ log_lines: count });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(wrapper.get("pre.log").text().split("\n")).toEqual(log);
+  }
+  expect(logRequests()).toHaveLength(3);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(logRequests()).toHaveLength(3);
+
+  details.element.open = false;
+  await details.trigger("toggle");
+  log.shift();
+  log.push("line 83");
+  status.job = job({ log_lines: 83 });
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(logRequests()).toHaveLength(3);
+  details.element.open = true;
+  await details.trigger("toggle");
+  await flushPromises();
+  expect(wrapper.get("pre.log").text().split("\n")).toEqual(log);
+  expect(logRequests()).toHaveLength(4);
 });

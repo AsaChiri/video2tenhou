@@ -133,6 +133,16 @@ class Job:
     error: str | None = None
     interrupted: bool = False
     log: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_LINES))
+    log_lines: int = field(default=0, init=False)
+    _log_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
+
+    def append_log(self, line: str) -> None:
+        """Retain the latest lines and count every append from either output stream."""
+        with self._log_lock:
+            self.log.append(line)
+            self.log_lines += 1
 
     def status(self) -> dict:
         """Describe progress and the user-facing outcome, without the log."""
@@ -145,7 +155,7 @@ class Job:
             "started": self.started,
             "finished": self.finished,
             "error": self.error,
-            "log_lines": len(self.log),
+            "log_lines": self.log_lines,
         }
 
     def record(self) -> dict:
@@ -848,7 +858,7 @@ class Workspace:
             except OSError as exc:
                 self._save_failed(project, exc, completed=True)
                 job.error = SAVE_FAILED
-                job.log.append(f"Project save failed: {exc}")
+                job.append_log(f"Project save failed: {exc}")
 
         self._launch(job, work, finish)
         return self.snapshot(key)
@@ -1092,7 +1102,7 @@ class Workspace:
                 ):
                     outcomes.append(document)
                     continue
-            job.log.append(line)
+            job.append_log(line)
             stage = _progress_stage(line)
             if stage:
                 job.stage = stage

@@ -212,6 +212,7 @@ def test_completion_save_failure_is_visible_and_restart_recovers(
         assert workspace.project(key)["export_signature"] is None
         assert "Could not save" in value["job"]["error"]
         assert "completion cannot be saved" in workspace.log(key)[-1]
+        assert workspace.job_status()["job"]["log_lines"] == 1
         assert path.read_bytes() == admitted
     reopened = workflow.Workspace(
         workspace.root, runner=lambda args, _p: commands.append(args)
