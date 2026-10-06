@@ -147,6 +147,7 @@ export interface WorkspaceJob {
   started: number;
   finished: number | null;
   error: string | null;
+  /** Total appended lines for this job; the fetched log retains only its tail. */
   log_lines: number;
 }
 export interface JobStatus {
