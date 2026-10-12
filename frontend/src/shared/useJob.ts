@@ -61,7 +61,8 @@ export function useJobStatus(project: Ref<string | null>): JobState {
       const status = await api<JobStatus>(
         asked ? `/api/job?project=${encodeURIComponent(asked)}` : "/api/job",
       );
-      if (!disposed && asked === project.value) show(status);
+      if (!disposed && run === generation && asked === project.value)
+        show(status);
     } catch {
       /* A transient failure keeps the last status; the next poll retries. */
     } finally {
